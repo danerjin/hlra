@@ -71,8 +71,7 @@ def main():
     print(f"[train_real] device={device} tokenizer=gpt2(local) vocab={vocab_size}")
 
     model = LatentThoughtModel(model_cfg, chunker).to(device)
-    ema = EMATargetEncoder(model.chunk_encoder, momentum=model_cfg.ema_momentum,
-                           online_proj=model.ssl_proj).to(device)
+    ema = EMATargetEncoder(model.chunk_encoder, momentum=model_cfg.ema_momentum).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.lr,
                                   weight_decay=train_cfg.weight_decay)
     curriculum = Curriculum(model_cfg, train_cfg)

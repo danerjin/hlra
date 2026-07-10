@@ -11,10 +11,12 @@ Wires every component into the full architecture described in §1-§4:
 Two independent forward passes are exposed, matching §2's "two losses, two
 granularities":
 
-  - `forward_self_supervised`: the cheap, fully-parallel JEPA-style branch
-    (§2.1). Does *not* touch the HRM loop, the memory, or the Talker --
-    it predicts one chunk's EMA-target latent from the previous chunk's
-    online-encoded latent, for every chunk pair in the batch at once.
+  - `forward_self_supervised`: the JEPA-style branch (§2.1), run ON the HRM
+    loop. Parallel across chunks (each chunk's loop is independent -- fresh
+    state, empty memory -- so no sequential dependency; the Talker and the
+    memory chain are skipped, the loop is NOT), it predicts one chunk's
+    EMA-target latent from the previous chunk's *loop output*, for every chunk
+    pair at once. This is what trains the loop to reason forward (notes §25).
 
   - `forward_grounded`: the expensive, sequential branch (§2.2). Walks the
     document's chunks in order, running the HRM inner loop, writing to (and
@@ -111,34 +113,21 @@ class LatentThoughtModel(nn.Module):
             n_roles=len(cfg.role_tags), max_chunk_len=cfg.max_chunk_len,
         )
 
-        # --- Self-supervised JEPA branch (§2.1) --------------------------
-        # `ssl_proj` maps the shared chunk latent into a *separate* SSL space
-        # before the prediction loss (BYOL-style projection head). This is the
-        # anti-collapse isolation: if the cheap SSL objective wants to collapse,
-        # it collapses this head, not the shared self.chunk_encoder that the
-        # reconstruction (grounded) path decodes from (§6 open question, resolved
-        # toward separate heads by the observed collapse). `latent_predictor` is
-        # the online-only predictor on top of the projection. The EMA target
-        # (ema_target.py) holds momentum copies of BOTH chunk_encoder and
-        # ssl_proj; the caller wires it once initial weights exist.
-        self.ssl_proj = nn.Sequential(
-            nn.Linear(cfg.d_model, cfg.d_model), nn.GELU(), nn.Linear(cfg.d_model, cfg.d_model)
-        )
-        self.latent_predictor = nn.Linear(cfg.d_model, cfg.d_model)
-
-        # --- Generation predictor (encoder-space next-latent head) --------
-        # The SSL branch above predicts in the *projected* SSL space, which the
-        # §2.4 collapse fix deliberately isolates from the shared encoder space
-        # the HRM loop consumes -- so `latent_predictor` cannot seed generation
-        # (its output lives in the wrong space). `gen_predictor` is the map
-        # generation actually needs: shared latent of chunk t -> shared latent
-        # of chunk t+1. It is trained with BOTH input and target detached
-        # (forward_gen_predictor), so its loss reaches only this head: it can
-        # neither collapse nor otherwise perturb the shared encoder. Purely a
-        # readout for inference (generate.py).
-        self.gen_predictor = nn.Sequential(
-            nn.Linear(cfg.d_model, cfg.d_model), nn.GELU(), nn.Linear(cfg.d_model, cfg.d_model)
-        )
+        # --- Self-supervised JEPA branch (§2.1) — the HRM loop IS the predictor.
+        # The self-supervised loss runs ON the inner loop (the reasoner), exactly
+        # as JEPA-Reasoner runs SSL on its reasoner transformer: for each chunk t
+        # the loop produces a finished thought, and `pred_head` maps that thought
+        # to chunk t+1's encoder-space latent (forward_self_supervised). The
+        # gradient reaches the loop AND the shared encoder, so deliberation --
+        # and, under ACT, its depth -- is trained to reason forward, not only to
+        # reconstruct. The former linear SSL (a separate ssl_proj/latent_predictor
+        # projection head + a detached gen MLP) was removed: it was the §2.4
+        # collapse-era shortcut that severed the loop from its own predictive
+        # objective, and the A/B (notes §25.1) showed the on-loop loss is MORE
+        # collapse-robust and the projection head is not load-bearing. Collapse is
+        # held by the always-on reconstruction anchor + the variance floor + the
+        # slow EMA target, not by an isolation head.
+        self.pred_head = nn.Linear(cfg.d_model, cfg.d_model)
 
     # ------------------------------------------------------------------
     def encode_chunks(self, chunk_tensor: torch.Tensor) -> torch.Tensor:
@@ -155,81 +144,72 @@ class LatentThoughtModel(nn.Module):
         return self.chunk_encoder(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
 
     # ------------------------------------------------------------------
-    # Self-supervised branch: fully parallel, no sequential dependency.
+    # Self-supervised branch: the HRM loop IS the predictor (§2.1 / notes §25).
+    # Parallel across chunks, no memory unroll -- but NOT loop-free.
     # ------------------------------------------------------------------
     def forward_self_supervised(self, chunk_tensor: torch.Tensor, chunk_mask: torch.Tensor,
-                                 ema: EMATargetEncoder, cos_weight: float = 1.0,
+                                 stage: StageFlags, ema: EMATargetEncoder, cos_weight: float = 1.0,
                                  var_weight: float = 0.0, chunk_vecs=None) -> torch.Tensor:
         """
-        chunk_tensor: (batch, n_chunks, chunk_len)
-        chunk_mask:   (batch, n_chunks) bool
-
-        Predicts chunk_{t+1}'s EMA-target latent from chunk_t's online latent,
-        for every valid consecutive pair, batched together (§2.1). Returns
+        The self-supervised loss, run ON the HRM loop -- the loop is the reasoner
+        that predicts the next chunk's latent, exactly as JEPA-Reasoner runs SSL
+        on its reasoner transformer (§2.1). Returns
 
             cos_weight * cosine_prediction_loss + var_weight * variance_reg
 
-        where the variance regularizer (losses.variance_regularization) hard-
-        floors the shared latent's per-dim variance so it cannot collapse. The
-        cosine term operates in the *projected* SSL space (self.ssl_proj), the
-        variance term on the *shared* latent it must protect.
+        PARALLEL across chunks: every chunk's loop is independent -- fresh state,
+        EMPTY memory -- so there is no sequential cross-thought dependency (the
+        "fully parallel across chunks / without unrolling through memory" of §2.1;
+        the Talker and the memory chain are skipped, the loop is NOT). The whole
+        batch*n_chunks set runs through the loop in ONE call. Gradients use the
+        inner-loop 2->5 truncation (stage.inner_loop_grad_window), the §3.5 method
+        the design specifies for exactly this -- so the loop, and under ACT its
+        depth, is trained to reason forward.
+
+        Online = pred_head(loop(encode(chunk_t))); target = the EMA target
+        encoder's next-chunk latent (encoder space, stop-grad). Collapse is held
+        by the always-on reconstruction anchor + the variance floor (on the shared
+        latent) + the slow EMA target -- the A/B (notes §25.1) showed the former
+        projection-head isolation is not needed once SSL is on the loop.
         """
         batch, n_chunks, chunk_len = chunk_tensor.shape
+        device = chunk_tensor.device
         flat_ids = chunk_tensor.reshape(batch * n_chunks, chunk_len)
-        flat_token_mask = (flat_ids != 0)  # pad id is 0 by convention (chunker.py)
-        flat_valid = chunk_mask.reshape(batch * n_chunks)
+        if chunk_vecs is None:
+            chunk_vecs = self.chunk_encoder(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
+        flat_z = chunk_vecs.reshape(batch * n_chunks, -1)
 
-        # Reuse the shared encode if the caller already produced it this step
-        # (encode_chunks); otherwise run the online encoder here. Either way the
-        # EMA *target* below is a separate encoder and always runs on its own.
-        shared_latents = (self.chunk_encoder(flat_ids, flat_token_mask)
-                          if chunk_vecs is None else chunk_vecs.reshape(batch * n_chunks, -1))
-        online_proj = self.ssl_proj(shared_latents).reshape(batch, n_chunks, -1)
+        # One loop call over every chunk, each independent (empty memory, fresh
+        # state) -- the parallel-across-chunks reasoner pass.
+        empty_mem = GestaltMemoryBank(self.cfg.memory_capacity, self.cfg.d_model)
+        h_flat, _ = self.hrm_loop(flat_z, empty_mem, None, h_state=None, l_state=None,
+                                  grad_window=stage.inner_loop_grad_window, use_act=stage.use_act)
+        online = self.pred_head(h_flat).reshape(batch, n_chunks, -1)
 
         with torch.no_grad():
-            target_latents = ema.encode(flat_ids, flat_token_mask).reshape(batch, n_chunks, -1)
+            tgt = ema.encode(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
 
-        # Valid (t, t+1) pairs: both chunks must be real, per chunk_mask.
-        pair_valid = chunk_mask[:, :-1] & chunk_mask[:, 1:]         # (batch, n_chunks-1)
-        pred = self.latent_predictor(online_proj[:, :-1])           # predict "next" from "current"
-        target = target_latents[:, 1:]
-        pred = pred[pair_valid]
-        target = target[pair_valid]
-
+        pair = chunk_mask[:, :-1] & chunk_mask[:, 1:]
+        pred, target = online[:, :-1][pair], tgt[:, 1:][pair]
         cos = (scaled_cosine_loss(pred, target, k=self.cfg.cosine_loss_k)
-               if pred.numel() > 0 else torch.zeros((), device=chunk_tensor.device))
-        # Variance regularizer on the shared latent (only the real chunks).
-        var = variance_regularization(shared_latents[flat_valid]) if var_weight > 0 else \
-            torch.zeros((), device=chunk_tensor.device)
+               if pred.numel() > 0 else torch.zeros((), device=device))
+        flat_valid = chunk_mask.reshape(batch * n_chunks)
+        var = (variance_regularization(flat_z[flat_valid]) if var_weight > 0
+               else torch.zeros((), device=device))
         return cos_weight * cos + var_weight * var
 
-    def forward_gen_predictor(self, chunk_tensor: torch.Tensor, chunk_mask: torch.Tensor,
-                               chunk_vecs=None) -> torch.Tensor:
+    @torch.no_grad()
+    def predict_next_latent(self, latent, memory, h_state=None, l_state=None,
+                             grad_window: int = 5, use_act: bool = False):
         """
-        Train the encoder-space next-latent head used by generation: predict
-        chunk_{t+1}'s *shared* latent from chunk_t's, both DETACHED, so the loss
-        trains ONLY self.gen_predictor -- gradient-isolated from the shared
-        encoder and the SSL branch by construction. The scaled cosine loss
-        suffices because the HRM injection LayerNorms the latent (chunk_pool_norm),
-        making the injection invariant to positive rescaling.
-
-        If the caller passes the shared `chunk_vecs` (encode_chunks), it is
-        detached here -- so reusing it keeps the exact gradient isolation the
-        standalone no_grad encode gave, at no extra encoder pass.
+        Inference-time next-latent prediction (generate.py): run the inner loop on
+        `latent` and read the next latent off the finished thought via pred_head
+        (the same map forward_self_supervised trains). Returns (pred_latent,
+        thought); the thought is the carried loop state.
         """
-        batch, n_chunks, chunk_len = chunk_tensor.shape
-        if chunk_vecs is None:
-            flat_ids = chunk_tensor.reshape(batch * n_chunks, chunk_len)
-            with torch.no_grad():
-                z = self.chunk_encoder(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
-        else:
-            z = chunk_vecs.detach()
-        pair_valid = chunk_mask[:, :-1] & chunk_mask[:, 1:]
-        pred = self.gen_predictor(z[:, :-1][pair_valid])
-        target = z[:, 1:][pair_valid]
-        if pred.numel() == 0:
-            return torch.zeros((), device=chunk_tensor.device)
-        return scaled_cosine_loss(pred, target, k=self.cfg.cosine_loss_k)
+        h, _ = self.hrm_loop(latent, memory, None, h_state=h_state, l_state=l_state,
+                              grad_window=grad_window, use_act=use_act)
+        return self.pred_head(h), h
 
     @torch.no_grad()
     def latent_collapse_metric(self, chunk_tensor: torch.Tensor, chunk_mask: torch.Tensor) -> float:

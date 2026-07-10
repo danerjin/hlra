@@ -69,16 +69,13 @@ class EMATargetEncoder:
     Wraps a frozen momentum copy of a ChunkEncoder. Not an nn.Module itself
     (so it's never accidentally included in the optimizer's parameter list);
     callers must exclude its parameters from gradient updates and instead
-    call `update()` after each optimizer step.
-
-    The target may include an EMA copy of the SSL projection head as well
-    (BYOL-style): the online path is predictor(proj(encoder(x))) and the target
-    path is proj_ema(encoder_ema(x')). Projecting into a separate SSL space is
-    what lets the SSL objective collapse *its own head* harmlessly instead of
-    flattening the shared chunk encoder that reconstruction depends on.
+    call `update()` after each optimizer step. `encode(x')` is the stop-grad
+    target for the self-supervised loss: the EMA target encoder's latent of the
+    next chunk (encoder space -- the space the HRM loop is injected with, and
+    the space model.pred_head predicts into).
     """
 
-    def __init__(self, online_encoder: ChunkEncoder, momentum: float, online_proj=None):
+    def __init__(self, online_encoder: ChunkEncoder, momentum: float):
         self.momentum = momentum
         self.target_encoder = copy.deepcopy(online_encoder)
         for p in self.target_encoder.parameters():
@@ -88,21 +85,12 @@ class EMATargetEncoder:
         # SSL cosine target jitter per call; nothing flips this back to train
         # (EMATargetEncoder is not an nn.Module, so model.train() never reaches it).
         self.target_encoder.eval()
-        self.target_proj = None
-        if online_proj is not None:
-            self.target_proj = copy.deepcopy(online_proj)
-            for p in self.target_proj.parameters():
-                p.requires_grad_(False)
-            self.target_proj.eval()
 
     @torch.no_grad()
-    def update(self, online_encoder: ChunkEncoder, online_proj=None) -> None:
+    def update(self, online_encoder: ChunkEncoder) -> None:
         """EMA update: theta' <- m * theta' + (1 - m) * theta (§3.4)."""
         for p_target, p_online in zip(self.target_encoder.parameters(), online_encoder.parameters()):
             p_target.mul_(self.momentum).add_(p_online.detach(), alpha=1.0 - self.momentum)
-        if self.target_proj is not None and online_proj is not None:
-            for p_target, p_online in zip(self.target_proj.parameters(), online_proj.parameters()):
-                p_target.mul_(self.momentum).add_(p_online.detach(), alpha=1.0 - self.momentum)
 
     @torch.no_grad()
     def encode(self, chunk_ids: torch.Tensor, chunk_mask: torch.Tensor) -> torch.Tensor:
@@ -119,24 +107,14 @@ class EMATargetEncoder:
         ctx = (torch.autocast(device_type=dev, enabled=False)
                if dev in ("cpu", "cuda") else nullcontext())
         with ctx:
-            z = self.target_encoder(chunk_ids, chunk_mask)
-            if self.target_proj is not None:
-                z = self.target_proj(z)
-        return z
+            return self.target_encoder(chunk_ids, chunk_mask)
 
     def to(self, device):
         self.target_encoder = self.target_encoder.to(device)
-        if self.target_proj is not None:
-            self.target_proj = self.target_proj.to(device)
         return self
 
     def state_dict(self):
-        sd = {"encoder": self.target_encoder.state_dict()}
-        if self.target_proj is not None:
-            sd["proj"] = self.target_proj.state_dict()
-        return sd
+        return {"encoder": self.target_encoder.state_dict()}
 
     def load_state_dict(self, sd):
         self.target_encoder.load_state_dict(sd["encoder"])
-        if self.target_proj is not None and "proj" in sd:
-            self.target_proj.load_state_dict(sd["proj"])

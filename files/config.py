@@ -76,6 +76,13 @@ class ModelConfig:
     input_lane_layers: int = 2
     recent_token_window: int = 128  # raw tokens kept at full fidelity before aging into gestalts
 
+    # The next-latent prediction (§2.1's self-supervised signal AND generation) is
+    # produced by the HRM loop itself: loop(encode(chunk_t)) -> pred_head predicts
+    # chunk t+1's encoder-space latent (model.forward_self_supervised). There is no
+    # separate linear SSL head or detached gen MLP -- those were the §2.4
+    # collapse-era shortcut, removed after the notes §25.1 A/B showed the on-loop
+    # loss is more collapse-robust and needs no isolation head.
+
 
 @dataclass
 class TrainConfig:
@@ -96,17 +103,16 @@ class TrainConfig:
     # the frequent one, NOT by thinning the anchor. Default 1.0 so every entry
     # point is safe-by-default; lower it only with eyes open.
     grounded_loss_min_frequency: float = 1.0
-    # The grounded (reconstruction) loss is the anti-collapse anchor on the
-    # shared chunk encoder, so the cheap-but-collapse-prone SSL loss is kept
-    # *secondary*: its cosine term is down-weighted, and a variance
-    # regularizer (VICReg-style) hard-floors the latent's per-dim variance so
-    # it cannot flatten to a constant. See model.forward_self_supervised.
-    ssl_loss_weight: float = 0.1              # weight on the SSL cosine prediction term
-    ssl_var_weight: float = 2.0               # weight on the anti-collapse variance regularizer
-    # Weight on the generation head's next-latent loss (model.forward_gen_predictor).
-    # Gradient-isolated (detached input AND target), so it cannot affect the shared
-    # encoder or SSL dynamics; 0 disables it. Runs alongside SSL from Stage D.
-    gen_loss_weight: float = 1.0
+    # The grounded (reconstruction) loss is the always-on anti-collapse anchor on
+    # the shared chunk encoder (runs every step at frequency 1.0). The on-loop SSL
+    # (model.forward_self_supervised) is the forward-prediction signal that trains
+    # the loop; it is now the MAIN predictive objective, so it runs co-equal with
+    # reconstruction (weight 1.0), not demoted to a whisper. The variance floor
+    # (VICReg-style) hard-floors the shared latent's per-dim variance as the
+    # anti-collapse backstop. (Notes §25.1: on-loop SSL held latent_std healthy at
+    # this weight where the old linear SSL flirted with collapse. RE-TUNE at scale.)
+    ssl_loss_weight: float = 1.0              # weight on the on-loop SSL cosine prediction term
+    ssl_var_weight: float = 2.0              # weight on the anti-collapse variance regularizer
     log_every: int = 10
     device: str = "cpu"
     seed: int = 0

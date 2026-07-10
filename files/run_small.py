@@ -83,8 +83,7 @@ def main():
     val_factory = lambda: iter_hf_single(DATASET, TEXT_FIELD, streaming=False, max_docs=32)
 
     model = LatentThoughtModel(model_cfg, chunker).to(device)
-    ema = EMATargetEncoder(model.chunk_encoder, momentum=model_cfg.ema_momentum,
-                           online_proj=model.ssl_proj).to(device)
+    ema = EMATargetEncoder(model.chunk_encoder, momentum=model_cfg.ema_momentum).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.lr,
                                   weight_decay=train_cfg.weight_decay)
     curriculum = Curriculum(model_cfg, train_cfg)

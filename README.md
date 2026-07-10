@@ -34,14 +34,14 @@ curves, and **generate** from the model.
 | `input_lane.py` | §4.1, §4.2 | Bidirectional input-lane encoder; read-only via cross-attention, never writes recurrent self-state. All-masked-row guard against NaN. |
 | `ema_target.py` | §2.1, §3.4 | `ChunkEncoder` (the shared latent producer) + `EMATargetEncoder`, a momentum copy of the encoder **and** the SSL projection head, with `state_dict`/`load_state_dict` for checkpointing. All-pad-row guard. |
 | `losses.py` | §2, §5.5, §2.4 | Scaled cosine loss, grounded NLL, ACT ponder cost, and the VICReg-style `variance_regularization` anti-collapse floor. |
-| `model.py` | §1-§4, §2.4 | `LatentThoughtModel`: shared `chunk_encoder`, HRM reasoner, Talker, two-lane input, `ssl_proj` (separate SSL head), `gen_predictor` (encoder-space next-latent head for generation; gradient-isolated, notes §15.1), `forward_grounded` (reconstruction), `forward_self_supervised` (SSL + variance), `latent_collapse_metric`. |
+| `model.py` | §1-§4, §2.1 | `LatentThoughtModel`: shared `chunk_encoder`, HRM reasoner, Talker, two-lane input, `pred_head` (the loop's next-latent head), `forward_grounded` (reconstruction anchor), `forward_self_supervised` (the **on-loop** SSL: `loop(encode(chunk_t))→pred_head` predicts chunk t+1's EMA latent + variance floor — the loop IS the predictor, notes §26), `latent_collapse_metric`. The former linear SSL / separate projection head / detached gen MLP were removed (§26). |
 | `curriculum.py` | §5 | Stage A→F flags/loss-plan. Gates on validation-loss plateau *or* fixed per-stage step budgets; `state_dict`/`load` for resume. |
 | `data.py` | §3.1, §5.6 | Real-text pipeline: HF mixture stream (`iter_hf_mixture`), single-dataset stream (`iter_hf_single`), offline synthetic-text + stub-SaT fallback, `ReservePadTokenizer` (id-0 = PAD), in-pipeline chunking + length bucketing, and `CachedChunkDataset` (map-style over a pre-chunked shard cache). |
 | `train.py` | §5, §5.7 | Smoke training entry (offline by default; `LATENT_USE_HF=1` = real streaming mixture). Device-aware; grounded/SSL loss orchestration. |
 | `run_small.py` | — | ~1M-token smoke run on real text (pile-10k) via the offline stub chunker (only `datasets` needed). |
 | `train_real.py` | — | ~1.5M-token run with the **real gpt2 tokenizer** (decodable output); writes `runs/model.pt` + `runs/metrics.json`. |
 | `plot_metrics.py` | — | Renders `runs/metrics.json` to `runs/loss_curves.png` (val loss, train NLL/SSL, and the latent-std collapse monitor, with stage bands). |
-| `generate.py` | §1.3, §2.4 | Use a checkpoint: tokenize a prompt → read it through the HRM loop → predict the next latent in encoder space (`gen_predictor`, notes §15.1) → decode with the Talker → detokenize. `--score` reports perplexity. Loads pre-§15 checkpoints with a warning (untrained gen head). |
+| `generate.py` | §1.3, §2.1 | Use a checkpoint: tokenize a prompt → read it through the HRM loop → predict the next latent in encoder space via the **HRM loop + `pred_head`** (`predict_next_latent`, the same map the on-loop SSL trains, notes §26) → decode with the Talker → detokenize. `--score` reports perplexity. Loads pre-§26 checkpoints with a warning (their predictor head can't drive the loop predictor). |
 | `data_prep.py` | scaling | Offline pre-chunking: run chunking + tokenization once, write sharded chunk tensors + manifest to a cache dir. |
 | `trainer.py` | scaling | `Trainer`: AMP autocast, gradient accumulation, warmup→cosine LR schedule, atomic checkpoint/resume (schedule-exact since notes §15.3), fixed-budget curriculum gating, collapse monitor, `gen` head loss from Stage D. |
 | `train_scaled.py` | scaling | Scale-oriented entry point: trains from the pre-chunked cache via `Trainer`, using a `MODEL_PRESETS` size preset. `--lr-schedule per-stage` (default) gives each stage its own warmup→cosine (the notes §12 curriculum fix); `global` reverts. |
@@ -95,28 +95,35 @@ scale** (perplexity ~3k vs. random 50k; output is real subword text but
 incoherent). Its purpose is to exercise the full architecture end-to-end and
 feed `generate.py`. See `notes.md` for the numbers and the honest read.
 
-## The SSL-collapse fix (design-doc §2.4)
+## The self-supervised loss runs ON the HRM loop (notes §25/§26)
 
-The first real run exposed a real pathology: with one **shared** chunk encoder
-feeding both losses and the self-supervised (SSL) loss at equal weight, the SSL
-loss collapsed the latent (cosine → 0.996) and *dragged reconstruction down with
-it*. The fix, now the default:
+The self-supervised (SSL) loss is the design's forward-prediction signal, and it
+runs **on the HRM loop** — the loop is the reasoner that predicts the next chunk's
+latent (`model.forward_self_supervised`: `pred_head(loop(encode(chunk_t)))`
+predicts chunk *t+1*'s EMA-target latent), exactly as JEPA-Reasoner runs SSL on
+its reasoner transformer (design §2.1). Parallel across chunks (each chunk's loop
+is independent — empty memory, fresh state), gradients via the inner-loop 2→5
+truncation. This is what trains the loop to reason forward, not only to
+reconstruct.
 
-- **Reconstruction (grounded) loss is the always-on anchor** — it's an
-  autoencoder (encode chunk → HRM → decode same chunk), which cannot be
-  satisfied by a constant latent.
-- **Separate SSL projection head** (`model.ssl_proj`, with its own EMA copy in
-  `ema_target.py`) so SSL can only collapse *its own* head, not the shared
-  encoder.
-- **SSL demoted**: cosine weight ≈0.1, EMA momentum 0.98→0.996.
-- **Variance floor** (`losses.variance_regularization`): a dormant safety net
-  that only activates as the latent nears collapse.
-- **`latent_std` collapse monitor** logged every eval (see the third panel in
-  `loss_curves.png`); validation is measured **reconstruction-only** so it's
-  comparable across the Stage-D boundary.
+The collapse defenses (a shared encoder + SSL can collapse the latent — the first
+real run hit cosine → 0.996; notes §5):
+- **Reconstruction (grounded) loss is the always-on anchor** — an autoencoder
+  (encode chunk → HRM → decode same chunk), which cannot be satisfied by a
+  constant latent. Runs every step.
+- **Variance floor** (`losses.variance_regularization`) on the shared latent — a
+  dormant safety net that activates only as the latent nears collapse.
+- **Slow EMA target** (momentum 0.996) — a harder target to chase into a constant.
+- **`latent_std` collapse monitor** logged every eval; validation is measured
+  **reconstruction-only** so it stays comparable across the Stage-D boundary.
 
-Verified: with the fix, validation holds flat through Stages D/E (no regression)
-and `latent_std` stays healthy. Full before/after numbers in `notes.md`.
+The earlier fix (a **separate `ssl_proj` projection head** to isolate a linear,
+loop-free SSL, cosine weight ≈0.1) was **removed** (notes §26): the §25.1 A/B
+showed the on-loop loss is *more* collapse-robust than that linear SSL and the
+projection head is not load-bearing. On-loop SSL now runs co-equal with
+reconstruction (`ssl_loss_weight=1.0`). Verified no collapse at smoke scale;
+**re-validate at `small`+ before the big run** (the §2.4 collapse history means
+smoke health is necessary, not sufficient).
 
 ## Scaling up
 
@@ -153,8 +160,9 @@ python train_scaled.py --preset small --cache chunk_cache --resume runs/scaled/c
   so true collapse reads ~0) so a regression is caught early. Checkpoints
   carry the resolved training schedule and a resume with a drifted command
   line warns loudly; `--archive-every N` keeps numbered rollback snapshots.
-- The anti-collapse recipe (reconstruction anchor always-on, separate SSL head,
-  variance floor, momentum 0.996) is carried over unchanged.
+- The anti-collapse recipe (reconstruction anchor always-on, variance floor,
+  momentum 0.996) is carried over; the separate SSL projection head was removed
+  and SSL now runs on the HRM loop (notes §26).
 
 Verified end-to-end offline (prepare → train → checkpoint → resume → multi-worker)
 on a tiny synthetic cache; **no large training run has been done**.

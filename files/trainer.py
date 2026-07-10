@@ -2,9 +2,9 @@
 trainer.py
 ==========
 A scale-ready training loop for Stages A-E, replacing the flat function in
-train.py. Adds the infrastructure a real run needs while keeping the exact
-loss semantics (reconstruction anchor + secondary SSL with anti-collapse
-variance floor) verified on the smoke run:
+train.py. Adds the infrastructure a real run needs while keeping the loss
+semantics (reconstruction anchor + on-loop SSL predictor with an anti-collapse
+variance floor, notes §26) verified on the smoke run:
 
   * gradient accumulation      (large effective batch on limited memory)
   * mixed precision autocast   (bf16/fp16; enable on CUDA)
@@ -68,7 +68,7 @@ class Trainer:
     _SCHEDULE_FIELDS = ("stage_steps", "per_stage_lr", "lr", "min_lr_ratio",
                         "warmup_steps", "total_steps", "batch_size",
                         "grad_accum_steps", "grounded_loss_min_frequency",
-                        "ssl_loss_weight", "ssl_var_weight", "gen_loss_weight",
+                        "ssl_loss_weight", "ssl_var_weight",
                         "amp", "amp_dtype")
 
     def _schedule_snapshot(self) -> dict:
@@ -135,20 +135,14 @@ class Trainer:
             logs["nll"] = round(nll.item(), 4)
             logs["ponder"] = round(ponder.item(), 4)
         if plan.use_self_supervised_loss:
+            # On-loop SSL (§2.1/§25): the HRM loop IS the next-latent predictor.
+            # One term trains the loop + encoder to reason forward, with the
+            # variance floor as the anti-collapse backstop.
             ssl = self.model.forward_self_supervised(
-                ct, cm, self.ema, cos_weight=self.train_cfg.ssl_loss_weight,
+                ct, cm, flags, self.ema, cos_weight=self.train_cfg.ssl_loss_weight,
                 var_weight=self.train_cfg.ssl_var_weight, chunk_vecs=chunk_vecs)
             total = ssl if total is None else total + ssl
             logs["ssl"] = round(ssl.item(), 4)
-            # Generation head (encoder-space next-latent). Gradient-isolated:
-            # trains only model.gen_predictor, so it can ride along at no risk
-            # to the reconstruction/SSL dynamics. Logged separately so the ssl
-            # metric stays comparable with earlier runs.
-            if self.train_cfg.gen_loss_weight > 0:
-                gen = self.train_cfg.gen_loss_weight * self.model.forward_gen_predictor(
-                    ct, cm, chunk_vecs=chunk_vecs)
-                total = total + gen
-                logs["gen"] = round(gen.item(), 4)
         return total, logs, (ct, cm)
 
     @torch.no_grad()
@@ -204,7 +198,7 @@ class Trainer:
                 self.scaler.step(self.optimizer); self.scaler.update()
             else:
                 self.optimizer.step()
-            self.ema.update(self.model.chunk_encoder, self.model.ssl_proj)
+            self.ema.update(self.model.chunk_encoder)
             self.global_step += 1
 
             val_loss = None

@@ -127,17 +127,16 @@ def main():
     print(f"    grounded loss finite: {finite(loss)} (nll={float(nll):.3f})   grads finite: {grad_finite}")
     ok &= finite(loss) and grad_finite
 
-    # 4. forward_self_supervised (SSL cosine + variance) under autocast ----
+    # 4. forward_self_supervised (on-loop SSL: cosine + variance) under autocast --
+    # This runs the HRM loop (the predictor), so it exercises the loop's ops under
+    # autocast on the SSL path too, not just reconstruction.
     model.zero_grad(set_to_none=True)
-    ema = EMATargetEncoder(model.chunk_encoder, momentum=cfg.ema_momentum,
-                           online_proj=model.ssl_proj).to(device)
+    ema = EMATargetEncoder(model.chunk_encoder, momentum=cfg.ema_momentum).to(device)
     with torch.autocast(device_type="cuda", dtype=dtype):
-        ssl = model.forward_self_supervised(ct, cm, ema, cos_weight=0.1, var_weight=2.0)
-        gen = model.forward_gen_predictor(ct, cm)   # generation head rides along at Stage D+
-        ssl = ssl + gen
+        ssl = model.forward_self_supervised(ct, cm, flags, ema, cos_weight=1.0, var_weight=2.0)
     ssl.backward()
     torch.cuda.synchronize()
-    print(f"[4] SSL+gen loss finite: {finite(ssl)} (gen={float(gen):.4f})")
+    print(f"[4] on-loop SSL loss finite: {finite(ssl)} (ssl={float(ssl):.4f})")
     ok &= finite(ssl)
 
     # ACT path too (Stage E) -- variable depth + halting head under autocast.

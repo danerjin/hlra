@@ -64,6 +64,9 @@ def main():
     ap.add_argument("--lr-schedule", default="per-stage", choices=["per-stage", "global"],
                     help="per-stage: warmup+cosine within each stage's budget (fixes D/E LR "
                          "starvation); global: one cosine across A..E (legacy)")
+    ap.add_argument("--ssl-weight", type=float, default=None,
+                    help="override ssl_loss_weight (default 1.0, co-equal with reconstruction; "
+                         "the on-loop SSL that trains the HRM loop to predict forward)")
     ap.add_argument("--out", default="runs/scaled")
     ap.add_argument("--resume", default=None)
     ap.add_argument("--max-steps", type=int, default=None)
@@ -105,6 +108,7 @@ def main():
         grounded_loss_min_frequency=1.0,   # reconstruction stays the always-on anchor
         stage_steps=stage_steps,
         per_stage_lr=(args.lr_schedule == "per-stage"),
+        ssl_loss_weight=(args.ssl_weight if args.ssl_weight is not None else TrainConfig.ssl_loss_weight),
     )
     set_seed(train_cfg.seed)
 
@@ -115,8 +119,7 @@ def main():
                             num_workers=0, collate_fn=collate_chunked)
 
     model = LatentThoughtModel(model_cfg, chunker=None).to(device)  # chunker unused (data pre-chunked)
-    ema = EMATargetEncoder(model.chunk_encoder, momentum=model_cfg.ema_momentum,
-                           online_proj=model.ssl_proj).to(device)
+    ema = EMATargetEncoder(model.chunk_encoder, momentum=model_cfg.ema_momentum).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.lr,
                                   weight_decay=train_cfg.weight_decay)
     curriculum = Curriculum(model_cfg, train_cfg)

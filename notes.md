@@ -5,6 +5,16 @@ and its fix (with the evidence that confirmed it), every training run and its
 numbers, and the theory/observations behind the decisions. The README is the
 map; this is the story. Nothing is omitted.
 
+> ⚠️⚠️ **EXTREMELY IMPORTANT — READ §24–§26 BEFORE ANY TRAINING RUN.** The
+> self-supervised loss now runs **ON the HRM loop** — the loop IS the next-latent
+> predictor (`model.forward_self_supervised`: `loop(encode(chunk_t)) → pred_head`
+> predicts chunk t+1's EMA latent), the design's actual §2.1 intent. The linear
+> SSL (`ssl_proj`/`latent_predictor`) and the detached gen MLP (`gen_predictor`)
+> are **removed** (§26); there is no toggle — this is the design. The on-loop SSL
+> is co-equal with reconstruction (`ssl_loss_weight=1.0`, up from 0.1). Validated
+> at smoke scale (no collapse; §25.1 A/B) but **NOT at `small`+ scale — re-run the
+> collapse check and re-tune `ssl_loss_weight` before committing multi-day compute.**
+
 ---
 
 ## 0. Context & environment
@@ -1733,3 +1743,228 @@ regime) — it is a correction to a *baseline-comparison* claim.
 
 No shipped model/training code changed this session; the two diagnostic flags
 monkeypatch at runtime only. No training run started.
+
+---
+
+## 24. ⚠️ EXTREMELY IMPORTANT — Make the HRM loop the next-latent predictor (2026-07-10)
+
+> **This is the single most consequential design change in the log.** It moves the
+> forward-prediction signal from a detached readout INTO the reasoner, changing
+> what the loop is trained to do and raising the collapse exposure of the shared
+> encoder at Stage D+. `predictive_loop` defaults **True**, so it is what
+> `train_scaled.py` uses unless you say otherwise. Do not launch the big run
+> without consciously choosing this flag, re-tuning `gen_loss_weight`, and running
+> the A/B in §24.4.
+
+Prompted by the §22–23 discussion (the loop is trained only by reconstruction;
+the forward-prediction is a linear/MLP head that bypasses it, so loop *depth* has
+no predictive signal): added an option to route the next-latent prediction
+**through the HRM loop itself**, so the recurrence — and, under ACT, its depth —
+receives a predictive gradient.
+
+### 24.1 What changed
+
+- **`ModelConfig.predictive_loop: bool = True`** selects the predictor:
+  - `True` (new default): `model.forward_predictive` — for each chunk *t*, run
+    the inner loop to its finished thought, then map that thought to chunk
+    *t+1*'s **encoder-space** latent via a new `pred_head` (Linear). Online path
+    is `encoder → loop → pred_head`, nothing detached, so gradient trains the
+    **loop and the shared encoder** to predict forward.
+  - `False`: the old `forward_gen_predictor` — the detached 2-layer MLP that
+    trains only itself, loop untouched.
+- **Target**: `EMATargetEncoder.encode_base` (new) — the EMA target in the shared
+  encoder space *without* the SSL projection, stop-grad. Collapse defense is
+  therefore identical to SSL (§2.4): slow EMA target + the always-on
+  reconstruction anchor + variance floor; the online path can't satisfy it with a
+  constant.
+- **Graph containment**: the predictive pass uses a fresh, **detached-write**
+  memory (`apply_grad_truncation(0)`), so it never enlarges the grounded path's
+  cross-thought BPTT graph — the loop may READ context but no cross-thought credit
+  flows through the raw memory chain here. Per-thought inner truncation is
+  unchanged (entering states severed, §21.5).
+- **Generation** (`generate.py`): `model.predict_next_latent` runs the loop +
+  `pred_head` when `predictive_loop`, else the MLP. Two loop passes per step now
+  (predict, then deliberate-to-decode) — inherent to using the loop as the
+  predictor. Old checkpoints with a trained `gen_predictor` but no `pred_head`
+  auto-fall-back to the MLP (no random-head garbage).
+- Wired the branch into `trainer.py`, `train.py`, `rocm_smoke.py`; both heads
+  coexist in the checkpoint for A/B; logged as `gen` either way.
+
+### 24.2 Verified
+
+- Gradient audit: `forward_predictive` trains `hrm_loop` (incl. `l_transition`
+  **and** `h_transition`, sum|g| 4.1/9.1 fixed-depth, 2.9/4.9 under ACT),
+  `chunk_encoder`, and `pred_head`; the old `forward_gen_predictor` still touches
+  **only** `gen_predictor`; EMA target stays grad-free. So the loop's recurrence
+  is genuinely trained to predict, in both Stage-D (fixed) and Stage-E (ACT).
+- Offline A→E smoke (`predictive_loop=True`, budgets 4/4/4/4/6): all stages fire,
+  val_loss monotone (8.93 → 7.87), **`latent_std` healthy 0.62 → 0.35 (no
+  collapse)**, `gen` (now the loop-predictive loss) falls 3.33 → 1.45. The §21
+  truncation/isolation invariant audit still passes unchanged. Byte-compiles;
+  generation runs.
+
+### 24.3 Honest caveats (what this does and does NOT fix)
+
+- **It gives loop depth a *task* gradient, but does NOT make ACT halting learn.**
+  Under ACT the predictive loss flows through the *executed* cycles (so deeper =
+  different, trainable prediction), but the halting **decision** is still a
+  non-differentiable branch — the halting head still sees only the ponder cost and
+  still degenerates toward minimum depth (§5.5/§15.5). Making *when to stop*
+  learnable still needs a real ACT accumulator or REINFORCE; this change makes
+  "how the loop uses the depth it runs" predictive, not "how much depth to spend".
+- **~2× loop cost at Stage D+**: `forward_predictive` runs its own sequential loop
+  pass in addition to the grounded one. Could be folded into the grounded pass
+  (one loop, two heads on the same thought) as a follow-up; kept separate here to
+  leave the verified `forward_grounded` path untouched.
+- **Reconstruction is still the anchor.** The predictive loss shares the collapse
+  exposure SSL has; the smoke run shows no collapse, but this is unvalidated at
+  scale and the predictive weight (`gen_loss_weight`) is untuned for the loop
+  variant.
+- **Default flip:** `predictive_loop` defaults **True**, so `train_scaled.py`
+  (the big run) would use the loop predictor. To reproduce the exactly-verified
+  §21 objective, set `predictive_loop=False`. Recommend an A/B (loop vs MLP) on a
+  short run before committing the big run to it.
+
+No large training run started. Files: `config.py`, `model.py`, `ema_target.py`,
+`trainer.py`, `train.py`, `generate.py`, `rocm_smoke.py`.
+
+---
+
+## 25. ⚠️ IMPORTANT CORRECTION — the SSL loss was meant to run ON the HRM loop
+
+Owner clarified the intent of §2.1's self-supervised loss, and it corrects a
+misreading (mine, this session) that treated the doc's SSL as "loop-free by
+design."
+
+**The intent:** `h_pred(θ)` in `k·(1 − cos(h_pred(θ), h_target(θ′)))` is the
+**reasoner's** output — the HRM loop — exactly as JEPA-Reasoner runs its SSL on
+its reasoner *transformer*. The clause "without running the Talker or unrolling
+through memory — fully parallel across chunks" names the two things SSL skips:
+the **Talker** and the **cross-thought memory chain**. It does **not** skip the
+loop. "Fully parallel across chunks" comes from dropping the memory dependency
+(each chunk's loop runs independently), and the gradient method is the
+**inner-loop truncated BPTT (last 2→5 steps, §3.5)** — which only applies if SSL
+runs the loop. Faithful form:
+
+    SSL = cos( loop(encode(chunk_t), empty memory), EMA_base(chunk_{t+1}) )
+          + variance_floor(shared latent),   inner-loop 2→5 truncation, parallel over t
+
+**The divergence:** the shipped `model.forward_self_supervised` runs
+`chunk_encoder → ssl_proj → latent_predictor` with **no loop**. That is NOT the
+design intent — it was introduced by the §2.4 collapse fix, which isolated SSL in
+a separate projection head to stop it collapsing the shared encoder, and in doing
+so took SSL off the loop entirely. **This is the root cause of the "the HRM loop
+never receives a predictive gradient" problem** discussed in §22–24: the loop was
+severed from its own predictive objective by a collapse patch, not by the design.
+
+**Relation to §24:** `forward_predictive` (added in §24) is a *partial*
+restoration — it runs the loop and predicts the next latent, but it is
+**sequential** (carries `h_state`, reads a detached memory) rather than the
+intended **parallel** (fresh loop per chunk, empty memory). The fully faithful
+implementation is a parallel loop-SSL: fresh loop per chunk, empty memory,
+inner-loop 2→5 truncation, EMA_base target, variance floor — replacing the linear
+`latent_predictor`, not sitting beside it.
+
+**The open tension (must be resolved before adopting):** SSL was moved off the
+loop *because* on-loop SSL collapsed the shared encoder (§2.4 called the separate
+projection head "load-bearing"). Restoring on-loop SSL re-exposes that risk. Weak
+counter-evidence: the §24 smoke run (on-loop predictor, no projection head, weight
+1.0) held `latent_std` healthy (0.35) — hinting the always-on reconstruction
+anchor + variance floor + EMA target may suffice without the projection head. But
+that is smoke-scale only. **Required: an A/B — faithful parallel on-loop SSL vs
+the shipped linear SSL — watching `latent_std` and reconstruction `val_loss`
+across the Stage-D boundary — before this becomes the design.** If on-loop SSL
+holds without collapsing, the linear `latent_predictor`/`ssl_proj` path should be
+retired as the collapse-era artifact it is.
+
+### 25.1 A/B result — on-loop SSL holds; the projection head is NOT load-bearing
+
+Ran the §25 three-way A/B on real gpt2 text (`wiki_cache`, 53 docs, smoke preset,
+A→E 25/25/25/30/40 steps, CPU) at a **stress SSL weight of 1.0** (the
+historically-collapsing weight, §2.4) so collapse would be visible. Configs:
+(a) `linear` shipped SSL + detached MLP gen head (loop NOT predictive);
+(b) `loop_proj` on-loop SSL through ssl_proj+latent_predictor; (c) `loop_base`
+on-loop SSL in encoder space via pred_head. Reconstruction anchor at frequency
+1.0 and the variance floor (2.0) held in all three.
+
+`latent_std` across Stage D/E (SSL on at D) and final reconstruction `val_loss`:
+
+| config | lstd D/E band | final val_loss |
+|---|---|---|
+| (a) linear (shipped) | **0.13–0.15** (dips toward the 0.1 collapse floor) | 6.536 |
+| (b) loop_proj        | 0.28–0.44 (healthy)                              | 6.457 |
+| (c) loop_base        | 0.23–0.43 (healthy)                              | **6.427** |
+
+**Findings:**
+1. **On-loop SSL does NOT collapse** — both loop variants keep `latent_std`
+   ~0.15 *higher* than the shipped linear SSL throughout D/E, at the same stress
+   weight. Routing SSL through the loop is not just viable, it is **more**
+   collapse-robust: the loop's deliberation absorbs the alignment pressure, so
+   the shared encoder is not forced toward a constant. The linear SSL puts that
+   burden partly on the encoder (even in projection space) and is the one that
+   dips toward the floor.
+2. **The projection head is NOT load-bearing once SSL is on the loop.** `loop_base`
+   (no ssl_proj, direct encoder-space target) matches `loop_proj` on `latent_std`
+   and is marginally *better* on val_loss. So the §2.4 "separate projection head
+   is load-bearing" conclusion was **over-attributed** — with the always-on
+   reconstruction anchor + variance floor + EMA target, on-loop SSL in encoder
+   space holds fine. The `ssl_proj`/`latent_predictor` path is the collapse-era
+   artifact §25 suspected and can be retired.
+3. **On-loop SSL also reconstructs slightly better** (val_loss 6.43 vs 6.54).
+
+**Caveats:** smoke scale, 53 docs, 145 steps, single seed; `latent_std` is a
+noisy single-batch read (hence the bounce), though the ~0.15 gap between linear
+and loop is consistent across the whole D/E window. The linear baseline dipped
+toward but did not fully cross the 0.1 floor. This is strong smoke-scale evidence
+for the faithful design (`loop_base`), NOT a scale guarantee — re-run the A/B at
+`small` on a real cache before the default flips.
+
+**Recommendation:** adopt `ssl_mode="loop_base"` as the faithful design; keep
+`"linear"` as the default until the A/B is reproduced at `small` scale. Retire
+`ssl_proj`/`latent_predictor` only after that confirmation. `predictive_loop` and
+the separate gen head become redundant under `loop_base` (the loop SSL is the
+predictor) — fold them out when `loop_base` is adopted.
+
+---
+
+## 26. Removed the linear SSL; the HRM loop is the sole, default predictive engine (2026-07-10)
+
+Acting on §25/§25.1: made the on-loop SSL the design, not a toggle. The HRM loop
+is now the one and only next-latent predictor — the §2.1 intent, finally in code.
+
+**Removed** (the §2.4 collapse-era machinery, retired after the §25.1 A/B showed
+it isn't needed): `model.ssl_proj`, `model.latent_predictor`, `model.gen_predictor`;
+the methods `forward_gen_predictor`, `forward_predictive`, `forward_ssl_loop`, and
+the old linear `forward_self_supervised`; the `ModelConfig.predictive_loop` and
+`TrainConfig.ssl_mode` / `gen_loss_weight` knobs; the EMA target's projection copy
+(`online_proj`/`target_proj`/`encode_base`). No toggles remain — there is one path.
+
+**The design now:**
+- `model.forward_self_supervised(chunk, mask, stage, ema, ...)` IS the on-loop SSL
+  (formerly `forward_ssl_loop`/`loop_base`): parallel across chunks (one loop call
+  over batch*n_chunks, empty memory, fresh state), inner-loop 2→5 truncation,
+  `pred_head(loop(encode(chunk_t)))` predicts `ema.encode(chunk_{t+1})` (encoder
+  space, stop-grad), plus the variance floor on the shared latent. It trains the
+  loop + encoder + pred_head to reason forward.
+- `pred_head` is the only prediction head; generation (`predict_next_latent`) uses
+  it. `ema.encode` is now encoder-space (no projection).
+- `ssl_loss_weight` default **0.1 → 1.0** (co-equal with the reconstruction
+  anchor; the on-loop SSL is the main predictive objective, not a demoted
+  secondary). Reconstruction still runs every step (frequency 1.0) as the anchor;
+  the variance floor (2.0) is the backstop.
+
+**Verified:**
+- Byte-compiles; no stale predictor refs in code (only historical comments).
+- Gradient audit: `forward_self_supervised` trains `l_transition`+`h_transition`
+  +`chunk_encoder`+`pred_head`; EMA target grad-free; removed heads absent; EMA has
+  no projection state; `predict_next_latent` finite.
+- Smoke A→E on real gpt2 text (`wiki_cache`, 20/20/20/25/30, CPU, ssl weight 1.0):
+  all stages fire, SSL drops 1.8→0.5 (loop learning to predict), val_loss monotone
+  8.42→6.63, **latent_std healthy 0.21–0.36 through D/E (no collapse)**.
+
+**Still outstanding (do NOT skip before the big run):** this is smoke-scale only.
+Re-run the collapse check at `small` on a real cache and re-tune `ssl_loss_weight`
+(1.0 is validated at smoke but the reconstruction-vs-prediction balance may shift
+with scale). The §2.4 collapse history means "no collapse at smoke" is necessary,
+not sufficient. README/spec (§2.1, §2.4, §5.4, file map) still describe the old
+linear SSL + separate-head story and need a fidelity pass to match this design.

@@ -159,28 +159,21 @@ def train_stages_a_to_e(model, ema, curriculum: Curriculum, model_cfg, train_cfg
             logs["ponder"] = round(ponder.item(), 4)
 
         if loss_plan.use_self_supervised_loss:
-            # SSL is the secondary signal: its cosine term is down-weighted and a
-            # variance regularizer hard-floors the shared latent against collapse,
-            # while the grounded (reconstruction) loss above stays the anchor.
-            ssl = model.forward_self_supervised(chunk_tensor, chunk_mask, ema,
+            # On-loop SSL (§2.1/§25): the HRM loop is the next-latent predictor.
+            # It trains the loop + encoder to reason forward; the variance floor
+            # is the anti-collapse backstop, the grounded loss the anchor.
+            ssl = model.forward_self_supervised(chunk_tensor, chunk_mask, stage_flags, ema,
                                                 cos_weight=train_cfg.ssl_loss_weight,
                                                 var_weight=train_cfg.ssl_var_weight,
                                                 chunk_vecs=chunk_vecs)
             total_loss = ssl if total_loss is None else total_loss + ssl
             logs["ssl"] = round(ssl.item(), 4)
-            # Generation head (encoder-space next-latent; gradient-isolated,
-            # trains only model.gen_predictor -- see model.forward_gen_predictor).
-            if train_cfg.gen_loss_weight > 0:
-                gen = train_cfg.gen_loss_weight * model.forward_gen_predictor(
-                    chunk_tensor, chunk_mask, chunk_vecs=chunk_vecs)
-                total_loss = total_loss + gen
-                logs["gen"] = round(gen.item(), 4)
 
         if total_loss is not None:
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
             optimizer.step()
-            ema.update(model.chunk_encoder, model.ssl_proj)
+            ema.update(model.chunk_encoder)
             logs["loss"] = round(total_loss.item(), 4)
 
         global_step += 1
@@ -263,14 +256,14 @@ def train_stage_f(model, ema, curriculum: Curriculum, model_cfg, train_cfg, opti
 
         if loss_plan.use_self_supervised_loss and last_chunks is not None:
             total_loss = total_loss + model.forward_self_supervised(
-                *last_chunks, ema, cos_weight=train_cfg.ssl_loss_weight,
+                *last_chunks, stage_flags, ema, cos_weight=train_cfg.ssl_loss_weight,
                 var_weight=train_cfg.ssl_var_weight)
 
         total_loss = total_loss / max(n_turns, 1)
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
         optimizer.step()
-        ema.update(model.chunk_encoder, model.ssl_proj)
+        ema.update(model.chunk_encoder)
 
         if step % train_cfg.log_every == 0:
             print(f"[stage F step {step}] loss={total_loss.item():.4f}")
@@ -286,8 +279,7 @@ def main():
     chunker, train_factory, val_factory = build_pipeline(model_cfg, data_cfg, use_real)
 
     model = LatentThoughtModel(model_cfg, chunker).to(train_cfg.device)
-    ema = EMATargetEncoder(model.chunk_encoder, momentum=model_cfg.ema_momentum,
-                           online_proj=model.ssl_proj).to(train_cfg.device)
+    ema = EMATargetEncoder(model.chunk_encoder, momentum=model_cfg.ema_momentum).to(train_cfg.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
     curriculum = Curriculum(model_cfg, train_cfg)
 

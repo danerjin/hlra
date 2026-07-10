@@ -136,10 +136,17 @@ combines.
    `L(θ,θ′) = k·(1 − cos(h_pred(θ), h_target(θ′)))`, with the same EMA-momentum trick (momentum
    0.98 on the target embeddings, to prevent rank collapse while allowing angular adjustment).
    Trains raw predictive competence without running the Talker or unrolling through memory — fully
-   parallel across chunks, like JEPA-Reasoner's SST phase. *(Implementation note: the naive form of
-   this — SSL on the shared chunk latent, equal weight, every step — collapses the latent. The
-   reference implementation runs the prediction in a **separate projection space**, down-weights it,
-   raises EMA momentum, and adds a variance floor. See §2.4.)*
+   parallel across chunks, like JEPA-Reasoner's SST phase. Note this loss runs **on the reasoner**
+   (the HRM loop): `h_pred(θ)` is the loop's output on chunk θ, not a linear head — "without
+   unrolling through memory" means each chunk's loop is independent (empty memory, fresh state), so
+   the chunks stay parallel; the loop itself is *not* skipped. Gradients use the inner-loop 2→5
+   truncation (§2.3). *(Implementation note, corrected — see notes §25/§26: the reference
+   implementation initially diverged, running a **linear** SSL through a separate projection space to
+   fight collapse (§2.4). That was later found to be the divergence, not the design: the on-loop SSL
+   is more collapse-robust, the projection head is unnecessary, and it is what actually trains the
+   loop to reason forward. The linear head was removed; SSL now runs on the loop, encoder-space,
+   co-equal with reconstruction, with the variance floor + reconstruction anchor + EMA target holding
+   collapse.)*
 
 2. **Grounded end-to-end loss** (expensive, Thought-Gestalt-style): periodically, run the Talker,
    take its NLL loss on realized tokens, and backprop through the latent thought, through the
@@ -182,35 +189,45 @@ Three properties make this severe and easy to miss:
 - **Absorbing.** The EMA target is a copy of the (collapsing) online encoder, so "predict a constant
   from a constant" is a stable fixed point with no gradient pressure to escape.
 
-The fix that removed it (verified: no collapse, no reconstruction regression):
+> **SUPERSEDED (notes §25/§26).** The fix below reached for a *separate SSL projection head* to
+> isolate a **linear** SSL. That was later found to be the divergence, not the design: §2.1's SSL is
+> meant to run *on the loop*. The §25.1 A/B showed on-loop SSL is *more* collapse-robust than the
+> linear one and the projection head is unnecessary — so it was removed. What survives from this
+> section: reconstruction as the always-on anchor (point 1), the variance floor (point 4), the slow
+> EMA target, and the two methodological lessons. What was removed: the separate projection head
+> (point 2) and the SSL down-weighting (point 3 — SSL now runs co-equal, weight 1.0, on the loop).
+> The historical account is kept below as the record of how the understanding evolved.
+
+The fix that removed it (verified at the time: no collapse, no reconstruction regression):
 1. **Reconstruction is the always-on anchor.** The grounded loss (§2.2) is an autoencoder and
    *cannot* be satisfied by a constant latent, so keeping it dominant — not thinned below SSL from
    Stage D — holds the shared encoder informative. This is the load-bearing part, and it validates
-   the framing in §3.7: reconstruction is an anchor, not a taperable regularizer.
+   the framing in §3.7: reconstruction is an anchor, not a taperable regularizer. **(Still true.)**
 2. **Separate SSL projection head.** The self-supervised loss operates on a projection of the shared
    latent (BYOL-style), with its own EMA copy, so if it still wants to collapse it collapses *its
-   own head* rather than the shared encoder — this resolves the §6 open question toward separate
-   heads.
+   own head* rather than the shared encoder. **(REMOVED, §26 — the on-loop SSL needs no isolation
+   head; this had severed the loop from its own predictive objective.)**
 3. **SSL demoted.** Cosine term down-weighted (≈0.1×) and EMA momentum raised (0.98 → 0.996: a
-   slower target is harder to chase into a constant).
+   slower target is harder to chase into a constant). **(SUPERSEDED — SSL is now the main predictive
+   signal, co-equal weight 1.0; the raised momentum stays.)**
 4. **Variance safety floor.** A VICReg-style hinge penalizes the shared latent's per-dimension
    variance falling below a *low* floor — dormant in normal operation, active only as the latent
    approaches collapse. The floor must sit *below* the encoder's natural scale; setting it too high
-   forces a rescale that itself hurts reconstruction (learned the hard way).
+   forces a rescale that itself hurts reconstruction (learned the hard way). **(Still true.)**
 
 Two methodological lessons fell out of this: (a) the validation metric must be
 **reconstruction-only** — adding the SSL term to eval at a different weight than training makes the
 Stage-D transition look like a regression when it isn't; (b) an anti-collapse regularizer is a
 *floor*, not a *target* — it must never drive the latent's scale, only prevent collapse to zero.
 
-One structural consequence of the separate-head fix deserves stating: once the SSL prediction
-lives in its own projection space, the SSL predictor **no longer provides an encoder-space
-next-latent map** — but that map is exactly what free-running generation needs (predict the next
-chunk's latent, feed it to the inner loop as the next injection). The fix therefore has to come
-with a dedicated generation head trained in the *shared encoder* space; to keep it from
-reintroducing the collapse pressure this section removed, it is trained with both its input and
-its target detached, so its loss reaches only the head itself — a pure readout, exactly like the
-Talker's relationship to the latent.
+One structural consequence of the separate-head fix deserved stating — and is now moot (notes §26):
+the projection-space SSL no longer provided an encoder-space next-latent map, which free-running
+generation needs (predict the next chunk's latent, feed it to the inner loop as the next injection),
+so a dedicated detached generation head was added to supply it. With the projection head removed and
+SSL back on the loop in encoder space, that map is exactly what the on-loop SSL trains directly:
+`pred_head(loop(encode(chunk_t)))` predicts chunk *t+1*'s encoder-space latent, and generation reuses
+that same head. The separate detached generation head was therefore removed too — one predictor, on
+the loop, serving both training and inference.
 
 ---
 
@@ -568,13 +585,14 @@ not the encoder from scratch.
 - What exactly gets written to memory: raw H-state vs. a separately-projected "gestalt readout"
   (decoupling "state needed to keep computing" from "state useful for other thoughts to attend to").
 - Interleave ratio and relative weighting between the self-supervised and grounded losses.
-  *(Partially resolved in the implementation (§2.4): reconstruction must dominate as the always-on
-  anchor and SSL must be secondary/down-weighted, or the latent collapses. The exact ratio and how
-  it should shift with scale remain open.)*
+  *(Updated, notes §26: reconstruction is the always-on anchor (frequency 1.0); the on-loop SSL now
+  runs co-equal (weight 1.0), not down-weighted — validated no-collapse at smoke scale. The exact
+  ratio and how it should shift with scale remain open and must be re-tuned at `small`+.)*
 - Whether the self-supervised and grounded losses should share projection heads on top of the
-  shared latent, or use separate heads to reduce objective interference. *(Resolved toward
-  **separate heads** (§2.4): a shared head collapsed the latent; a separate SSL projection head plus
-  an always-on reconstruction anchor fixed it.)*
+  shared latent, or use separate heads to reduce objective interference. *(Resolved toward **no
+  separate head** (notes §25/§26): the SSL runs on the HRM loop directly (encoder-space), and the
+  §25.1 A/B showed the separate projection head — earlier thought load-bearing (§2.4) — is
+  unnecessary and the on-loop loss is more collapse-robust.)*
 - Whether an explicit anti-sycophancy auxiliary loss (or contrastive training data) is added on
   top of the input/self lane separation, since the separation alone only creates the *possibility*
   of independent judgment, not the incentive for it.

@@ -71,7 +71,9 @@ def load(ckpt_path: str = CKPT):
     if missing:
         mods = sorted({k.split(".")[0] for k in missing})
         print(f"[generate] WARNING: checkpoint predates module(s) {mods}; they are "
-              f"randomly initialized -- latent prediction will be untrained.")
+              f"randomly initialized -- latent prediction will be untrained. "
+              f"(Pre-§25 checkpoints trained a different predictor head and cannot "
+              f"drive the HRM-loop predictor.)")
     if unexpected:
         raise SystemExit(f"checkpoint has unexpected keys (wrong model?): {unexpected[:5]}")
     model.eval()
@@ -141,11 +143,11 @@ def generate(model, chunker, cfg, prompt, n_chunks=3, temperature=0.9, greedy=Fa
     memory, h_state, l_state, last_latent = read_prompt(model, chunker, cfg, prompt)
     out_chunks = []
     for _ in range(n_chunks):
-        # JEPA next-segment prediction in ENCODER space (gen_predictor), the
-        # space the HRM injection expects. (latent_predictor lives in the
-        # separate SSL projection space and must not be used here -- feeding
-        # its output to the loop was the pre-review bug.)
-        pred_latent = model.gen_predictor(last_latent)
+        # Next-latent prediction in ENCODER space: the HRM loop itself produces it
+        # (run the loop on last_latent, read the next latent off the thought via
+        # pred_head -- the same map forward_self_supervised trains).
+        pred_latent, _ = model.predict_next_latent(last_latent, memory, h_state=h_state,
+                                                   l_state=l_state, grad_window=5, use_act=False)
         h_state, _ = model.hrm_loop(pred_latent, memory, None, h_state=h_state, l_state=l_state,
                                     grad_window=5, use_act=False)
         l_state = h_state

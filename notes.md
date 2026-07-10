@@ -920,3 +920,71 @@ hours for ~1.2B tokens, but do a timed 1k-doc dry run before committing.
 - `generate.py` against the existing pre-review `runs/model.pt`: loads with the
   explicit missing-module warning, `--score` matches expectations (ppl ~1.3k on
   the test sentence), generation path runs end-to-end.
+
+---
+
+## 16. Fourth pre-scale review (2026-07-09) — final read before the big run
+
+Another independent pass over spec + all code, same methodology (read →
+hypothesize → confirm by running → fix → re-verify), specifically to catch
+anything the §11/§15 passes missed before committing to an expensive run. The
+structural bugs those passes fixed (inner-loop truncation no-op §11.1, gen-head
+latent space §15.1, resume LR off-by-one §15.3) were re-confirmed **present and
+working**. One real latent bug found and fixed; two minor items surfaced and
+deliberately left for the owner to decide.
+
+### 16.1 C7 — `grounded_loss_min_frequency` default contradicted the §2.4 anti-collapse fix (latent bug, fixed)
+
+`config.TrainConfig.grounded_loss_min_frequency` still defaulted to **0.2** — a
+stale value from before the §2.4/§5 collapse fix. At that value, from Stage D
+the grounded (reconstruction) *anchor* loss runs only 20% of steps while SSL
+runs every step. That is **exactly** the collapse recipe §2.4 exists to remove
+and that §5 verified empirically flattens the shared encoder (cosine → ~0.996,
+reconstruction regresses the moment SSL turns on).
+
+- The **big-run path was already safe**: `train_scaled.py` and `train_real.py`
+  both explicitly override to `1.0` ("reconstruction stays the always-on
+  anchor").
+- But `train.py` — the README-documented real-data entry point
+  (`LATENT_USE_HF=1 python train.py`) — uses the bare `TrainConfig()` default,
+  so a real run launched that way would have re-triggered the collapse.
+
+Fix: changed the default to **1.0** in `config.py` (the stated single source of
+truth), with a comment tying it to the §2.4 correction, so *every* entry point
+is safe-by-default. The knob still exists for deliberate thinning; it just no
+longer defaults into the failure mode. Verified `TrainConfig().grounded_loss_min_frequency == 1.0`.
+
+### 16.2 Documented, deliberately NOT changed
+
+- **EMA target encoder runs with dropout active.** `EMATargetEncoder` never
+  puts its `target_encoder`/`target_proj` in `.eval()`, so the SSL cosine
+  target is stochastic per call. Low impact (target noise is mildly
+  anti-collapse and `cos_weight` is only 0.1), but a deterministic momentum
+  target is the standard BYOL/DINO choice. Left unchanged because it shifts
+  training dynamics and is not a correctness failure — flagged for the owner.
+- **`--resume` path asymmetry (UX).** `train_scaled.py` resolves `--cache` and
+  `--out` against the project root but passes `--resume` verbatim
+  (`trainer.load(args.resume)`), i.e. relative to cwd. A relative `--resume`
+  threw `FileNotFoundError` during re-verification until an absolute path was
+  used. Cosmetic; worth normalizing or documenting.
+
+### 16.3 Re-verification (what was actually run this pass)
+
+- **Full A→E via the exact big-run path** (`data_prep.py --offline --preset
+  smoke` → `train_scaled.py`, fixed budgets 4/4/4/4/4): all stage transitions
+  fire, `ssl`/`gen`/`ponder` log and move correctly (ponder activates at E),
+  checkpoints written, `latent_std` healthy (~0.43, no collapse).
+- **Checkpoint → `--resume`**: continues schedule-exact (LR picks up mid-cosine,
+  losses/`latent_std` continuous) — the §15.3 fix holding.
+- **bf16 autocast numerics on CPU** (`torch.autocast`, mirroring `rocm_smoke`'s
+  checks since the trainer forces AMP off on CPU): `forward_grounded` for stages
+  C / E-ACT / F-lanes, plus `forward_self_supervised` + `forward_gen_predictor`
+  — **all losses and grads finite**. The `--amp` path the ROCm run uses stays
+  finite through the ops that can NaN (hard_normalize division, Parcae
+  exp/softplus, masked softmax, CE).
+- **Multi-worker DataLoader** (`--num-workers 2`) and **`generate.py`**: both run
+  end-to-end.
+
+Net: only `config.py` changed. The scaled path was already collapse-safe; this
+closes the one remaining footgun in the shared default. No large training run
+was started.

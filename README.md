@@ -4,8 +4,9 @@ A PyTorch implementation of the architecture described in
 `latent-thought-architecture.md`, combining JEPA-Reasoner, HRM-Text,
 Thought Gestalt, and Parcae into a single model that thinks in latent
 "thoughts" (chunk-level vectors), each decoded into tokens by a separate
-Talker module, using a Parcae-stabilized HRM loop as the thinking
-mechanism.
+Talker module, using a diagonal-decay-gated HRM loop as the thinking
+mechanism (the decay gate is the Parcae paper's diagonal case; the
+depth-stability is MagicNorm's hard-norm, not the gate — see §3.3).
 
 This is a from-scratch reference implementation meant to be readable and
 traceable back to the design doc, not a production training pipeline. It runs
@@ -23,11 +24,12 @@ curves, and **generate** from the model.
 |---|---|---|
 | `config.py` | throughout | `ModelConfig`/`TrainConfig`/`DataConfig`, each field commented with its source section. `MODEL_PRESETS` + `model_config()` give size presets (`smoke`/`small`/`base`). `TrainConfig` also holds the scaling knobs (AMP, grad-accum, LR schedule, checkpointing, per-stage step budgets). |
 | `utils.py` | §3.6, §5.7.2 | Seeding, the post-hoc detach helper used by the *memory* truncation (the inner loop cuts its graph mid-loop instead — see `hrm_loop._TruncationSchedule` and notes §11.1), plateau detector. |
-| `parcae.py` | §0, §3.3 | Spectral-norm-constrained (discretized negative-diagonal) recurrent state transition, shared by the L- and H-modules. |
+| `decay_gate.py` | §0, §3.3 | Per-channel **diagonal decay gate** — the discretized negative-diagonal state transition (S4/Mamba `exp(-softplus·dt)` form), shared by the L- and H-modules. Depth-boundedness comes from `norm.py`'s hard-norm, not from this gate; the gate is the state carry path and shapes on-shell dynamics. |
+| `profile_transition.py` | §3.3, §5.5 | Measures the L-gate's share of a training step, to decide whether the loop-constant-`e` caching rewrite is worth doing. Reuses `bench_throughput.py`'s synthetic harness. |
 | `norm.py` | §0, §3.3 | MagicNorm: Pre-LN wrapper + hard normalization at recurrent-module exit. |
 | `chunker.py` | §3.1, §5.1 | `SegmentAnyTextChunker` — "SaT Capped" (SaT sentence boundaries + punctuation-aware length capping), matching Thought Gestalt's preprocessing. `encode_recent` slices recent raw tokens for the input lane. `TokenIdBoundaryChunker` is a legacy token-id fallback. |
 | `gestalt_memory.py` | §1.2, §3.6, §4.2 | FIFO memory bank with role tags (USER/SELF/SYSTEM) and truncated-gradient cross-attention reader. |
-| `hrm_loop.py` | §1.1, §3.2, §3.5, §5.5 | The inner HRM loop: fast L-module, slow H-module, Parcae stability, ACT adaptive depth (ponder cost rewards halting), and in-loop truncated BPTT (`_TruncationSchedule` — the §3.5 grad window, cut mid-loop on the carried states). |
+| `hrm_loop.py` | §1.1, §3.2, §3.5, §5.5 | The inner HRM loop: fast L-module, slow H-module, the diagonal decay gate, ACT adaptive depth (ponder cost rewards halting), and in-loop truncated BPTT (`_TruncationSchedule` — the §3.5 grad window, cut mid-loop on the carried states). |
 | `talker.py` | §1.3 | Lightweight causal decoder reconstructing a chunk's tokens from a finished thought. Teacher forcing is right-shifted internally (learned start vector) so it can't trivially copy the input; boolean causal mask (MPS/AMP-safe). |
 | `input_lane.py` | §4.1, §4.2 | Bidirectional input-lane encoder; read-only via cross-attention, never writes recurrent self-state. All-masked-row guard against NaN. |
 | `ema_target.py` | §2.1, §3.4 | `ChunkEncoder` (the shared latent producer) + `EMATargetEncoder`, a momentum copy of the encoder **and** the SSL projection head, with `state_dict`/`load_state_dict` for checkpointing. All-pad-row guard. |

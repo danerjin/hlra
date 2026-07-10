@@ -9,9 +9,10 @@ recurrent deliberation, structurally identical to HRM-Text's L/H split:
     "strategic" state forward -- this is the role Thought Gestalt's
     sentence-vector plays, generalized to arbitrary thought-chunks.
 
-Both modules are Parcae-stabilized recurrences (parcae.py) with MagicNorm's
-hard normalization applied at the exit of every L-step and every H-step
-(norm.py). The L:H ratio (3:1) is an empirical HRM-Text hyperparameter,
+Both modules are diagonal-decay-gated recurrences (decay_gate.py) with
+MagicNorm's hard normalization applied at the exit of every L-step and every
+H-step (norm.py) -- that hard-norm is what bounds the state at any depth, not
+the decay gate. The L:H ratio (3:1) is an empirical HRM-Text hyperparameter,
 *not* derived (§3.2) -- once ACT is turned on (Stage E, §5.5) the model can
 learn to spend a different number of fast/slow steps per thought; before
 that it's a fixed schedule from the config.
@@ -40,7 +41,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from parcae import ParcaeStateTransition
+from decay_gate import DiagonalDecayGate
 from norm import hard_normalize
 from gestalt_memory import GestaltCrossAttentionReader, GestaltMemoryBank
 
@@ -110,8 +111,8 @@ class HaltingHead(nn.Module):
 class HRMInnerLoop(nn.Module):
     """
     Produces one thought vector from a chunk embedding, given the current
-    persistent gestalt memory. Encapsulates the L/H recurrence, Parcae
-    stability, MagicNorm hard-normalization, cross-attention into memory,
+    persistent gestalt memory. Encapsulates the L/H recurrence, the diagonal
+    decay gate, MagicNorm hard-normalization, cross-attention into memory,
     and (optionally) ACT adaptive depth.
     """
 
@@ -125,10 +126,10 @@ class HRMInnerLoop(nn.Module):
         self.h_updates_per_thought = h_updates_per_thought
         self.act_max_ponder_steps = act_max_ponder_steps
 
-        # Separate Parcae-stable recurrences for the fast and slow modules --
-        # they share the primitive (parcae.py) but hold independent weights.
-        self.l_transition = ParcaeStateTransition(d_model, d_ff, dropout, min_decay, max_decay)
-        self.h_transition = ParcaeStateTransition(d_model, d_ff, dropout, min_decay, max_decay)
+        # Separate decay-gated recurrences for the fast and slow modules --
+        # they share the primitive (decay_gate.py) but hold independent weights.
+        self.l_transition = DiagonalDecayGate(d_model, d_ff, dropout, min_decay, max_decay)
+        self.h_transition = DiagonalDecayGate(d_model, d_ff, dropout, min_decay, max_decay)
 
         # Cross-attention into the persistent gestalt memory (read only; the
         # write happens once per finished thought, outside this module).

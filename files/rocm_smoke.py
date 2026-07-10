@@ -13,7 +13,7 @@ Checks, in order (each must stay finite):
   3. ONE real forward_grounded + backward of the model under bf16 autocast is
      finite. This is the load-bearing check: it exercises exactly the ops that
      can NaN under mixed precision -- the HRM loop's hard_normalize division,
-     Parcae's exp/softplus, the masked-softmax guards, and the CE loss.
+     the decay gate's exp/softplus, the masked-softmax guards, and the CE loss.
   4. ONE forward_self_supervised (the SSL cosine/variance path) under autocast.
 
 Exit 0 => the training path runs and stays finite on this GPU. Any NaN/Inf ->

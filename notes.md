@@ -1321,3 +1321,97 @@ guard, 19.6 archives + amp gate), `files/config.py` + `files/train_scaled.py`
 (19.6 archive knob), `files/data.py` (19.6 cache guard), `files/parcae.py` +
 `files/bench_throughput.py` + `README.md` + `latent-thought-architecture.md`
 (19.7), `notes.md` (this section).
+
+---
+
+## 20. "Is Parcae actually relevant?" — honest rename + a deferred optimization (2026-07-10)
+
+Prompted by a plain question: is the "Parcae" state transition actually doing
+what the doc credits it with, and is it *necessarily* Parcae at all?
+
+### 20.1 The finding (no code behavior at stake — a naming/claim audit)
+
+The looped state transition (`h_{n+1} = a⊙h + B·e + R(h,e)`, then hard_normalize)
+is a **generic per-channel diagonal decay gate** — the S4/Mamba discretization
+`a = exp(-softplus(theta)·dt) ∈ (0,1)`. There is no Parcae-specific machinery in
+it: a per-channel scalar in (0,1) satisfies "spectral norm < 1" trivially, by
+construction. The Parcae paper's actual contribution (a spectral-norm constraint
+on a full looped-*transformer* transition) is **not implemented**; we use only
+its trivial diagonal case. So the primitive is not "necessarily Parcae" — it is a
+gated residual / leaky-integrator cell that Parcae happens to be one citation for.
+
+What the gate does and does not do (sharpens §1.1's earlier correction):
+- **Does not** bound the state at depth — `R` is an unconstrained nonlinear MLP,
+  so a contractive `a` bounds nothing. Boundedness is entirely MagicNorm's
+  hard_normalize (re-projection onto ‖h‖=√d each step). Already logged in §1.1.
+- **Does** two real jobs: (1) it is the only *linear carry path* propagating
+  state across steps (remove `a⊙h` and all carry-over must route through `R`);
+  (2) keeping the linear part contractive *shapes* the on-shell dynamics toward
+  convergence rather than orbiting — which is the mechanism we *hope* buys
+  predictable, saturating test-time-depth scaling. That last part is an
+  **empirical claim to measure** (the §5.5 depth sweep), not a guarantee the
+  gate provides. The clean ablation that would settle it: full gate vs. `a`
+  frozen at a constant vs. `a` removed — if frozen==full, the "spectral" story
+  is really just "a leaky-integrator carry path" and can be dropped from the
+  narrative.
+
+### 20.2 Rename (behavior-preserving — forward left byte-identical)
+
+Renamed the primitive to describe what it is. **The `forward()` was not touched**,
+so training numerics are unchanged:
+- `files/parcae.py` → `files/decay_gate.py`; class `ParcaeStateTransition` →
+  `DiagonalDecayGate`. Docstring rewritten with the honesty note above.
+- Config `parcae_min_decay`/`parcae_max_decay` → `decay_min`/`decay_max`
+  (`config.py`), updated at the single read site (`model.py`).
+- Import + comments in `hrm_loop.py`; mechanism references in `norm.py`,
+  `rocm_smoke.py`, `STRIX_HALO.md`.
+- Docs: `README.md` (file-map row, intro), `latent-thought-architecture.md`
+  (intro + a §3.3 bridge note mapping the doc's "Parcae" to `DiagonalDecayGate`).
+  The **Parcae paper citation is kept** as prior art (§0 bullet, §3.3) — it is a
+  real influence; only the claim that our primitive *is* Parcae's mechanism was
+  removed. Verified: no dangling `parcae` symbols in code (only two intentional
+  paper citations in `decay_gate.py`), all files byte-compile.
+
+### 20.3 A real but deferred optimization: loop-constant-`e` caching
+
+Verified at `hrm_loop.py` (the L-group): inside the fast loop,
+`e = chunk_embed + h_state` is **constant across all `l_steps_per_h_update`
+iterations** (neither term changes until the H-update). Yet `DiagonalDecayGate`
+recomputes the e-dependent matmuls — `B·e` and the e-half of the residual's first
+layer — on every L-step. Only the h-dependent half genuinely changes. Splitting
+the cell into `precompute(e)` (once per group) + `step(h)` (per iteration) would
+remove ~1/3 of the L-gate's per-step matmuls, algebraically exact
+(`W·[h;e] = W_h·h + W_e·e`), zero quality change. Only the L-loop benefits (the
+H-transition runs once per group).
+
+**Not applied yet, on purpose.** Precomputing `e` freezes its autograd attachment
+for the whole group, whereas the current code re-derives it each step *after*
+`trunc.maybe_detach`. If a truncated-BPTT detach boundary falls mid-L-loop, the
+gradient reaching `h_state` through the e-path changes — and the truncation path
+was just fixed (§19, f74b82e9 / cba8804f). So this is a real change with a real
+regression surface, not a free lunch. Gated behind a measurement.
+
+### 20.4 `profile_transition.py` — the go/no-go for 20.3
+
+New script (reuses `bench_throughput.py`'s synthetic harness): hooks the L-gate /
+H-gate / reasoner, prints each one's forward share of a step, and estimates what
+the caching would save (~1/3 of L-gate time). Rule of thumb baked into the
+output: if the estimated saving is under ~2–3% of a step, the caching is **not**
+worth perturbing the truncated-BPTT path before the scaled run. Run it on the
+ROCm box (torch not installed on the dev box), like bench:
+`python profile_transition.py --preset small --batch-size 16`.
+
+### 20.5 Deliberately left alone
+
+- `build_deck.py` — the slide deck still lists "Parcae" as one of the four
+  ingredient chips (presentation branding; rename only if the deck should match).
+- Earlier `notes.md` entries (incl. the §19.7 `parcae.py` filename references) —
+  historical log, not rewritten. This §20 is the forward pointer.
+
+Files changed this session: `files/parcae.py` → `files/decay_gate.py` (rename +
+honest docstring), `files/hrm_loop.py` (import/comments), `files/config.py`
+(field rename), `files/model.py` (read site), `files/norm.py` +
+`files/rocm_smoke.py` + `STRIX_HALO.md` (mechanism wording),
+`files/profile_transition.py` (new, 20.4), `README.md` +
+`latent-thought-architecture.md` (20.2 docs), `notes.md` (this section). No
+training run started; forward numerics unchanged.

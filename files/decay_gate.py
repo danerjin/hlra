@@ -1,36 +1,47 @@
 """
-parcae.py
-=========
-Implements Parcae's fix for looped-transformer instability (§0, §3.3):
+decay_gate.py
+=============
+A per-channel **diagonal decay gate** -- the recurrent state-transition cell
+used by both the fast L-module and the slow H-module (they share this
+primitive but hold separate weights, see hrm_loop.py). The update run is:
 
-    h_{n+1} = A h_n + B*e + R(h_n, e)
+    h_{n+1} = a ⊙ h_n + B·e + R(h_n, e)
 
 where:
-  - `A` is a *discretized negative-diagonal* state-transition matrix whose
-    spectral norm is constrained to stay inside the unit circle -- this is
-    what gives a stability guarantee that holds *at any depth*, which is
-    exactly what's needed once inner-loop depth becomes test-time-adaptive
-    (§1.1 "adaptive depth", §3.3).
-  - `B*e` is the (normalized) injection of the current external input `e`
-    (a chunk embedding, or the H-module's context depending on where this
-    is used).
-  - `R(h_n, e)` is the ordinary nonlinear residual (a small transformer
-    sublayer), which is where MagicNorm's PreNorm/hard-norm discipline is
-    applied (see norm.py). MagicNorm and Parcae are complementary, not
-    redundant: MagicNorm bounds *training-time* variance under truncated
-    BPTT, Parcae's constraint bounds the *forward map* at arbitrary depth
-    (§3.3). Both are used here.
+  - `a` is a per-channel decay in (0, 1), the diagonal of the state-transition
+    matrix. It is a learned **leaky-integrator carry path**: each channel picks
+    its own memory timescale. This is the S4/Mamba diagonal discretization
+    (below), not the spectral-norm machinery of the Parcae paper -- see the
+    honesty note.
+  - `B·e` is the (RMS-normalized) injection of the current external input `e`
+    (a chunk embedding, or the H-module's context, depending on the caller).
+  - `R(h_n, e)` is an ordinary nonlinear residual (a small feed-forward
+    sublayer) over the concatenation of state and input.
+
+Where the stability actually comes from (honesty note)
+------------------------------------------------------
+`R` is an unconstrained nonlinear term, so a contractive `a` does **not** bound
+this map. Boundedness at arbitrary loop depth comes entirely from MagicNorm's
+hard-normalization (norm.py), which re-projects h onto the fixed-norm shell
+‖h‖=√d at the exit of every L- and H-step. This gate does two real jobs:
+  1. it is the linear carry path that propagates state across steps (without
+     it, all state carry-over would have to route through `R`); and
+  2. keeping the linear part contractive *shapes* the on-shell dynamics toward
+     convergence rather than orbiting -- which is the mechanism we *hope* buys
+     predictable, saturating test-time-depth scaling. That is an empirical
+     claim to be measured (see profile_transition.py / the §5.5 sweep), not a
+     guarantee this primitive provides. The Parcae paper's spectral-norm
+     constraint on a full looped-transformer transition is the inspiration; we
+     implement only the trivial diagonal case.
 
 Negative-diagonal discretization
 ---------------------------------
-Following the S4/Mamba family of discretizations: a continuous-time
-negative-diagonal generator `-softplus(theta)` is discretized with a
-per-channel step size `dt` via `A = exp(-softplus(theta) * dt)`. Because
-`softplus(theta) * dt > 0`, `exp(-softplus(theta)*dt)` lies in `(0, 1)` for
-every channel, so the elementwise (diagonal) spectral norm of `A` is
-guaranteed < 1 for any number of steps -- there is no "eigenvalue drifted
-outside the unit circle" failure mode, no matter how deep the loop is run
-at test time.
+Following the S4/Mamba family: a continuous-time negative-diagonal generator
+`-softplus(theta)` is discretized with a per-channel step size `dt` via
+`a = exp(-softplus(theta) * dt)`. Because `softplus(theta) * dt > 0`, each
+`a` lies in `(0, 1)` for every channel by construction, for any number of
+steps -- there is no "eigenvalue drifted outside the unit circle" failure mode
+no matter how deep the loop runs at test time.
 """
 from __future__ import annotations
 
@@ -39,9 +50,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ParcaeStateTransition(nn.Module):
+class DiagonalDecayGate(nn.Module):
     """
-    A single Parcae-stabilized recurrent update, reused for both the fast
+    A single diagonal-decay recurrent update, reused for both the fast
     L-module and the slow H-module inner-loop updates (they share this
     primitive but hold separate parameters -- see hrm_loop.py).
     """
@@ -62,10 +73,9 @@ class ParcaeStateTransition(nn.Module):
         self.log_dt = nn.Parameter(torch.zeros(d_model))
 
         # Injection projection B (applied to the external input e). The
-        # design doc calls for the injection to be *normalized* -- we do
-        # this by RMS-normalizing e before the linear projection, which
-        # bounds the injection's contribution to the update independent of
-        # the raw scale of e.
+        # injection is *normalized* -- we RMS-normalize e before the linear
+        # projection, which bounds the injection's contribution to the update
+        # independent of the raw scale of e.
         self.B = nn.Linear(d_model, d_model, bias=False)
 
         # Nonlinear residual R(h, e): a small feed-forward "transformer
@@ -84,9 +94,9 @@ class ParcaeStateTransition(nn.Module):
 
     def diagonal_decay(self) -> torch.Tensor:
         """
-        Returns the diagonal entries of A, each guaranteed to lie strictly
-        inside (min_decay, max_decay) subset of (0, 1). This is the
-        elementwise spectral norm of the (diagonal) state-transition matrix.
+        Returns the diagonal entries of the state transition, each guaranteed
+        to lie strictly inside (min_decay, max_decay) subset of (0, 1). This is
+        the elementwise spectral norm of the (diagonal) state-transition matrix.
         """
         dt = F.softplus(self.log_dt) + 1e-4
         decay = torch.exp(-F.softplus(self.theta) * dt)

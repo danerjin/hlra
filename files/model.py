@@ -93,8 +93,8 @@ class LatentThoughtModel(nn.Module):
             d_model=cfg.d_model, d_ff=cfg.d_ff, n_heads=cfg.n_heads, dropout=cfg.dropout,
             l_steps_per_h_update=cfg.l_steps_per_h_update,
             h_updates_per_thought=cfg.h_updates_per_thought,
-            n_roles=len(cfg.role_tags), min_decay=cfg.parcae_min_decay,
-            max_decay=cfg.parcae_max_decay, act_max_ponder_steps=cfg.act_max_ponder_steps,
+            n_roles=len(cfg.role_tags), min_decay=cfg.decay_min,
+            max_decay=cfg.decay_max, act_max_ponder_steps=cfg.act_max_ponder_steps,
         )
 
         # --- Input lane (§4.1, §4.2) -----------------------------------

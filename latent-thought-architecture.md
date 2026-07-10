@@ -2,7 +2,9 @@
 
 Combining **JEPA-Reasoner**, **HRM-Text**, **Thought Gestalt**, and **Parcae** into a single model
 that thinks in latent thoughts — each decoded into multiple tokens — using HRM-style looping
-(a Parcae-stabilized looped transformer) as the "thinking" mechanism.
+as the "thinking" mechanism. The looped state transition is a **diagonal decay gate** (`decay_gate.py`) —
+Parcae's negative-diagonal case, adopted for its stable carry path; the actual depth-stability is
+supplied by MagicNorm's hard-normalization, not the gate's spectral norm (see §3.3).
 
 ---
 
@@ -237,6 +239,10 @@ stays a fixed hyperparameter, which is exactly what Stage E does — ACT there v
 cycles per thought while the L:H ratio inside each cycle remains fixed (§5.5).
 
 ### 3.3 Parcae's spectral-norm stabilization *alongside*, not instead of, MagicNorm
+*(In code the looped transition is `decay_gate.DiagonalDecayGate` — we implement Parcae's diagonal
+`exp(-softplus·dt)` case, a per-channel decay in (0,1), not the paper's full spectral-norm-constraint
+machinery. "Parcae's constraint" below refers to that diagonal contraction.)*
+
 These fix different failure modes, and it's worth being precise about which mechanism supplies
 which guarantee — because the update actually run is `h_{n+1} = A h_n + B·e + R(h_n, e)`, and a
 spectral-norm constraint on `A` alone does **not** bound that map. `R` is an unconstrained

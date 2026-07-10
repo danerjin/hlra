@@ -37,12 +37,13 @@ class ModelConfig:
     inner_loop_grad_window_start: int = 2
     inner_loop_grad_window_end: int = 5
 
-    # ---- Parcae stability (§0, §3.3) -----------------------------------
-    # Discretized negative-diagonal state transition; eigenvalues are kept
-    # strictly inside the unit circle regardless of how many steps are run,
-    # which is what test-time-adaptive depth requires (see parcae.py).
-    parcae_min_decay: float = 0.01
-    parcae_max_decay: float = 0.99
+    # ---- diagonal decay gate (§0, §3.3) --------------------------------
+    # Per-channel decay of the state-transition cell; the exp(-softplus·dt)
+    # construction keeps each channel's decay strictly inside (0, 1) for any
+    # number of steps (see decay_gate.py). Note: boundedness at arbitrary
+    # depth comes from MagicNorm's hard-norm (norm.py), not from this gate.
+    decay_min: float = 0.01
+    decay_max: float = 0.99
 
     # ---- gestalt memory (§1.2, §3.6) -----------------------------------
     memory_capacity: int = 64      # FIFO capacity (slots), per example
@@ -204,7 +205,7 @@ class DataConfig:
 #   large     1024           8 / 8 / 6           560M            37%
 #   xl        1280          12 / 12 / 8          1.03B           25%
 #
-# The non-size hyperparameters (Parcae decay, ema_momentum, cosine_loss_k,
+# The non-size hyperparameters (decay-gate min/max, ema_momentum, cosine_loss_k,
 # act_ponder_cost, the grad-truncation windows, loss weights) were tuned on the
 # smoke run and should be RE-TUNED per scale -- notably cosine_loss_k is width-
 # dependent (§3.4) and the anti-collapse weights/momentum were set on the 1.5M-

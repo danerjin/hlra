@@ -41,7 +41,7 @@ cd files && python rocm_smoke.py --preset small     # add HSA_OVERRIDE if needed
 Runs on synthetic tensors (no data). Verifies torch sees the GPU, a bf16 matmul
 is finite, and one real `forward_grounded` + `forward_self_supervised` + ACT
 step stays finite under bf16 autocast — i.e. the ops most likely to NaN under
-mixed precision (hard_normalize division, Parcae exp/softplus, masked softmax,
+mixed precision (hard_normalize division, decay-gate exp/softplus, masked softmax,
 CE). **Use bf16, not fp16** (RDNA 3.5 has bf16; keeps fp32 range, needs no
 GradScaler). `PASS` == the training path is numerically safe on this GPU.
 

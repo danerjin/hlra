@@ -13,9 +13,10 @@ inside every recurrent module (the L-module and the H-module):
    fixed-norm shell (norm = sqrt(d_model)). This bounds forward variance
    across the *forward* horizon N even though gradients are only ever
    truncated to the last K steps -- MagicNorm's stability argument is about
-   training dynamics under truncated BPTT (§3.3), which is a different
-   guarantee than Parcae's "stable at any depth" spectral-norm constraint.
-   Keeping both is deliberate, not redundant.
+   training dynamics under truncated BPTT (§3.3). This hard-norm is *also*
+   what bounds the state at arbitrary loop depth; the diagonal decay gate
+   (decay_gate.py) does not -- it shapes the on-shell dynamics, it does not
+   bound them. Keeping both is deliberate, not redundant.
 """
 from __future__ import annotations
 

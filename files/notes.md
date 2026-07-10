@@ -426,77 +426,6 @@ which scale. Added (no training run — verified offline):
 
 ---
 
-## 12. Investigating the "D/E regresses reconstruction" claim (2026-07-09)
-
-Prompted by a full-curriculum overfit run on one Wikipedia page (~5.8k gpt2
-tokens, smoke preset) where held-out val rose across Stages D/E (7.3 -> 7.9),
-looking like SSL/ACT were damaging reconstruction. Dug in with a controlled
-ablation; **the SSL/ACT hypothesis was largely wrong.**
-
-### 12.1 First ablation was contaminated (a methodology lesson)
-Branched four arms (control / +SSL / +ACT / +both) from a common grounded-only
-init, each with a **fresh** AdamW. The *control itself diverged* (ppl
-458 -> 14000), which is impossible if grounded-only is stable (it drives ppl ->
-1.0 given a continuous run). Cause: a fresh optimizer with zero second-moment
-estimates takes huge first steps at lr 3e-4 on an already-trained model.
-**Lesson: to model a curriculum stage transition you must carry the optimizer
-state** (as `Trainer` does -- one optimizer across all stages). Re-ran carrying
-`opt.state_dict()`.
-
-### 12.2 Corrected ablation (held LR 3e-4, continuous optimizer, common init)
-All arms *improve* smoothly from ppl 458 over 300 steps:
-
-| arm | final recon ppl | vs control |
-|---|---|---|
-| control (grounded only) | **11.6** | -- |
-| +SSL (Stage D) | 14.0 | ~20% worse |
-| +ACT (Stage E) | 12.0 | ~neutral |
-| +SSL +ACT | 14.6 | ~25% worse |
-| +SSL, cos_w 0.02 | 12.4 | penalty halved |
-| +SSL, encoder-detached | 11.9 | penalty gone |
-
-Findings: **ACT is innocent** (12.0 ≈ 11.6, and ACT-mode eval matches
-fixed-depth). **SSL costs a small ~20%**, and it is exactly the shared-encoder
-coupling: `forward_self_supervised` does *not* stop-grad `chunk_encoder`, so the
-cosine term trains the shared encoder that reconstruction decodes from.
-Stop-grad'ing it (or cos_w 0.02) removes the penalty. Neither loss produces the
-big "regression".
-
-### 12.3 The actual cause: LR starvation + overfitting confound
-The dramatic D/E rise was two artifacts, not model damage:
-1. **Global cosine LR starves late stages.** One cosine over the whole A..E
-   horizon means D/E run at the tail. Measured on the wiki curriculum: Stage E
-   saw lr **5.5e-5** (global) vs the intended **3.0e-4** (per-stage) -- ~5x
-   starved, so D/E couldn't keep learning.
-2. **Held-out val on 8 paragraphs is overfitting-dominated.** On a 45-paragraph
-   train set the model memorizes; held-out val rising is overfitting, not a
-   reconstruction regression. Full-page (train) reconstruction never regressed
-   under a held LR.
-
-### 12.4 The fix (implemented, opt-in)
-`trainer._lr` + `TrainConfig.per_stage_lr` + `train_scaled --lr-schedule`:
-a **per-stage warmup->cosine over each stage's own budget**, so every stage
-starts with a usable LR and still anneals. Default is `per-stage` on the scaled
-path; `--lr-schedule global` reverts. Verified it delivers 3e-4 to D/E (vs
-5.5e-5). **Honest caveat: on this toy the fix is ~neutral** (final recon ppl
-407 global vs 425 per-stage -- within noise), because reconstruction quality
-here is dominated by total grounded exposure, not per-stage LR. Its benefit is a
-**scale hypothesis**: with the real DEFAULT_STAGE_STEPS (2000+/stage) the global
-cosine starves E far harder than at 200 steps/stage, so per-stage should matter
-more on the big run. Watch full-page/train reconstruction (not held-out val) at
-the D/E boundaries to confirm.
-
-### 12.5 Left as decisions, not silently changed
-- **SSL shared-encoder coupling.** Genuine tension: C2 (§1.2 fix) deliberately
-  *connected* SSL to the shared encoder; §2.4's collapse-fix framing says SSL
-  should touch only its own head. Fully stop-grad'ing reverts C2. Recommend
-  leaving cos_w=0.1 (its payoff is generalization at scale, which a memorization
-  toy can't show) but flag cos_w / stop-grad as knobs if reconstruction is hurt
-  at scale.
-- **Stage budgets.** For memorizing one page the dominant lever is grounded
-  exposure (bigger A-D), not the schedule -- but that trades against SSL/ACT
-  time and is scale-dependent; not retuned off the toy.
-
 ## 10. Key numbers, one place
 
 - Chance NLL, gpt2 vocab: ln(50258) = **10.82**.
@@ -507,6 +436,10 @@ the D/E boundaries to confirm.
 - Fixed run: val **7.84 (C) → ~7.8 (D/E, flat)**; latent std **~0.24–0.56**; ppl **~3136**.
 - Streaming pile-10k: **~7 s/doc**; compute **~1.0 s/step** (CPU ≈ MPS).
 - Env: `.venv` torch **2.2.2**, datasets **2.21.0**, transformers **4.57.6**, numpy **1.26.4**, matplotlib **3.9.4**.
+- Small-preset shakedown (MPS): A→E in ~12 min, **~33 s/step** (batch 4); latent_std **0.48–0.67** across the D boundary (§13.1).
+- Wiki-page overfit, grounded-only: reconstruction **59,013 → 1.0 ppl** — the architecture *does* memorize (§13.2).
+- Fair-scale baselines, same page: GPT same-params (44.7M) **ppl 1.1** (verbatim); GPT same-compute (14.1M) **484**; latent grounded-only **1.0** (§13.3).
+- Chinchilla-equivalent for `small` (153M): compute-active N **75.4M → ~1.2B tokens** (naive-total would say 3.06B) (§14.1).
 
 ---
 
@@ -629,3 +562,171 @@ encoder launches; matters at 32 chunks/doc).
 - ACT remains per-batch (M4), and in mixed batches finished documents' rows
   still contribute to the batch-mean halt probability.
 - `CachedChunkDataset` remains in-RAM (memmap when corpora get big).
+
+---
+
+## 12. Investigating the "D/E regresses reconstruction" claim (2026-07-09)
+
+Prompted by a full-curriculum overfit run on one Wikipedia page (~5.8k gpt2
+tokens, smoke preset) where held-out val rose across Stages D/E (7.3 -> 7.9),
+looking like SSL/ACT were damaging reconstruction. Dug in with a controlled
+ablation; **the SSL/ACT hypothesis was largely wrong.**
+
+### 12.1 First ablation was contaminated (a methodology lesson)
+Branched four arms (control / +SSL / +ACT / +both) from a common grounded-only
+init, each with a **fresh** AdamW. The *control itself diverged* (ppl
+458 -> 14000), which is impossible if grounded-only is stable (it drives ppl ->
+1.0 given a continuous run). Cause: a fresh optimizer with zero second-moment
+estimates takes huge first steps at lr 3e-4 on an already-trained model.
+**Lesson: to model a curriculum stage transition you must carry the optimizer
+state** (as `Trainer` does -- one optimizer across all stages). Re-ran carrying
+`opt.state_dict()`.
+
+### 12.2 Corrected ablation (held LR 3e-4, continuous optimizer, common init)
+All arms *improve* smoothly from ppl 458 over 300 steps:
+
+| arm | final recon ppl | vs control |
+|---|---|---|
+| control (grounded only) | **11.6** | -- |
+| +SSL (Stage D) | 14.0 | ~20% worse |
+| +ACT (Stage E) | 12.0 | ~neutral |
+| +SSL +ACT | 14.6 | ~25% worse |
+| +SSL, cos_w 0.02 | 12.4 | penalty halved |
+| +SSL, encoder-detached | 11.9 | penalty gone |
+
+Findings: **ACT is innocent** (12.0 ≈ 11.6, and ACT-mode eval matches
+fixed-depth). **SSL costs a small ~20%**, and it is exactly the shared-encoder
+coupling: `forward_self_supervised` does *not* stop-grad `chunk_encoder`, so the
+cosine term trains the shared encoder that reconstruction decodes from.
+Stop-grad'ing it (or cos_w 0.02) removes the penalty. Neither loss produces the
+big "regression".
+
+### 12.3 The actual cause: LR starvation + overfitting confound
+The dramatic D/E rise was two artifacts, not model damage:
+1. **Global cosine LR starves late stages.** One cosine over the whole A..E
+   horizon means D/E run at the tail. Measured on the wiki curriculum: Stage E
+   saw lr **5.5e-5** (global) vs the intended **3.0e-4** (per-stage) -- ~5x
+   starved, so D/E couldn't keep learning.
+2. **Held-out val on 8 paragraphs is overfitting-dominated.** On a 45-paragraph
+   train set the model memorizes; held-out val rising is overfitting, not a
+   reconstruction regression. Full-page (train) reconstruction never regressed
+   under a held LR.
+
+### 12.4 The fix (implemented, opt-in)
+`trainer._lr` + `TrainConfig.per_stage_lr` + `train_scaled --lr-schedule`:
+a **per-stage warmup->cosine over each stage's own budget**, so every stage
+starts with a usable LR and still anneals. Default is `per-stage` on the scaled
+path; `--lr-schedule global` reverts. Verified it delivers 3e-4 to D/E (vs
+5.5e-5). **Honest caveat: on this toy the fix is ~neutral** (final recon ppl
+407 global vs 425 per-stage -- within noise), because reconstruction quality
+here is dominated by total grounded exposure, not per-stage LR. Its benefit is a
+**scale hypothesis**: with the real DEFAULT_STAGE_STEPS (2000+/stage) the global
+cosine starves E far harder than at 200 steps/stage, so per-stage should matter
+more on the big run. Watch full-page/train reconstruction (not held-out val) at
+the D/E boundaries to confirm.
+
+### 12.5 Left as decisions, not silently changed
+- **SSL shared-encoder coupling.** Genuine tension: C2 (§1.2 fix) deliberately
+  *connected* SSL to the shared encoder; §2.4's collapse-fix framing says SSL
+  should touch only its own head. Fully stop-grad'ing reverts C2. Recommend
+  leaving cos_w=0.1 (its payoff is generalization at scale, which a memorization
+  toy can't show) but flag cos_w / stop-grad as knobs if reconstruction is hurt
+  at scale.
+- **Stage budgets.** For memorizing one page the dominant lever is grounded
+  exposure (bigger A-D), not the schedule -- but that trades against SSL/ACT
+  time and is scale-dependent; not retuned off the toy.
+
+---
+
+## 13. Scaling & baseline experiments (2026-07-08/09)
+
+Three experiments run after the §11 fixes, to answer: does the pipeline work at
+real scale, does the architecture actually *learn*, and how does it compare to a
+plain transformer at matched scale. All on MPS/CPU (no GPU yet).
+
+### 13.1 Small-preset shakedown (pipeline at 153M)
+Pre-chunked 1,401 pile-10k docs (`small` preset, gpt2) into a cache, then walked
+A→E via `train_scaled` on MPS in ~12 min (**~33 s/step**, batch 4). Confirmed:
+all stages fire (SSL at D, ACT at E), `latent_std` healthy **0.48–0.67** across
+the D boundary, val monotone with **no artificial jumps at D/E** (the M6 eval-fix
+holding), and checkpoint→resume works (RNG restore, 1.7 GB ckpt). Purpose was
+*plumbing*, not learning: 22 steps sits at chance, and — a useful lesson — with
+`warmup=100` > total steps the LR never left warmup, so the flat loss measured
+the schedule, not the model.
+
+### 13.2 Single-page overfit — the architecture *does* learn
+Built a tiny high-quality corpus: the Wikipedia "Solar System" article via the
+API, ~5.8k gpt2 tokens, split into 53 paragraph docs (`wiki_cache`, smoke
+preset). Full A→E drove reconstruction hard once warmup completed (val 10.95 →
+~7.2 in Stage A). The decisive test — **grounded-only** (loop+memory, no SSL/ACT,
+held LR 3e-4, 1500 steps) — drove page reconstruction **59,013 → 1.0 ppl**: the
+architecture memorizes the page. The earlier ~936 "plateau" was a curriculum
+artifact (§12), not an architecture wall. Caveat: at ppl 1.0 teacher-forced,
+free-running greedy decode is still only *partially* coherent (some chunks
+verbatim, others degenerate) — the autoregressive-dilution-through-bottleneck
+caveat (§5.4, §7).
+
+### 13.3 Fair-scale baseline vs a vanilla GPT (`baseline_gpt.py`)
+New file `baseline_gpt.py`: a standard pre-LN decoder GPT, same gpt2 tokenizer /
+text / optimizer / steps. Two presets, because "same scale" is ambiguous when
+67–90% of the latent model's params are duplicate embedding tables:
+`same-params` (44.7M, d512×6, matches *total* params) and `same-compute` (14.1M,
+d192×10, matches *width* + ~4.5M non-embedding compute). **Bug caught+fixed:**
+no GPT-style weight init → default `N(0,1)` embeddings made init CE 112–320
+(should be ~10.8), wasting ~300 steps and unfairly handicapping the *wider*
+model; post-fix init CE ≈ 10.86.
+
+Results (teacher-forced page ppl): `same-params` **1.1** (generates the page
+verbatim); `same-compute` **484** (degenerate); latent grounded-only **1.0**
+(§13.2). Honest reading: (a) at the same *total* size a vanilla GPT memorizes
+trivially and is far more parameter-efficient; (b) the latent's ppl is on an
+*easier* task (reconstruction *with* lookahead) than the GPT's causal next-token,
+so it's not a tie in the latent's favour; (c) this is a *memorization* test — not
+the architecture's value proposition (latent reasoning, test-time-compute
+scaling), which it cannot measure. One sobering data point, not a verdict.
+Artifact: `runs/comparison.png`.
+
+---
+
+## 14. Scale & hardware planning (2026-07-09)
+
+Planning the first real run: `small` (~153M), A→E only, on a single AMD GPU.
+
+### 14.1 A Chinchilla-equivalent token budget (embedding-corrected)
+Naive 20:1 on *total* params overcounts, because most params here are input
+embedding **lookups** (~0 FLOP). Measured for `small` (152.8M total): input token
+embeds **77.2M** (~0 FLOP), output head 25.7M (FLOP-active), core 49.7M. So the
+compute-active N (head+core) = **75.4M → ~1.5B tokens**; core-only 49.7M →
+~1.0B; the naive total would say 3.06B. The recurrence ("etc.") raises
+FLOPs/token but **not** the optimal token/param ratio: the compute-optimal
+D-for-given-N falls out of the loss-curve exponents, and the FLOP constant
+cancels in the Lagrange condition `αA/N^α = βB/D^β` (independent of the per-token
+FLOP multiplier) — consistent with Parcae's "looping and data trade at fixed
+FLOPs". So the loop costs GPU-hours, not tokens. **Working budget: ~1.0–1.5B
+tokens (center ~1.2B), ≈ ⅓ of naive**; `base` ≈ 3.0–3.8B. Caveats: the 20×
+constant is borrowed from next-token LM, so the true number for this
+reconstruction+SSL objective needs a token/IsoFLOP sweep; and ~1.2B tokens ≈
+~9 GB cache, which eases the in-RAM `CachedChunkDataset` concern.
+
+### 14.2 Target hardware: single AMD Strix Halo (Radeon 8060S, ROCm), 128 GB
+Decisions (user): ROCm GPU + bf16 AMP, `small` preset to start, A→E only. Full
+ops detail in **`STRIX_HALO.md`**; summary:
+- **Compatibility:** ROCm exposes the GPU as `torch.cuda`, so the code needs no
+  change and the bf16 AMP path works (prefer bf16 over fp16). gfx1151 may need
+  `HSA_OVERRIDE_GFX_VERSION`.
+- **Memory is an advantage, not a limit:** model+opt ~2.5 GB and a ~10 GB cache
+  fit the 128 GB unified memory easily → in-RAM `CachedChunkDataset` is fine
+  (memmap optional), and large batches are possible.
+- **Throughput is the real question:** `forward_grounded` is a sequential
+  per-chunk loop of many small ops → launch-overhead-bound, underutilizes any
+  GPU (why `small` was ~33 s/step on MPS). Lever: **large batch** (the 128 GB
+  enables it). The thought recurrence across chunks is inherently sequential;
+  the Talker (teacher-forced) is the one real batch-across-chunks optimization,
+  but needs testing — deferred.
+- **New deliverables (all synthetic, no data needed):** `rocm_smoke.py`
+  (validate the training path stays finite under bf16 on the GPU — the **first
+  real execution of the AMP path**, so PASS is necessary not sufficient),
+  `bench_throughput.py` (tokens/sec + wall-clock ETA sweep across batch sizes),
+  and `STRIX_HALO.md` (setup + go/no-go). Recommended pre-flight order on the
+  box: `rocm_smoke.py` → `bench_throughput.py` → read the ETA → short real-data
+  shakedown watching `latent_std` → launch.

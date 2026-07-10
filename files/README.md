@@ -42,7 +42,11 @@ curves, and **generate** from the model.
 | `generate.py` | §1.3, §2.4 | Use a checkpoint: tokenize a prompt → read it through the HRM loop → predict/decode continuation with the Talker → detokenize. `--score` reports perplexity. |
 | `data_prep.py` | scaling | Offline pre-chunking: run chunking + tokenization once, write sharded chunk tensors + manifest to a cache dir. |
 | `trainer.py` | scaling | `Trainer`: AMP autocast, gradient accumulation, warmup→cosine LR schedule, checkpoint/resume, fixed-budget curriculum gating, collapse monitor. |
-| `train_scaled.py` | scaling | Scale-oriented entry point: trains from the pre-chunked cache via `Trainer`, using a `MODEL_PRESETS` size preset. |
+| `train_scaled.py` | scaling | Scale-oriented entry point: trains from the pre-chunked cache via `Trainer`, using a `MODEL_PRESETS` size preset. `--lr-schedule per-stage` (default) gives each stage its own warmup→cosine (the notes §12 curriculum fix); `global` reverts. |
+| `baseline_gpt.py` | comparison | Standard decoder-only GPT baseline (two presets: `same-params` / `same-compute`) for a fair-scale memorization comparison vs the latent model. See notes §13.3. |
+| `rocm_smoke.py` | scaling | Validate the training path stays finite under bf16 on an AMD ROCm GPU (Strix Halo, gfx1151) — synthetic tensors, no data. First real execution of the AMP path. See `STRIX_HALO.md`. |
+| `bench_throughput.py` | scaling | Tokens/sec + wall-clock ETA sweep across batch sizes, to size a run on a given GPU before prepping data. Synthetic, no data. |
+| `STRIX_HALO.md` | scaling | Ops guide for the ROCm / Strix Halo run: setup, the two scripts above, throughput→ETA table, vectorization analysis, and a go/no-go checklist. |
 
 ## Running it
 

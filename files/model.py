@@ -8,20 +8,28 @@ Wires every component into the full architecture described in §1-§4:
                                         v                         v
                                  gestalt memory <---------- Talker (tokens out)
 
-Two independent forward passes are exposed, matching §2's "two losses, two
-granularities":
+Two forward passes are exposed, matching §2's "two losses, two granularities".
+**Both run the HRM loop and train it** -- that is the point (notes §26): the loop
+is the reasoner, so both objectives shape it, just used two different ways:
 
-  - `forward_self_supervised`: the JEPA-style branch (§2.1), run ON the HRM
-    loop. Parallel across chunks (each chunk's loop is independent -- fresh
-    state, empty memory -- so no sequential dependency; the Talker and the
-    memory chain are skipped, the loop is NOT), it predicts one chunk's
-    EMA-target latent from the previous chunk's *loop output*, for every chunk
-    pair at once. This is what trains the loop to reason forward (notes §25).
+  - `forward_grounded`: the reconstruction/autoencoder branch (§2.2), SEQUENTIAL.
+    Per chunk t: encode -> HRM loop (reading + writing the persistent gestalt
+    memory, carrying h/l state across chunks) -> Talker decodes the SAME chunk t.
+    Masked-NLL against chunk t's own tokens. Trains the loop to produce a
+    *decodable* thought. (Stage A is the one exception: the loop is off, so it's
+    encoder-latent -> Talker directly -- the shallow fixed Reasoner that grounds
+    the Talker first, §5.1.) This is the always-on anti-collapse anchor.
 
-  - `forward_grounded`: the expensive, sequential branch (§2.2). Walks the
-    document's chunks in order, running the HRM inner loop, writing to (and
-    reading from) the persistent gestalt memory, and running the Talker to
-    get an NLL loss against the realized tokens.
+  - `forward_self_supervised`: the JEPA-style predictive branch (§2.1), run ON the
+    HRM loop but PARALLEL across chunks (each chunk's loop is independent -- fresh
+    state, EMPTY memory, no Talker -- so no sequential dependency). `pred_head(
+    loop(encode(chunk_t)))` predicts chunk t+1's EMA-target latent, for every
+    chunk pair at once. Trains the loop to *predict forward* (notes §25/§26).
+
+So: reconstruction = loop + memory + Talker (decodable); prediction = loop alone
+(forward). Same loop weights, two objectives. `pred_head` is also what generation
+uses (`predict_next_latent`). The former linear SSL / separate projection head /
+detached gen MLP were removed (§26).
 
 `role_ids` (USER=0 / SELF=1 / SYSTEM=2, see config.role_tags) are threaded
 through explicitly, per §4.2 -- the caller decides whether a given

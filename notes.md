@@ -1651,3 +1651,85 @@ unaffected. Verified against the pre-rename `runs/model.pt`.
 Files changed this session: `files/generate.py` (22.2 write-order fix, 22.3
 legacy-config load fix), `README.md` (ninth-review block), `notes.md` (this
 §22). **No training run started.**
+
+---
+
+## 23. Baseline comparison re-run — the "→1.0" was a Talker-copy artifact (2026-07-10)
+
+Re-ran the §13.3 baseline comparison from scratch (fresh gpt2 baselines + a
+faithful latent grounded-only re-run) and found that the **headline latent
+number does not reproduce**: §13.2/§13.3 reported latent grounded-only page
+reconstruction → **ppl ≈ 1.0, "matching the 44.7M same-params GPT (≈1.1)"**; with
+the current reviewed code and a token-weighted measurement identical to
+`generate.score`, the latent **floors at ≈ 38 ppl**, ~18× worse than the
+same-params GPT. Investigation traced the original 1.0 to the pre-C1 Talker copy
+bug. New reproducible scripts: `files/wiki_overfit_grounded.py` (latent side),
+`files/plot_comparison.py` (rebuilds `runs/comparison.png`).
+
+### 23.1 Fresh numbers (all this session, MPS, gpt2 tokenizer, wiki "Solar System" page)
+
+| Run | Batch | Steps | Final page ppl |
+|---|---|---|---|
+| GPT same-params (44.7M, d512×6) | 4 | 900 | **2.1** (was 1.1 in §13.3; MPS nondeterminism, same regime) |
+| GPT same-compute (14.1M, d192×10) | 4 | 900 | **487** (was 484 — reproduces) |
+| Latent grounded-only | 4 | 1500 | 2035 — does **not** memorize |
+| Latent grounded-only | 16 | 1500 | **38** (plateau) |
+| Latent grounded-only | 32 | ~830 | ~38 (same floor, then MPS throttled) |
+
+Measurement is sound: latent init ppl (59,507) ≈ the original's 59,013, i.e. the
+*same* quantity is being measured — the gap is entirely in the training outcome.
+
+### 23.2 The latent needs a much larger batch than the baselines
+
+At the baselines' batch 4 the latent does not memorize (2035); it needs batch 16+
+to reach 38. So the §13.3 "same optimizer, schedule, batch; only architecture
+differs" parity is not real for batch. (Token throughput differs too: a GPT
+"example" is a 128-token block = 512 tok/step at batch 4; a latent "example" is a
+whole ~110-token paragraph = ~440 tok/step at batch 4, ~1760 at batch 16.) The
+latent side now uses the **same warmup→cosine schedule** as `baseline_gpt.py`
+(shared `lr_at`), which also fixed a late-training oscillation a held-constant LR
+produced past ~step 900.
+
+### 23.3 The ~38 floor is real; the original 1.0 required bypassing the thought
+
+- **~38 is a genuine ceiling, not undertraining.** Batch 16 and batch 32 both
+  plateau at the *identical* train_nll ≈ 2.5 / page ppl ≈ 38. Two batch sizes
+  converging to the same floor ⇒ the 192-d thought bottleneck caps exact
+  reconstruction there.
+- **ppl 1.0 ⟺ mean NLL exactly 0**, reachable only by the model *bypassing the
+  thought* and trivially copying the target tokens. Confirmed by two diagnostics
+  (both added as flags to `wiki_overfit_grounded.py`, monkeypatching the shipped
+  modules; **no shipped code changed**):
+  - `--full-bptt` (reproduce the pre-C5/§11.1 no-op inner-loop truncation): page
+    ppl **6165** at batch 4 — *worse*, not better (train_nll stuck ~9.1, near
+    chance). **C5 ruled out** as the cause; deep BPTT through a near-random
+    recurrence is noise, exactly what the §3.5 truncation warmup prevents.
+  - `--talker-copy` (reproduce the pre-C1/§1.2 Talker teacher-forcing bug — no
+    right shift, so decoder position *i* sees token *i*): at batch 16, page ppl
+    **64,006 → 13.5 and still falling steeply** at step 900, dropping clean
+    *below* the correct model's 38 floor toward ~1.0. This is the mechanism:
+    §1.2's "trivial identity copy that drives NLL→0 without using the thought at
+    all". The correct post-C1 right-shift Talker (shipped) cannot do this.
+
+**Conclusion.** The original §13.2/§13.3 "latent → 1.0" measured a Talker copying
+its own input, the latent doing no work — not genuine reconstruction through the
+latent. The honest, reproducible figure with correct code is **~38 ppl**. What
+survives: the latent still clearly beats the same-*compute* (width-matched) GPT
+(38 vs 487); it is well behind the same-*params* GPT (38 vs 2). This does not
+affect the A→E scaled run (which trains at batch 16–64, firmly in the memorizing
+regime) — it is a correction to a *baseline-comparison* claim.
+
+### 23.4 Artifacts updated
+
+- `runs/comparison.png` rebuilt from the honest curves (latent labeled "batch
+  16", caveat baked into the figure). Full-curriculum reference recomputed from
+  `runs/wiki_overfit/model.pt` = **957** (≈ the §13.3 "936", consistent).
+- `build_deck.py` slide 8: title → "Ahead of a width-matched GPT, behind a
+  param-matched one"; the false "≈1.0 matching same-params" take rewritten to the
+  real 38-vs-2 result; the "beats same-compute GPT" take kept (it holds); numbers
+  refreshed (487, 957, chance 50,257). Deck regenerated.
+- `runs/wiki_overfit_grounded/metrics.json` = the batch-16 latent curve;
+  `runs/baseline_same_{params,compute}_v2/metrics.json` = the fresh baselines.
+
+No shipped model/training code changed this session; the two diagnostic flags
+monkeypatch at runtime only. No training run started.

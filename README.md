@@ -166,6 +166,19 @@ on a tiny synthetic cache; **no large training run has been done**.
 > fixed stage budgets, an unmasked input-lane read, and missing RNG state in
 > checkpoints.
 
+> **Ninth pre-scale review (notes §22):** independent full pass — **A→E training
+> path clean** (offline A→E + schedule-exact resume re-verified; six-invariant
+> autograd audit of truncation/isolation all pass). Two *inference-path* fixes in
+> `generate.py`: free-running generation decoded a chunk **before** writing its
+> thought to memory (training and `--score` write first, so the Talker always
+> trains with its own thought as the newest slot — the decode-time memory was
+> one slot short), and the §20.2 config-field rename (`parcae_*` → `decay_*`)
+> crashed `generate.load()` on every pre-rename checkpoint (legacy names now
+> mapped forward; unknown fields warn instead of crash). Neither touches
+> training. Also documented (not changed): Stage-E ACT's ponder/halting sees
+> padded rows (an aspect of the per-batch-ACT simplification), and `_cap_span`
+> drops the separator punctuation when capping over-long sentences.
+>
 > **Eighth pre-scale review (notes §21):** verification pass — ran the A→E path
 > end-to-end offline at both `smoke` and `small` presets (+ schedule-exact
 > resume), byte-compiled, and ran an adversarial gradient-flow audit. Fixed one

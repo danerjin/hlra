@@ -1557,3 +1557,97 @@ full A→E run completes and advances A→F.
 Files changed this session: `files/hrm_loop.py` (21.5 ACT entry cut), `README.md`
 (eighth-review block), `STRIX_HALO.md` (§6 memory + ACT-fix notes), `notes.md`
 (this §21). No training run started.
+
+---
+
+## 22. Ninth pre-scale review (2026-07-10) — inference-path fixes only; A→E training path clean
+
+Independent full pass over the spec + every `files/*.py` before the big run.
+**No critical bug in the A→E scaled training path.** The two real findings are
+both on the *inference* path (`generate.py`), so neither could have harmed the
+training run — but one of them (M18) made `generate.py` crash outright on every
+existing checkpoint, which the post-run evaluation would have hit. Both fixed
+and verified this pass. Training-path files untouched.
+
+### 22.1 What was actually run
+
+- All `files/*.py` byte-compile.
+- Offline `data_prep.py --offline --preset smoke` → `train_scaled.py` A→E
+  (budgets 4/4/4/4/6, CPU): every stage fires, SSL+gen at D, ponder at E,
+  `val_loss` monotone down (8.93 → 7.86), `lstd` healthy (0.61 → 0.35),
+  rolling + final checkpoints written, curriculum advances A→F.
+- `--resume` from the step-20 Stage-E checkpoint, identical schedule: no drift
+  warning; `val_loss` **bit-matches** at the resumed step (7.8631); `nll`
+  within data-order noise — schedule-exact resume holds (§15.3/§19.5 intact).
+- Fresh direct autograd audit (six invariants, all PASS):
+  1. ACT entering-state grads `None` at window=5 **and** window=100 (§21.5
+     fix holds, including the §18.2 footgun regime);
+  2. fixed-depth entering-state grads `None` at window=2/5/100;
+  3. gen-head loss reaches **only** `gen_predictor`;
+  4. SSL grads confined to `{chunk_encoder, ssl_proj, latent_predictor}`,
+     EMA target grad-free;
+  5. Stage-B (`detach_memory=True`, window 0): every stored memory slot
+     detached;
+  6. Stage-C window=2: stored slots `requires_grad == [F, F, T, T]` — exactly
+     the trailing window in-graph.
+- `generate.py` (generate + `--score`) exercised end-to-end on the existing
+  `runs/model.pt` smoke checkpoint — which is what surfaced M18, then verified
+  both fixes (real subword output; ppl ~1.3k on the toy checkpoint, as
+  expected at smoke scale).
+
+### 22.2 M17 — generation decoded before the thought was written to memory (fixed)
+
+In training (`model.forward_grounded`) the order per chunk is: `memory.write(
+thought_t)` → `talker(chunk_t, thought_t, memory)`. The Talker is therefore
+*always trained with its own thought as the newest memory slot* (its
+`memory_reader` query is that same vector, so the self-slot plausibly dominates
+the readout). `generate.py --score` follows the same order — but the
+free-running `generate()` loop called `talker_decode(...)` **before**
+`memory.write(h_state)`, so at generation time the Talker read a memory state
+one slot short of what it ever saw in training: a systematic train/inference
+distribution shift on the memory readout, on top of a model already operating
+out-of-distribution when free-running. Fix: write before decoding, matching
+training and `score()` (one-line reorder in `generate.generate`). Verified by
+running generation on the smoke checkpoint.
+
+### 22.3 M18 — §20.2 rename broke loading of ALL pre-rename checkpoints (fixed)
+
+The §20.2 rename was checked to be behavior-preserving on the *forward pass*
+(module attribute names, hence `state_dict` keys, unchanged) — but it renamed
+the `ModelConfig` fields `parcae_min_decay`/`parcae_max_decay` →
+`decay_min`/`decay_max`, and `generate.load()` rehydrates the checkpoint config
+via `ModelConfig(**ckpt["model_cfg"])`. Every checkpoint saved before the
+rename (including the shipped `runs/model.pt`) carries the old field names, so
+`generate.py` crashed with `TypeError: unexpected keyword argument
+'parcae_min_decay'` — the README's "loads pre-§15 checkpoints with a warning"
+compatibility promise was silently dead. Fix in `generate.load()`: map legacy
+field names forward (`_LEGACY_CFG_FIELDS`), drop any remaining unknown keys
+with a loud warning instead of crashing. `generate.py` is the only rehydration
+site (grep-verified); new-run checkpoints save the new names and are
+unaffected. Verified against the pre-rename `runs/model.pt`.
+
+### 22.4 Documented, deliberately NOT changed (consistent with §21.4's freeze)
+
+- **Stage-E ACT sees padded rows.** For chunk columns where only some batch
+  rows are still active, the loop/ponder run on all rows: `(1 - halt_prob)
+  .mean()` averages garbage (pad-driven) rows into the ponder cost, and the
+  batch-level halting break includes them. This is an aspect of the already-
+  documented "ACT halting is per-batch, not per-thought" simplification, and
+  the halting head's only signal is the ponder cost anyway (§15.5: it
+  degenerates to halt→1 regardless). Not worth perturbing Stage-E dynamics
+  pre-run; revisit with a real per-thought ACT accumulator.
+- **`SegmentAnyTextChunker._cap_span` drops the separator** when splitting an
+  over-long sentence (`span.split(punct)` discards the `;`/`:`/`,`), so capped
+  spans lose their boundary punctuation in the cached corpus. Lossy but
+  self-consistent (training targets = what was tokenized); changing it would
+  invalidate prep/train consistency mid-flight. Flag for the next cache build.
+- **Optimizations: none applied.** Same reasoning as §20.4/§21.4 — the one
+  measured candidate (L-gate caching) was ~0.3% of a step, and everything else
+  on the hot path would perturb smoke-validated dynamics right before a
+  multi-day run. The known memory dominator (Talker logits retained across
+  chunks, §21) is unavoidable without activation checkpointing; budget via
+  `bench_throughput.py` peak-GB as documented.
+
+Files changed this session: `files/generate.py` (22.2 write-order fix, 22.3
+legacy-config load fix), `README.md` (ninth-review block), `notes.md` (this
+§22). **No training run started.**

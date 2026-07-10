@@ -42,9 +42,26 @@ from losses import grounded_nll_loss
 CKPT = os.path.join(PROJECT, "runs", "model.pt")
 
 
+# ModelConfig fields renamed after some checkpoints were saved (§20.2 rename:
+# the Parcae-named gate became DiagonalDecayGate). Only the *config field names*
+# changed -- module/state_dict keys are identical -- so old checkpoints stay
+# loadable by mapping the saved names forward here.
+_LEGACY_CFG_FIELDS = {"parcae_min_decay": "decay_min", "parcae_max_decay": "decay_max"}
+
+
 def load(ckpt_path: str = CKPT):
+    import dataclasses
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)  # carries non-tensor RNG/cfg state
-    cfg = ModelConfig(**ckpt["model_cfg"])
+    raw_cfg = dict(ckpt["model_cfg"])
+    for old, new in _LEGACY_CFG_FIELDS.items():
+        if old in raw_cfg and new not in raw_cfg:
+            raw_cfg[new] = raw_cfg.pop(old)
+    known = {f.name for f in dataclasses.fields(ModelConfig)}
+    dropped = sorted(k for k in raw_cfg if k not in known)
+    if dropped:
+        print(f"[generate] WARNING: ignoring unknown checkpoint config fields {dropped} "
+              f"(older/newer code version); defaults will be used where they mattered.")
+    cfg = ModelConfig(**{k: v for k, v in raw_cfg.items() if k in known})
     tok_src = ckpt.get("tokenizer_path") if os.path.isdir(ckpt.get("tokenizer_path", "")) else TOKENIZER_DIR
     chunker, _ = build_regex_gpt2_chunker(cfg, tok_src)
     model = LatentThoughtModel(cfg, chunker)
@@ -132,8 +149,11 @@ def generate(model, chunker, cfg, prompt, n_chunks=3, temperature=0.9, greedy=Fa
         h_state, _ = model.hrm_loop(pred_latent, memory, None, h_state=h_state, l_state=l_state,
                                     grad_window=5, use_act=False)
         l_state = h_state
-        ids = talker_decode(model, h_state, memory, cfg.max_chunk_len, temperature, greedy)
+        # Write BEFORE decoding, matching training (model.forward_grounded) and
+        # score(): the Talker is always trained with its own thought as the
+        # newest memory slot, so decoding must see the same memory state.
         memory.write(h_state.detach(), SELF)
+        ids = talker_decode(model, h_state, memory, cfg.max_chunk_len, temperature, greedy)
         # re-encode the produced chunk to seed the next step
         gen = torch.zeros(1, cfg.max_chunk_len, dtype=torch.long)
         for j, g in enumerate(ids[:cfg.max_chunk_len]):

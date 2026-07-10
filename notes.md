@@ -1370,7 +1370,9 @@ so training numerics are unchanged:
   The **Parcae paper citation is kept** as prior art (§0 bullet, §3.3) — it is a
   real influence; only the claim that our primitive *is* Parcae's mechanism was
   removed. Verified: no dangling `parcae` symbols in code (only two intentional
-  paper citations in `decay_gate.py`), all files byte-compile.
+  paper citations in `decay_gate.py`), all files byte-compile, **and the full
+  `forward_grounded` + backward + optimizer step runs end-to-end on MPS through
+  the renamed `DiagonalDecayGate`** (via `profile_transition.py`, see 20.4).
 
 ### 20.3 A real but deferred optimization: loop-constant-`e` caching
 
@@ -1397,9 +1399,28 @@ New script (reuses `bench_throughput.py`'s synthetic harness): hooks the L-gate 
 H-gate / reasoner, prints each one's forward share of a step, and estimates what
 the caching would save (~1/3 of L-gate time). Rule of thumb baked into the
 output: if the estimated saving is under ~2–3% of a step, the caching is **not**
-worth perturbing the truncated-BPTT path before the scaled run. Run it on the
-ROCm box (torch not installed on the dev box), like bench:
+worth perturbing the truncated-BPTT path before the scaled run.
 `python profile_transition.py --preset small --batch-size 16`.
+
+**Measured (dev box, MPS, preset small, batch 8, stage C) — verdict: don't do
+the caching.** Ran the whole path end-to-end (this is also the rename smoke
+test: model builds, `forward_grounded` + backward + `opt.step` all run through
+`DiagonalDecayGate`, exit 0). Numbers:
+- reasoner **forward** = 5.0% of a full step; **l_gate = 0.3%**, h_gate = 0.1%.
+- l_gate is only **6.5% of the reasoner's forward**; the caching removes ~1/3 of
+  that → **~0.1% of a step** saved (forward only). Far under the 2–3% bar.
+- The per-hook sync *inflates* the l_gate figure, so the true share is lower
+  still. Conclusion holds with margin: the loop-constant-`e` caching is not
+  worth the truncated-BPTT regression surface. Consider 20.3 closed / dropped
+  unless a ROCm profile overturns the ratio (it won't move enough — l_gate is a
+  tiny slice of the reasoner, which is itself a small slice of the step).
+
+Caveat on the *absolute* step time: MPS reported ~92 s/step here, dominated by
+backward + the sequential Python chunk loop's launch overhead (the reasoner
+forward is only 5%). That absolute figure is an MPS/dev-box artifact, **not** a
+throughput estimate — the real go/no-go for run planning is still
+`bench_throughput.py` on the ROCm box. Only the *ratios* above are the point,
+and they answer 20.3.
 
 ### 20.5 Deliberately left alone
 

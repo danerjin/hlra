@@ -117,6 +117,14 @@ class Trainer:
                 var_weight=self.train_cfg.ssl_var_weight)
             total = ssl if total is None else total + ssl
             logs["ssl"] = round(ssl.item(), 4)
+            # Generation head (encoder-space next-latent). Gradient-isolated:
+            # trains only model.gen_predictor, so it can ride along at no risk
+            # to the reconstruction/SSL dynamics. Logged separately so the ssl
+            # metric stays comparable with earlier runs.
+            if self.train_cfg.gen_loss_weight > 0:
+                gen = self.train_cfg.gen_loss_weight * self.model.forward_gen_predictor(ct, cm)
+                total = total + gen
+                logs["gen"] = round(gen.item(), 4)
         return total, logs, (ct, cm)
 
     @torch.no_grad()
@@ -184,11 +192,16 @@ class Trainer:
                 self.metrics.append({"step": self.global_step, "stage": self.curriculum.stage.name,
                                      "val_loss": val_loss, "latent_std": round(lstd, 4), **step_logs})
 
+            # Advance the curriculum BEFORE checkpointing: the checkpoint must
+            # capture the post-step curriculum state (stage_idx/step_in_stage),
+            # or a resume replays one extra step-in-stage and the per-stage LR
+            # schedule drifts off the uninterrupted run by one step.
+            if self.curriculum.advance_step(val_loss):
+                print(f">>> curriculum advanced to stage {self.curriculum.stage.name}", flush=True)
+
             if self.train_cfg.checkpoint_every and self.global_step % self.train_cfg.checkpoint_every == 0:
                 self.save("checkpoint.pt")
 
-            if self.curriculum.advance_step(val_loss):
-                print(f">>> curriculum advanced to stage {self.curriculum.stage.name}", flush=True)
             if self.curriculum.stage == Stage.F:
                 break
 
@@ -204,6 +217,9 @@ class Trainer:
             "torch": torch.get_rng_state(),
             "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         }
+        # Atomic write: a crash/power-loss mid-save must never destroy the only
+        # checkpoint of a multi-day run. Write to a temp file, then rename.
+        tmp = path + ".tmp"
         torch.save({
             "rng": rng,
             "model_state": self.model.state_dict(),
@@ -216,9 +232,12 @@ class Trainer:
             "model_cfg": asdict(self.model_cfg),
             "vocab_size": self.model_cfg.vocab_size,
             "tokenizer_name": "gpt2", "chunker": "regex_gpt2",
-        }, path)
-        with open(os.path.join(self.ckpt_dir, "metrics.json"), "w") as f:
+        }, tmp)
+        os.replace(tmp, path)
+        mtmp = os.path.join(self.ckpt_dir, "metrics.json.tmp")
+        with open(mtmp, "w") as f:
             json.dump(self.metrics, f, indent=2)
+        os.replace(mtmp, os.path.join(self.ckpt_dir, "metrics.json"))
         print(f"[trainer] checkpoint -> {path} (step {self.global_step})", flush=True)
 
     def load(self, path: str):

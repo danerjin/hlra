@@ -133,9 +133,11 @@ def main():
                            online_proj=model.ssl_proj).to(device)
     with torch.autocast(device_type="cuda", dtype=dtype):
         ssl = model.forward_self_supervised(ct, cm, ema, cos_weight=0.1, var_weight=2.0)
+        gen = model.forward_gen_predictor(ct, cm)   # generation head rides along at Stage D+
+        ssl = ssl + gen
     ssl.backward()
     torch.cuda.synchronize()
-    print(f"[4] SSL loss finite: {finite(ssl)} (ssl={float(ssl):.4f})")
+    print(f"[4] SSL+gen loss finite: {finite(ssl)} (gen={float(gen):.4f})")
     ok &= finite(ssl)
 
     # ACT path too (Stage E) -- variable depth + halting head under autocast.

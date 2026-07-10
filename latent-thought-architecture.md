@@ -201,6 +201,15 @@ Two methodological lessons fell out of this: (a) the validation metric must be
 Stage-D transition look like a regression when it isn't; (b) an anti-collapse regularizer is a
 *floor*, not a *target* — it must never drive the latent's scale, only prevent collapse to zero.
 
+One structural consequence of the separate-head fix deserves stating: once the SSL prediction
+lives in its own projection space, the SSL predictor **no longer provides an encoder-space
+next-latent map** — but that map is exactly what free-running generation needs (predict the next
+chunk's latent, feed it to the inner loop as the next injection). The fix therefore has to come
+with a dedicated generation head trained in the *shared encoder* space; to keep it from
+reintroducing the collapse pressure this section removed, it is trained with both its input and
+its target detached, so its loss reaches only the head itself — a pure readout, exactly like the
+Talker's relationship to the latent.
+
 ---
 
 ## 3. Why every non-obvious technical choice is justified
@@ -290,6 +299,16 @@ written, not just how the current one is read. But un-truncated BPTT through an 
 conversation's worth of thoughts is intractable and hits the same instability problem as the inner
 loop. So the same asymmetric trick (long forward horizon, short backward horizon) is reapplied one
 level up: unbounded forward reads from memory, bounded backward credit assignment into it.
+
+One honest caveat about what the window actually bounds: it bounds *direct* credit — a loss at
+thought *t* reads at most the trailing *k* memory slots with gradient. But slot *t−1*'s own
+computation read slots *t−2…t−k−1* in-graph when it was written, so credit still reaches
+arbitrarily far back **transitively**, attenuated per hop (measured ~30× per hop in the reference
+implementation). Two consequences: the effective credit horizon is soft rather than hard, and the
+autograd graph — hence activation memory — still spans the whole document whenever memory is
+un-detached (Stages C+). The truncation makes distant credit *cheap and weak*, not absent; only
+per-hop reach and gradient magnitude are bounded, not graph depth. Budget GPU memory accordingly
+(the throughput bench runs with memory un-detached, so its peak-memory numbers reflect this).
 
 ### 3.7 Two losses, not one
 Pure self-supervised latent prediction is cheap and parallelizable, but self-distillation
@@ -470,6 +489,17 @@ more iterations have helped this specific thought") to learn from. Add a small p
 so the model is pushed toward the cheapest depth that doesn't hurt the loss. This is also the
 first point where Parcae's "predictable test-time scaling" claim actually starts to matter — before
 this stage, depth isn't a free variable at all.
+
+**Implementation caveat — "doesn't hurt the loss" needs a gradient path, and a hard halting
+branch doesn't provide one.** If the halting decision is taken as a non-differentiable branch
+(continue/stop on a thresholded probability), the task loss has *no* gradient into the halting
+head: depth affects the loss only through discrete control flow, which gradients cannot see. The
+ponder cost is then the head's *only* training signal, and it points one way — halt sooner — so
+the learned policy provably degenerates to "always halt at the minimum depth" (verified in the
+reference implementation: NLL gradient on the halting head is exactly zero). Getting a genuine
+compute-vs-quality trade requires the task loss to see depth differentiably — a real ACT
+accumulator (output = Σₖ p(halt=k)·h_k) or a REINFORCE-style estimator — which is the mechanism
+this stage should eventually use; the soft expected-value ponder cost alone is not it.
 
 ### 5.6 Stage F — Chatbot fine-tuning: two-lane input/self separation, cross-turn persistence
 

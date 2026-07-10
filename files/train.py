@@ -54,7 +54,9 @@ def build_sat_chunker(model_cfg: ModelConfig, data_cfg: DataConfig):
     from data import ReservePadTokenizer, PAD
 
     sat_model = SaT(data_cfg.sat_model_name)                       # downloads from HF hub
-    tokenizer = ReservePadTokenizer(AutoTokenizer.from_pretrained(data_cfg.tokenizer_name))
+    base = AutoTokenizer.from_pretrained(data_cfg.tokenizer_name)
+    base.model_max_length = int(1e12)  # whole-doc tokenization; silence >1024 warnings
+    tokenizer = ReservePadTokenizer(base)
     chunker = SegmentAnyTextChunker(
         sat_model=sat_model, tokenizer=tokenizer,
         max_chunk_len=model_cfg.max_chunk_len, max_chunks_per_doc=model_cfg.max_chunks_per_doc,
@@ -161,6 +163,12 @@ def train_stages_a_to_e(model, ema, curriculum: Curriculum, model_cfg, train_cfg
                                                 var_weight=train_cfg.ssl_var_weight)
             total_loss = ssl if total_loss is None else total_loss + ssl
             logs["ssl"] = round(ssl.item(), 4)
+            # Generation head (encoder-space next-latent; gradient-isolated,
+            # trains only model.gen_predictor -- see model.forward_gen_predictor).
+            if train_cfg.gen_loss_weight > 0:
+                gen = train_cfg.gen_loss_weight * model.forward_gen_predictor(chunk_tensor, chunk_mask)
+                total_loss = total_loss + gen
+                logs["gen"] = round(gen.item(), 4)
 
         if total_loss is not None:
             total_loss.backward()

@@ -32,16 +32,16 @@ curves, and **generate** from the model.
 | `input_lane.py` | §4.1, §4.2 | Bidirectional input-lane encoder; read-only via cross-attention, never writes recurrent self-state. All-masked-row guard against NaN. |
 | `ema_target.py` | §2.1, §3.4 | `ChunkEncoder` (the shared latent producer) + `EMATargetEncoder`, a momentum copy of the encoder **and** the SSL projection head, with `state_dict`/`load_state_dict` for checkpointing. All-pad-row guard. |
 | `losses.py` | §2, §5.5, §2.4 | Scaled cosine loss, grounded NLL, ACT ponder cost, and the VICReg-style `variance_regularization` anti-collapse floor. |
-| `model.py` | §1-§4, §2.4 | `LatentThoughtModel`: shared `chunk_encoder`, HRM reasoner, Talker, two-lane input, `ssl_proj` (separate SSL head), `forward_grounded` (reconstruction), `forward_self_supervised` (SSL + variance), `latent_collapse_metric`. |
+| `model.py` | §1-§4, §2.4 | `LatentThoughtModel`: shared `chunk_encoder`, HRM reasoner, Talker, two-lane input, `ssl_proj` (separate SSL head), `gen_predictor` (encoder-space next-latent head for generation; gradient-isolated, notes §15.1), `forward_grounded` (reconstruction), `forward_self_supervised` (SSL + variance), `latent_collapse_metric`. |
 | `curriculum.py` | §5 | Stage A→F flags/loss-plan. Gates on validation-loss plateau *or* fixed per-stage step budgets; `state_dict`/`load` for resume. |
 | `data.py` | §3.1, §5.6 | Real-text pipeline: HF mixture stream (`iter_hf_mixture`), single-dataset stream (`iter_hf_single`), offline synthetic-text + stub-SaT fallback, `ReservePadTokenizer` (id-0 = PAD), in-pipeline chunking + length bucketing, and `CachedChunkDataset` (map-style over a pre-chunked shard cache). |
 | `train.py` | §5, §5.7 | Smoke training entry (offline by default; `LATENT_USE_HF=1` = real streaming mixture). Device-aware; grounded/SSL loss orchestration. |
 | `run_small.py` | — | ~1M-token smoke run on real text (pile-10k) via the offline stub chunker (only `datasets` needed). |
 | `train_real.py` | — | ~1.5M-token run with the **real gpt2 tokenizer** (decodable output); writes `runs/model.pt` + `runs/metrics.json`. |
 | `plot_metrics.py` | — | Renders `runs/metrics.json` to `runs/loss_curves.png` (val loss, train NLL/SSL, and the latent-std collapse monitor, with stage bands). |
-| `generate.py` | §1.3, §2.4 | Use a checkpoint: tokenize a prompt → read it through the HRM loop → predict/decode continuation with the Talker → detokenize. `--score` reports perplexity. |
+| `generate.py` | §1.3, §2.4 | Use a checkpoint: tokenize a prompt → read it through the HRM loop → predict the next latent in encoder space (`gen_predictor`, notes §15.1) → decode with the Talker → detokenize. `--score` reports perplexity. Loads pre-§15 checkpoints with a warning (untrained gen head). |
 | `data_prep.py` | scaling | Offline pre-chunking: run chunking + tokenization once, write sharded chunk tensors + manifest to a cache dir. |
-| `trainer.py` | scaling | `Trainer`: AMP autocast, gradient accumulation, warmup→cosine LR schedule, checkpoint/resume, fixed-budget curriculum gating, collapse monitor. |
+| `trainer.py` | scaling | `Trainer`: AMP autocast, gradient accumulation, warmup→cosine LR schedule, atomic checkpoint/resume (schedule-exact since notes §15.3), fixed-budget curriculum gating, collapse monitor, `gen` head loss from Stage D. |
 | `train_scaled.py` | scaling | Scale-oriented entry point: trains from the pre-chunked cache via `Trainer`, using a `MODEL_PRESETS` size preset. `--lr-schedule per-stage` (default) gives each stage its own warmup→cosine (the notes §12 curriculum fix); `global` reverts. |
 | `baseline_gpt.py` | comparison | Standard decoder-only GPT baseline (two presets: `same-params` / `same-compute`) for a fair-scale memorization comparison vs the latent model. See notes §13.3. |
 | `rocm_smoke.py` | scaling | Validate the training path stays finite under bf16 on an AMD ROCm GPU (Strix Halo, gfx1151) — synthetic tensors, no data. First real execution of the AMP path. See `STRIX_HALO.md`. |
@@ -155,8 +155,20 @@ on a tiny synthetic cache; **no large training run has been done**.
 > a silent no-op (full-document BPTT, always) — plus a ponder-contaminated val
 > metric, doc-length-dependent ponder scaling, warmup ramps that ignored the
 > fixed stage budgets, an unmasked input-lane read, and missing RNG state in
-> checkpoints. If Stage E halts too late on the next run, bump
-> `act_ponder_cost` (see notes §11.3).
+> checkpoints.
+
+> **Third pre-scale review (notes §15):** found and fixed a critical
+> inference-path bug — generation fed the SSL-projection-space predictor's
+> output to the HRM loop as an encoder-space latent; a new gradient-isolated
+> `gen_predictor` head (trained from Stage D, logged as `gen`) restores a
+> *trained* next-latent map for generation — plus a truncation footgun
+> (`grad_window >= 8` silently reverted the §11 fix), a checkpoint/resume LR
+> off-by-one, non-atomic checkpoint writes, whole-document tokenization waste
+> in prep, and a corpus-ordered val split. Two things are documented, not
+> changed: the ACT halting head gets gradient only from the ponder cost (so
+> expect `halt_prob → 1` in Stage E — the depth dial doesn't learn yet), and
+> memory truncation bounds direct-but-not-transitive credit (activation memory
+> still spans the document in Stages C+; trust the bench's peak-GB).
 
 ## What's simplified relative to the design doc, and why
 

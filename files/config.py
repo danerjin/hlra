@@ -95,6 +95,10 @@ class TrainConfig:
     # it cannot flatten to a constant. See model.forward_self_supervised.
     ssl_loss_weight: float = 0.1              # weight on the SSL cosine prediction term
     ssl_var_weight: float = 2.0               # weight on the anti-collapse variance regularizer
+    # Weight on the generation head's next-latent loss (model.forward_gen_predictor).
+    # Gradient-isolated (detached input AND target), so it cannot affect the shared
+    # encoder or SSL dynamics; 0 disables it. Runs alongside SSL from Stage D.
+    gen_loss_weight: float = 1.0
     log_every: int = 10
     device: str = "cpu"
     seed: int = 0

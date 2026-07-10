@@ -130,7 +130,11 @@ def build_regex_gpt2_chunker(model_cfg, tokenizer_name: str = "gpt2"):
     """
     from transformers import AutoTokenizer
     from chunker import SegmentAnyTextChunker
-    tok = ReservePadTokenizer(AutoTokenizer.from_pretrained(tokenizer_name))
+    base = AutoTokenizer.from_pretrained(tokenizer_name)
+    # We tokenize whole documents (no model context involved); silence the
+    # per-document ">1024 tokens" warning, which floods (and slows) data prep.
+    base.model_max_length = int(1e12)
+    tok = ReservePadTokenizer(base)
     chunker = SegmentAnyTextChunker(
         sat_model=RegexSentenceSegmenter(), tokenizer=tok,
         max_chunk_len=model_cfg.max_chunk_len,
@@ -244,7 +248,20 @@ class DialogueTextCorpus:
 # Chunking + Dataset
 # ======================================================================
 def chunk_text_example(text: str, chunker, window: int):
-    """Chunk + tokenize one document into the 4-tensor example tuple."""
+    """Chunk + tokenize one document into the 4-tensor example tuple.
+
+    The document is pre-truncated to a character budget generously covering
+    what can actually be kept (max_chunks_per_doc * max_chunk_len tokens, at a
+    conservative 8 chars/token). Without this, a long document (e.g. a PG-19
+    book) is SaT-segmented and tokenized in FULL -- typically 10-100x more work
+    than the ~2k tokens that survive -- and, worse, `encode_recent` would take
+    the input-lane window from the *end* of the document, text entirely
+    disjoint from the kept chunks. After truncation the raw window comes from
+    the tail of the kept region, i.e. text the chunks actually cover.
+    """
+    max_chars = getattr(chunker, "max_chunks_per_doc", 0) * getattr(chunker, "max_chunk_len", 0) * 8
+    if max_chars and len(text) > max_chars:
+        text = text[:max_chars]
     chunk_tensor, chunk_mask = chunker.chunk_batch([text])       # (1, C, L), (1, C)
     raw_ids, raw_mask = chunker.encode_recent([text], window)     # (1, W), (1, W)
     return chunk_tensor[0], chunk_mask[0], raw_ids[0], raw_mask[0]

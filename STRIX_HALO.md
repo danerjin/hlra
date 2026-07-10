@@ -121,3 +121,13 @@ If none of that gets the ETA acceptable, the levers are: smaller token budget
 - **~1.2B tokens is an embedding-corrected estimate, not a fitted optimum** — the
   20:1 constant is borrowed from next-token LM; a small token sweep would
   calibrate it for this reconstruction+SSL objective.
+- **Data source (notes §15.6)** — pile-10k holds only ~20M usable tokens; the
+  1.2B budget needs a big single corpus (e.g. fineweb-edu `sample-10BT`) or
+  mixture support wired into `data_prep.py`. Time a 1k-doc prep dry run first.
+- **Stage E expectation (notes §15.5)** — the halting head is trained only by
+  the ponder cost, so `halt_prob → 1` (always halt at minimum depth) is the
+  *expected* Stage-E behavior, not a regression; don't burn run time tuning
+  `act_ponder_cost` against it.
+- **Peak memory (notes §15.5)** — activation graphs span whole documents in
+  Stages C+ (transitive memory credit); the bench's peak-GB numbers already
+  include this — trust them, and leave batch-size headroom.

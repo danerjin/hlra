@@ -77,10 +77,15 @@ class _TruncationSchedule:
         if self.window <= 0:
             return h.detach(), l.detach()
         if self.total is not None:
-            cut = self.step == self.total - self.window
+            # One exact cut `window` steps before the end. If the window covers
+            # the whole thought (window >= total), cut at step 0: every step of
+            # this thought keeps gradient, but the *entering* (previous-thought)
+            # states are still severed -- the raw cross-thought chain must never
+            # survive, or truncation silently degrades to full-document BPTT.
+            cut = self.step == max(0, self.total - self.window)
         else:
             cut = self.in_graph >= self.window
-        if cut and self.step > 0:
+        if cut:
             self.in_graph = 0
             return h.detach(), l.detach()
         return h, l

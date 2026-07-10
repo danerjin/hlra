@@ -386,6 +386,21 @@ which scale. Added (no training run — verified offline):
 - **A regularizer is a floor, not a target.** (Variance-floor overshoot lesson.)
 - **Watch the metric, not just the loss.** A contaminated eval metric faked a
   regression; the loss the model minimizes can be the one being gamed (SSL→0).
+- **Isolating a loss into its own projection space can amputate a capability.**
+  The §5 separate-head fix quietly removed the only trained encoder-space
+  next-latent map — exactly what free-running generation needs. The resolution
+  mirrors the Talker pattern: a dedicated head trained as a pure readout
+  (input AND target detached), so it restores the capability without
+  reintroducing the collapse pressure (§15.1).
+- **A hard halting branch gives the task loss no gradient into the halting
+  head.** Depth chosen via a thresholded `.item()` is invisible to autograd, so
+  the ponder cost is the head's only signal and the policy degenerates to
+  always-halt-at-minimum-depth. A compute-vs-quality trade needs the loss to
+  see depth differentiably (ACT accumulator) or via REINFORCE (§15.5).
+- **Truncation windows bound *direct* credit, not *transitive* credit.** Slot
+  t−1's graph contains its own in-graph reads of t−2…, so credit chains
+  arbitrarily far back (attenuating ~30×/hop) and the activation graph spans
+  the whole document whenever memory is un-detached (Stages C+) (§15.5).
 
 ## 8. Consolidated empirical/infra notes
 
@@ -402,6 +417,20 @@ which scale. Added (no training run — verified offline):
 - Perplexity is prompt-length sensitive; compare on fixed text.
 - Everything is pinned inside the project (`.venv`, `.hf_cache`, `gpt2_tok`) so
   the setup is reproducible and self-contained.
+- **Checkpoint writes must be atomic** (write `*.tmp`, then `os.replace`) — a
+  crash mid-save must never destroy the only checkpoint of a long run (§15.4).
+- **Save curriculum state AFTER `advance_step`**, or resume replays one extra
+  step-in-stage and the per-stage LR schedule drifts off by one (§15.3).
+- **Pre-truncate documents before chunking** to a char budget covering what's
+  kept — otherwise long docs are segmented/tokenized in full for ~2k kept
+  tokens, and the input-lane window lands on text disjoint from the kept
+  chunks (§15.4).
+- **Val split by seeded permutation, not a head slice** — caches preserve
+  corpus order, so "first N docs" can be topically clustered (§15.4).
+- **`hard_normalize` makes ‖h‖ constant — a `h.pow(2).mean()` probe loss has
+  ~zero gradient.** Gradient-flow tests on normalized states need a
+  direction-sensitive loss (e.g. `<h, v>` with random v); learned during the
+  §15.2 verification.
 
 ## 9. Open items / not done / next
 
@@ -416,8 +445,23 @@ which scale. Added (no training run — verified offline):
 - **Stage F is synthetic** — real multi-turn dialogue + the anti-sycophancy
   contrastive data (§4.3) are deferred; the two-lane machinery is wired but
   cold-started at F.
-- **ACT is per-batch, soft** (M4) — per-thought adaptive depth needs a real ACT
-  accumulator.
+- **ACT is per-batch, soft** (M4) — **and one-sided** (§15.5): the halting head
+  gets gradient only from the ponder cost, so the Stage-E policy degenerates to
+  always-halt-at-minimum-depth. Per-thought adaptive depth that actually trades
+  compute against quality needs a real ACT accumulator (output = Σₖ
+  p(halt=k)·h_k) or REINFORCE — one change fixes both. Deliberately not landed
+  before the big run.
+- **`data_prep.py` is single-dataset and single-process** (§15.6) — the
+  DataConfig mixture (`iter_hf_mixture`) is not wired into offline prep, and
+  pile-10k (~20M usable tokens) cannot feed the ~1.2B budget; pick a big corpus
+  (e.g. fineweb-edu `sample-10BT`) or wire the mixture in, and time a 1k-doc
+  dry run.
+- **Weight-decay param groups** — AdamW currently decays everything, including
+  LayerNorms, embeddings, and Parcae's `theta`/`log_dt` (a mild pull toward
+  decay ≈ 0.62). Conventional no-decay groups recommended, but it changes
+  optimizer state/dynamics, so not applied pre-run.
+- **Talker batching across chunks** — the main throughput lever if large-batch
+  isn't enough (STRIX_HALO.md §4); must be tested before landing.
 - **Anti-collapse hyperparameters** (cos weight 0.1, var weight 2.0, var floor
   0.1, momentum 0.996) were tuned on the smoke run — **re-tune at scale**.
 - **k=4 cosine scale** should be re-tuned per model width (§3.4).
@@ -440,6 +484,12 @@ which scale. Added (no training run — verified offline):
 - Wiki-page overfit, grounded-only: reconstruction **59,013 → 1.0 ppl** — the architecture *does* memorize (§13.2).
 - Fair-scale baselines, same page: GPT same-params (44.7M) **ppl 1.1** (verbatim); GPT same-compute (14.1M) **484**; latent grounded-only **1.0** (§13.3).
 - Chinchilla-equivalent for `small` (153M): compute-active N **75.4M → ~1.2B tokens** (naive-total would say 3.06B) (§14.1).
+- §15 halting-head gradient: from NLL **0** (exactly), from ponder **0.27** — one-sided, Stage E degenerates to min depth (§15.5).
+- §15 transitive memory credit: window 2, thought-9 loss → thought-8 grad **7.3e-4**, thought-0 **2.5e-8** (~30×/hop; graph spans the doc) (§15.5).
+- §15 M11 confirm: cross-thought leak at grad_window 8/12 **6.5e-8** pre-fix, **0** at 5; post-fix **0 at every window**, forwards bit-identical (§15.2).
+- §15 M12 confirm: resumed vs uninterrupted per-stage LR at same step **1.23e-4 vs 5.58e-5** pre-fix; identical post-fix, final val 8.3104 vs 8.3108 (§15.3).
+- §15 gen head: isolation **4/4** own tensors with grad, **0** elsewhere (both directions); gen loss **2.97 → 1.78** over the 24-step toy (§15.1).
+- pile-10k usable tokens after the 32×64 cap: **~20M** — vs the ~1.2B budget (§15.6).
 
 ---
 
@@ -730,3 +780,143 @@ ops detail in **`STRIX_HALO.md`**; summary:
   and `STRIX_HALO.md` (setup + go/no-go). Recommended pre-flight order on the
   box: `rocm_smoke.py` → `bench_throughput.py` → read the ETA → short real-data
   shakedown watching `latent_std` → launch.
+
+---
+
+## 15. Third pre-scale review (2026-07-09) — external pass before the big run
+
+A fresh independent read of spec + all code, with the same methodology as §1/§11
+(read → hypothesize → confirm with tiny targeted scripts → fix → re-verify).
+One critical inference-path bug, one latent training footgun, several run-ops
+hardening fixes; plus two findings **documented but deliberately not changed**.
+All fixes verified; full A→E (`train_scaled`, offline cache, resume) and A→F
+(`train.py`) integration re-run clean, and `generate.py` still works against
+the old `runs/model.pt`.
+
+### 15.1 C6 — generation used the wrong latent space (critical, inference path)
+
+`generate.py` seeded each new thought with `latent_predictor(last_latent)`. But
+after the §5 collapse fix, `latent_predictor` lives on top of `ssl_proj` — it
+maps *SSL-projection space → SSL-projection space*. Generation fed it a raw
+**encoder-space** latent and pushed its output into the HRM loop as if it were
+an encoder-space chunk latent: wrong input space, wrong output space. Deeper
+problem: the separate-head fix removed the only trained encoder-space
+next-latent map, so **free-running generation had no trained pathway at all** —
+the architecture's own §2.4 fix quietly amputated its generation mechanism.
+
+- *Fix*: new `model.gen_predictor` (2-layer MLP head) + `forward_gen_predictor`
+  loss: predict chunk t+1's **shared encoder latent** from chunk t's, with BOTH
+  input and target detached (encoder runs under `no_grad`), scaled-cosine (the
+  HRM injection LayerNorms the latent, so cosine alignment suffices). Runs
+  alongside SSL from Stage D (`TrainConfig.gen_loss_weight`, 0 disables),
+  logged separately as `gen` so the `ssl` metric stays comparable.
+  `generate.py` now uses it; checkpoints predating the head load with
+  `strict=False` + an explicit warning. `rocm_smoke.py` covers it under bf16.
+- *Why it cannot hurt the run*: gradient-isolated by construction. Audit
+  (the §1.2/C2 methodology): gen loss → grads on exactly 4/4 `gen_predictor`
+  tensors, **zero** on every other parameter; grounded+SSL losses → **zero**
+  grad on `gen_predictor`, `chunk_encoder` unaffected (28/28 as before).
+- *Verified learning*: in the 24-step offline integration run the gen loss
+  fell 2.97 → 1.78 while nll/ssl/latent_std matched pre-change behavior.
+
+### 15.2 M11 — truncation silently off when grad_window ≥ inner steps (latent footgun)
+
+`_TruncationSchedule` (fixed-depth mode) cut at `step == total - window`, with
+a `step > 0` guard. For `window >= total` (e.g. window 8 with 2×(3+1)=8 inner
+steps) the cut never fired, so the **entering states were never detached and
+the raw cross-thought chain came back** — the exact C5 full-document-BPTT bug,
+one config tweak away. Confirmed empirically: nonzero gradient on the previous
+thought at window 8/12, zero at 5. Current defaults (2→5) were safe; anyone
+raising `inner_loop_grad_window_end` or lowering the cycle counts would have
+silently reverted C5. **Fixed**: cut at `max(0, total - window)` (cut at step 0
+= whole thought keeps gradient, entering chain still severed). Re-verified:
+chain severed at every window, forward values bit-identical, per-window
+gradient monotone and saturating at full depth (reproduces the §11.1 numbers).
+
+### 15.3 M12 — checkpoint/resume off-by-one in the per-stage LR schedule
+
+`Trainer.train` saved checkpoints *before* `curriculum.advance_step`, so a
+resume replayed one extra `step_in_stage` and the per-stage LR drifted off the
+uninterrupted run (measured on the toy: lr 1.23e-4 resumed vs 5.58e-5
+uninterrupted at the same global step — large there because the toy stage was 6
+steps; small but nonzero at real budgets). **Fixed**: advance before save;
+resume now schedule-exact (identical lr at the same step, val within data-order
+noise).
+
+### 15.4 Run-ops hardening (small, each verified)
+
+- **Atomic checkpoints** (`trainer.save`): write to `*.tmp` + `os.replace`, for
+  both the checkpoint and `metrics.json` — a crash mid-save can no longer
+  destroy the only checkpoint of a multi-day run.
+- **Document pre-truncation** (`data.chunk_text_example`): docs are cut to a
+  char budget generously covering what survives (`max_chunks × max_chunk_len ×
+  8 chars/token`) before SaT/tokenization. Previously a PG-19-length book was
+  segmented and tokenized in FULL (10–100× wasted prep work) and — worse —
+  `encode_recent` took the input-lane window from the *end* of the document,
+  text disjoint from the kept chunks; now the raw window covers the kept
+  region's tail. Verified: byte-identical tensors to manual truncation; short
+  docs unaffected.
+- **Seeded random val split** (`train_scaled.py`): was "first N cache docs"
+  (corpus-ordered → potentially topically clustered); now a seed-0 permutation,
+  deterministic across resumes.
+- **Tokenizer length-warning silenced** (`model_max_length = 1e12` on the
+  wrapped tokenizer): whole-doc encodes of >1024 tokens flooded (and slowed)
+  data prep with per-doc warnings.
+
+### 15.5 Documented, deliberately NOT changed
+
+- **ACT's halting head is trained by the ponder cost alone.** Confirmed
+  empirically: |grad| on the halting head from the NLL is exactly **0** (the
+  halting decision is a thresholded `.item()` branch — depth is invisible to
+  autograd), from the ponder cost **0.27**. The only signal says "halt sooner",
+  so Stage E's policy must converge to halt-at-minimum-depth (= fixed 2-cycle
+  depth): benign for stability (E ≈ D plus a tiny loss term) but the
+  test-time-compute dial *learns nothing*, and §11.3's "bump `act_ponder_cost`
+  if it halts too late" can never be needed in this form — there is no
+  counter-pressure to trade against. The real fix is an ACT accumulator
+  (output = Σₖ p(halt=k)·h_k, giving the NLL leverage on the head) or
+  REINFORCE; that is an untested training-dynamics change and exactly the
+  wrong thing to land unvalidated days before a long run. Spec §5.5 now
+  carries the caveat. **Expect `halt_prob → 1` in Stage E logs; that is this
+  mechanism working as (currently) built, not a bug appearing.**
+- **Memory truncation is transitively leaky, and the notes overstated §11.1's
+  consequence.** With `memory_grad_window=2`, gradient from thought 9's loss
+  still reaches thought 0 (~30× attenuation per hop; 7e-4 → 2e-8). The window
+  bounds *direct* reads; slot t−1's graph contains its own reads of t−2…, so
+  credit chains transitively and the autograd graph **still spans the whole
+  document in Stages C+** — §11.1's "activation memory no longer grows as one
+  full-doc graph" is true only for the raw state chain (and Stage B, where
+  writes are detached). Not a correctness bug (it is Thought Gestalt's
+  un-detached-memory semantics, softly truncated), but it is the memory-footprint
+  reality: trust `bench_throughput.py`'s peak-GB (it runs Stage-C flags with
+  memory un-detached), not a mental model of a 5-step graph. Spec §3.6 now
+  carries the caveat. Related: in ACT mode the *ponder* term also leaks a small
+  bounded gradient across thoughts (early-cycle halt probs sit before the
+  rolling cut) — weight `act_ponder_cost`=0.01, Stage E only, left alone.
+
+### 15.6 Planning note surfaced by the review (not a code change)
+
+The §14.1 budget (~1.2B tokens) cannot come from the README's example dataset:
+pile-10k holds ~10k docs ≈ 20M usable tokens after the 32×64 per-doc cap.
+`data_prep.py` also only supports a **single** HF dataset (`iter_hf_single`) —
+the §5.6/DataConfig mixture was never wired into the offline prep path. For the
+big run either point `--dataset` at one big corpus (e.g.
+`HuggingFaceFW/fineweb-edu` `sample-10BT`, which `--text-field text` handles,
+noting `data_prep` downloads non-streaming) or wire `iter_hf_mixture` into
+`data_prep` first. Prep is single-process; with the truncation fix it should be
+hours for ~1.2B tokens, but do a timed 1k-doc dry run before committing.
+
+### 15.7 Re-verification summary
+
+- Gradient audits: gen-head isolation both directions (15.1); truncation cut at
+  windows {1,2,5,8,12} with identical forwards (15.2); halting-head gradient
+  sources (15.5); transitive memory reach (15.5).
+- Offline A→E via `data_prep --offline` → `train_scaled` (smoke preset, fixed
+  budgets 4/4/4/6/6): all stages fire, `gen` logged and decreasing, ckpt at
+  step 20 → `--resume` continues schedule-exact to the same final val (8.3104
+  vs 8.3108) — the M12 fix holding.
+- Offline A→F via `train.py`'s loops (incl. Stage F dialogue path): finite,
+  loss decreasing.
+- `generate.py` against the existing pre-review `runs/model.pt`: loads with the
+  explicit missing-module warning, `--score` matches expectations (ppl ~1.3k on
+  the test sentence), generation path runs end-to-end.

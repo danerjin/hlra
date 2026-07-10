@@ -126,6 +126,20 @@ class LatentThoughtModel(nn.Module):
         )
         self.latent_predictor = nn.Linear(cfg.d_model, cfg.d_model)
 
+        # --- Generation predictor (encoder-space next-latent head) --------
+        # The SSL branch above predicts in the *projected* SSL space, which the
+        # §2.4 collapse fix deliberately isolates from the shared encoder space
+        # the HRM loop consumes -- so `latent_predictor` cannot seed generation
+        # (its output lives in the wrong space). `gen_predictor` is the map
+        # generation actually needs: shared latent of chunk t -> shared latent
+        # of chunk t+1. It is trained with BOTH input and target detached
+        # (forward_gen_predictor), so its loss reaches only this head: it can
+        # neither collapse nor otherwise perturb the shared encoder. Purely a
+        # readout for inference (generate.py).
+        self.gen_predictor = nn.Sequential(
+            nn.Linear(cfg.d_model, cfg.d_model), nn.GELU(), nn.Linear(cfg.d_model, cfg.d_model)
+        )
+
     # ------------------------------------------------------------------
     # Self-supervised branch: fully parallel, no sequential dependency.
     # ------------------------------------------------------------------
@@ -170,6 +184,26 @@ class LatentThoughtModel(nn.Module):
         var = variance_regularization(shared_latents[flat_valid]) if var_weight > 0 else \
             torch.zeros((), device=chunk_tensor.device)
         return cos_weight * cos + var_weight * var
+
+    def forward_gen_predictor(self, chunk_tensor: torch.Tensor, chunk_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Train the encoder-space next-latent head used by generation: predict
+        chunk_{t+1}'s *shared* latent from chunk_t's, both computed under
+        no_grad, so the loss trains ONLY self.gen_predictor -- gradient-isolated
+        from the shared encoder and the SSL branch by construction. The scaled
+        cosine loss suffices because the HRM injection LayerNorms the latent
+        (chunk_pool_norm), making the injection invariant to positive rescaling.
+        """
+        batch, n_chunks, chunk_len = chunk_tensor.shape
+        flat_ids = chunk_tensor.reshape(batch * n_chunks, chunk_len)
+        with torch.no_grad():
+            z = self.chunk_encoder(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
+        pair_valid = chunk_mask[:, :-1] & chunk_mask[:, 1:]
+        pred = self.gen_predictor(z[:, :-1][pair_valid])
+        target = z[:, 1:][pair_valid]
+        if pred.numel() == 0:
+            return torch.zeros((), device=chunk_tensor.device)
+        return scaled_cosine_loss(pred, target, k=self.cfg.cosine_loss_k)
 
     @torch.no_grad()
     def latent_collapse_metric(self, chunk_tensor: torch.Tensor, chunk_mask: torch.Tensor) -> float:

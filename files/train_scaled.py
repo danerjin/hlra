@@ -83,9 +83,14 @@ def main():
     print(f"[train_scaled] preset={args.preset} device={device} vocab={ds.vocab_size} "
           f"examples={len(ds)} stage_steps={stage_steps}")
 
+    # Seeded random split rather than "first N docs": the cache preserves corpus
+    # order, so a head slice can be topically clustered (one dump/source) and
+    # make val unrepresentative. Deterministic across resumes (fixed seed,
+    # computed before any RNG-state restore).
     val_n = min(256, max(8, len(ds) // 20))
-    val_ds = Subset(ds, range(val_n))
-    train_ds = Subset(ds, range(val_n, len(ds)))
+    perm = torch.randperm(len(ds), generator=torch.Generator().manual_seed(0)).tolist()
+    val_ds = Subset(ds, perm[:val_n])
+    train_ds = Subset(ds, perm[val_n:])
 
     train_cfg = TrainConfig(
         batch_size=args.batch_size, lr=args.lr, device=device,

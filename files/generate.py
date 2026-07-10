@@ -7,8 +7,8 @@ and output text. Two things happen, matching the architecture:
   1. READ  -- the prompt is chunked, each chunk encoded to a latent and run
      through the HRM inner loop, building up the gestalt memory and the running
      H-state ("thought"). This is the model reading the prompt as self-content.
-  2. GENERATE -- for each new chunk: predict the next latent (JEPA
-     latent_predictor), form the next thought via the HRM loop, and let the
+  2. GENERATE -- for each new chunk: predict the next latent in encoder space
+     (gen_predictor; notes §15.1), form the next thought via the HRM loop, and let the
      Talker autoregressively decode tokens for that thought (conditioned on the
      thought + gestalt memory). The generated chunk is re-encoded to a latent to
      seed the next step. Decoded to text with the gpt2 tokenizer.
@@ -47,7 +47,15 @@ def load():
     tok_src = ckpt.get("tokenizer_path") if os.path.isdir(ckpt.get("tokenizer_path", "")) else TOKENIZER_DIR
     chunker, _ = build_regex_gpt2_chunker(cfg, tok_src)
     model = LatentThoughtModel(cfg, chunker)
-    model.load_state_dict(ckpt["model_state"])
+    # strict=False so checkpoints predating the gen_predictor head still load;
+    # report anything missing so degraded generation is attributable.
+    missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
+    if missing:
+        mods = sorted({k.split(".")[0] for k in missing})
+        print(f"[generate] WARNING: checkpoint predates module(s) {mods}; they are "
+              f"randomly initialized -- latent prediction will be untrained.")
+    if unexpected:
+        raise SystemExit(f"checkpoint has unexpected keys (wrong model?): {unexpected[:5]}")
     model.eval()
     return model, chunker, cfg, ckpt
 
@@ -105,7 +113,11 @@ def generate(model, chunker, cfg, prompt, n_chunks=3, temperature=0.9, greedy=Fa
     memory, h_state, l_state, last_latent = read_prompt(model, chunker, cfg, prompt)
     out_chunks = []
     for _ in range(n_chunks):
-        pred_latent = model.latent_predictor(last_latent)              # JEPA: next-segment latent
+        # JEPA next-segment prediction in ENCODER space (gen_predictor), the
+        # space the HRM injection expects. (latent_predictor lives in the
+        # separate SSL projection space and must not be used here -- feeding
+        # its output to the loop was the pre-review bug.)
+        pred_latent = model.gen_predictor(last_latent)
         h_state, _ = model.hrm_loop(pred_latent, memory, None, h_state=h_state, l_state=l_state,
                                     grad_window=5, use_act=False)
         l_state = h_state

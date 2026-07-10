@@ -82,11 +82,17 @@ class EMATargetEncoder:
         self.target_encoder = copy.deepcopy(online_encoder)
         for p in self.target_encoder.parameters():
             p.requires_grad_(False)
+        # Deterministic target: keep the EMA encoder in eval mode so dropout is
+        # OFF, the standard BYOL/DINO choice. A stochastic target would make the
+        # SSL cosine target jitter per call; nothing flips this back to train
+        # (EMATargetEncoder is not an nn.Module, so model.train() never reaches it).
+        self.target_encoder.eval()
         self.target_proj = None
         if online_proj is not None:
             self.target_proj = copy.deepcopy(online_proj)
             for p in self.target_proj.parameters():
                 p.requires_grad_(False)
+            self.target_proj.eval()
 
     @torch.no_grad()
     def update(self, online_encoder: ChunkEncoder, online_proj=None) -> None:

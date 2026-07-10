@@ -104,17 +104,21 @@ class Trainer:
     def _loss_on(self, batch, flags, plan, run_grounded):
         ct, cm, ri, rm = batch
         total, logs = None, {}
+        # One shared online encoder pass per step, reused by every branch below
+        # (grounded / SSL / gen all consume the same shared-encoder latent).
+        chunk_vecs = self.model.encode_chunks(ct)
         if plan.use_grounded_loss and run_grounded:
             memory = GestaltMemoryBank(self.model_cfg.memory_capacity, self.model_cfg.d_model)
             nll, ponder, _ = self.model.forward_grounded(
-                ct, cm, ri, rm, memory, SELF, flags, self.model_cfg.act_ponder_cost)
+                ct, cm, ri, rm, memory, SELF, flags, self.model_cfg.act_ponder_cost,
+                chunk_vecs=chunk_vecs)
             total = nll + ponder
             logs["nll"] = round(nll.item(), 4)
             logs["ponder"] = round(ponder.item(), 4)
         if plan.use_self_supervised_loss:
             ssl = self.model.forward_self_supervised(
                 ct, cm, self.ema, cos_weight=self.train_cfg.ssl_loss_weight,
-                var_weight=self.train_cfg.ssl_var_weight)
+                var_weight=self.train_cfg.ssl_var_weight, chunk_vecs=chunk_vecs)
             total = ssl if total is None else total + ssl
             logs["ssl"] = round(ssl.item(), 4)
             # Generation head (encoder-space next-latent). Gradient-isolated:
@@ -122,7 +126,8 @@ class Trainer:
             # to the reconstruction/SSL dynamics. Logged separately so the ssl
             # metric stays comparable with earlier runs.
             if self.train_cfg.gen_loss_weight > 0:
-                gen = self.train_cfg.gen_loss_weight * self.model.forward_gen_predictor(ct, cm)
+                gen = self.train_cfg.gen_loss_weight * self.model.forward_gen_predictor(
+                    ct, cm, chunk_vecs=chunk_vecs)
                 total = total + gen
                 logs["gen"] = round(gen.item(), 4)
         return total, logs, (ct, cm)
@@ -243,7 +248,10 @@ class Trainer:
     def load(self, path: str):
         import random
         import numpy as np
-        ckpt = torch.load(path, map_location=self.device)
+        # weights_only=False: the checkpoint carries Python/NumPy/torch RNG state
+        # (not plain tensors), which torch>=2.6's weights_only=True default refuses
+        # to unpickle -- an explicit False keeps resume working across torch versions.
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(ckpt["model_state"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.ema.load_state_dict(ckpt["ema"])

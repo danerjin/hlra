@@ -141,11 +141,25 @@ class LatentThoughtModel(nn.Module):
         )
 
     # ------------------------------------------------------------------
+    def encode_chunks(self, chunk_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Shared order-aware chunk latents, (batch, n_chunks, d_model), WITH grad.
+        The grounded, self-supervised, and generation paths all consume the same
+        shared-encoder representation, so a caller that runs more than one of them
+        in a single step should encode ONCE here and pass the result in via each
+        method's `chunk_vecs=` argument -- avoiding 2-3 redundant encoder passes
+        per step (the online encoder is otherwise re-run per branch).
+        """
+        batch, n_chunks, chunk_len = chunk_tensor.shape
+        flat_ids = chunk_tensor.reshape(batch * n_chunks, chunk_len)
+        return self.chunk_encoder(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
+
+    # ------------------------------------------------------------------
     # Self-supervised branch: fully parallel, no sequential dependency.
     # ------------------------------------------------------------------
     def forward_self_supervised(self, chunk_tensor: torch.Tensor, chunk_mask: torch.Tensor,
                                  ema: EMATargetEncoder, cos_weight: float = 1.0,
-                                 var_weight: float = 0.0) -> torch.Tensor:
+                                 var_weight: float = 0.0, chunk_vecs=None) -> torch.Tensor:
         """
         chunk_tensor: (batch, n_chunks, chunk_len)
         chunk_mask:   (batch, n_chunks) bool
@@ -165,7 +179,11 @@ class LatentThoughtModel(nn.Module):
         flat_token_mask = (flat_ids != 0)  # pad id is 0 by convention (chunker.py)
         flat_valid = chunk_mask.reshape(batch * n_chunks)
 
-        shared_latents = self.chunk_encoder(flat_ids, flat_token_mask)      # (B*N, d) shared
+        # Reuse the shared encode if the caller already produced it this step
+        # (encode_chunks); otherwise run the online encoder here. Either way the
+        # EMA *target* below is a separate encoder and always runs on its own.
+        shared_latents = (self.chunk_encoder(flat_ids, flat_token_mask)
+                          if chunk_vecs is None else chunk_vecs.reshape(batch * n_chunks, -1))
         online_proj = self.ssl_proj(shared_latents).reshape(batch, n_chunks, -1)
 
         with torch.no_grad():
@@ -185,19 +203,27 @@ class LatentThoughtModel(nn.Module):
             torch.zeros((), device=chunk_tensor.device)
         return cos_weight * cos + var_weight * var
 
-    def forward_gen_predictor(self, chunk_tensor: torch.Tensor, chunk_mask: torch.Tensor) -> torch.Tensor:
+    def forward_gen_predictor(self, chunk_tensor: torch.Tensor, chunk_mask: torch.Tensor,
+                               chunk_vecs=None) -> torch.Tensor:
         """
         Train the encoder-space next-latent head used by generation: predict
-        chunk_{t+1}'s *shared* latent from chunk_t's, both computed under
-        no_grad, so the loss trains ONLY self.gen_predictor -- gradient-isolated
-        from the shared encoder and the SSL branch by construction. The scaled
-        cosine loss suffices because the HRM injection LayerNorms the latent
-        (chunk_pool_norm), making the injection invariant to positive rescaling.
+        chunk_{t+1}'s *shared* latent from chunk_t's, both DETACHED, so the loss
+        trains ONLY self.gen_predictor -- gradient-isolated from the shared
+        encoder and the SSL branch by construction. The scaled cosine loss
+        suffices because the HRM injection LayerNorms the latent (chunk_pool_norm),
+        making the injection invariant to positive rescaling.
+
+        If the caller passes the shared `chunk_vecs` (encode_chunks), it is
+        detached here -- so reusing it keeps the exact gradient isolation the
+        standalone no_grad encode gave, at no extra encoder pass.
         """
         batch, n_chunks, chunk_len = chunk_tensor.shape
-        flat_ids = chunk_tensor.reshape(batch * n_chunks, chunk_len)
-        with torch.no_grad():
-            z = self.chunk_encoder(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
+        if chunk_vecs is None:
+            flat_ids = chunk_tensor.reshape(batch * n_chunks, chunk_len)
+            with torch.no_grad():
+                z = self.chunk_encoder(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
+        else:
+            z = chunk_vecs.detach()
         pair_valid = chunk_mask[:, :-1] & chunk_mask[:, 1:]
         pred = self.gen_predictor(z[:, :-1][pair_valid])
         target = z[:, 1:][pair_valid]
@@ -233,10 +259,16 @@ class LatentThoughtModel(nn.Module):
         role_id: int,
         stage: StageFlags,
         ponder_weight: float,
+        chunk_vecs=None,
     ):
         """
         Returns (nll_loss, ponder_loss, thoughts) where `thoughts` is the
         list of per-chunk H-state vectors produced (useful for logging/eval).
+
+        `chunk_vecs` (batch, n_chunks, d_model), if supplied by the caller via
+        encode_chunks, is the shared order-aware chunk latent -- reused here
+        instead of re-encoding, so a step that also runs the SSL/gen branches
+        pays for exactly one online encoder pass.
         """
         batch, n_chunks, chunk_len = chunk_tensor.shape
         device = chunk_tensor.device
@@ -253,8 +285,10 @@ class LatentThoughtModel(nn.Module):
         # representation the self-supervised loss predicts. All chunks are
         # independent of the loop state, so encode the whole document in one
         # batched call instead of once per chunk inside the sequential loop.
-        flat_ids = chunk_tensor.reshape(batch * n_chunks, chunk_len)
-        chunk_vecs = self.chunk_encoder(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
+        # Reuse the caller's shared encode when provided (encode_chunks).
+        if chunk_vecs is None:
+            flat_ids = chunk_tensor.reshape(batch * n_chunks, chunk_len)
+            chunk_vecs = self.chunk_encoder(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
 
         h_state, l_state = None, None
         total_nll = torch.zeros((), device=device)

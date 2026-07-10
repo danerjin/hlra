@@ -42,7 +42,7 @@ CKPT = os.path.join(PROJECT, "runs", "model.pt")
 
 
 def load():
-    ckpt = torch.load(CKPT, map_location="cpu")
+    ckpt = torch.load(CKPT, map_location="cpu", weights_only=False)  # carries non-tensor RNG/cfg state
     cfg = ModelConfig(**ckpt["model_cfg"])
     tok_src = ckpt.get("tokenizer_path") if os.path.isdir(ckpt.get("tokenizer_path", "")) else TOKENIZER_DIR
     chunker, _ = build_regex_gpt2_chunker(cfg, tok_src)

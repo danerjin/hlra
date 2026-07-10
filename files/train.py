@@ -102,9 +102,10 @@ def _to_device(batch, device):
 # Training
 # ----------------------------------------------------------------------
 def run_grounded_step(model, chunk_tensor, chunk_mask, raw_ids, raw_mask,
-                       memory, role_id, stage_flags, ponder_weight):
+                       memory, role_id, stage_flags, ponder_weight, chunk_vecs=None):
     return model.forward_grounded(
-        chunk_tensor, chunk_mask, raw_ids, raw_mask, memory, role_id, stage_flags, ponder_weight
+        chunk_tensor, chunk_mask, raw_ids, raw_mask, memory, role_id, stage_flags,
+        ponder_weight, chunk_vecs=chunk_vecs,
     )
 
 
@@ -145,10 +146,13 @@ def train_stages_a_to_e(model, ema, curriculum: Curriculum, model_cfg, train_cfg
             # ungrounded-drift regime §3.7 warns about.
             run_grounded = random.random() < train_cfg.grounded_loss_min_frequency
 
+        # One shared online encoder pass, reused by every branch this step.
+        chunk_vecs = model.encode_chunks(chunk_tensor)
+
         if run_grounded and loss_plan.use_grounded_loss:
             nll, ponder, _ = run_grounded_step(
                 model, chunk_tensor, chunk_mask, raw_ids, raw_mask,
-                memory, SELF, stage_flags, model_cfg.act_ponder_cost,
+                memory, SELF, stage_flags, model_cfg.act_ponder_cost, chunk_vecs=chunk_vecs,
             )
             total_loss = loss_plan.grounded_loss_weight * (nll + ponder)
             logs["nll"] = round(nll.item(), 4)
@@ -160,13 +164,15 @@ def train_stages_a_to_e(model, ema, curriculum: Curriculum, model_cfg, train_cfg
             # while the grounded (reconstruction) loss above stays the anchor.
             ssl = model.forward_self_supervised(chunk_tensor, chunk_mask, ema,
                                                 cos_weight=train_cfg.ssl_loss_weight,
-                                                var_weight=train_cfg.ssl_var_weight)
+                                                var_weight=train_cfg.ssl_var_weight,
+                                                chunk_vecs=chunk_vecs)
             total_loss = ssl if total_loss is None else total_loss + ssl
             logs["ssl"] = round(ssl.item(), 4)
             # Generation head (encoder-space next-latent; gradient-isolated,
             # trains only model.gen_predictor -- see model.forward_gen_predictor).
             if train_cfg.gen_loss_weight > 0:
-                gen = train_cfg.gen_loss_weight * model.forward_gen_predictor(chunk_tensor, chunk_mask)
+                gen = train_cfg.gen_loss_weight * model.forward_gen_predictor(
+                    chunk_tensor, chunk_mask, chunk_vecs=chunk_vecs)
                 total_loss = total_loss + gen
                 logs["gen"] = round(gen.item(), 4)
 
@@ -240,7 +246,7 @@ def train_stage_f(model, ema, curriculum: Curriculum, model_cfg, train_cfg, opti
         loss_plan = curriculum.loss_plan()
 
         optimizer.zero_grad()
-        total_loss = torch.zeros(())
+        total_loss = torch.zeros((), device=device)  # must match the per-turn losses' device
         n_turns = 0
         last_chunks = None
 

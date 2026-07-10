@@ -988,3 +988,89 @@ longer defaults into the failure mode. Verified `TrainConfig().grounded_loss_min
 Net: only `config.py` changed. The scaled path was already collapse-safe; this
 closes the one remaining footgun in the shared default. No large training run
 was started.
+
+---
+
+## 17. Fifth pre-scale review (2026-07-09) — independent read + two hardening fixes
+
+Another full pass over spec + all code before the run, same methodology
+(read → hypothesize → confirm by running → fix → re-verify). The structural
+fixes from §11/§15/§16 were re-confirmed present and working. The scaled
+big-run path (`data_prep.py` → `train_scaled.py` → `trainer.py`) is clean: a
+full offline A→E smoke fired every stage, `ssl`/`gen`/`ponder` moved correctly
+(ponder activates at E), `latent_std` held ~0.43 (no collapse), and
+checkpoint → `--resume` continued schedule-exact. Two real-but-narrow issues
+found and fixed; no critical bug in the scaled path.
+
+### 17.1 Stage F device bug (fixed)
+
+`train.py:train_stage_f` initialized `total_loss = torch.zeros(())` — a CPU
+scalar — then added the per-turn `nll`/`ponder` (on the model's device). On CPU
+(the default, and what all prior A→F verification used) this is silent; on a
+GPU run it raises "expected all tensors on the same device" the moment Stage F
+starts. Fixed to `torch.zeros((), device=device)`. Narrow (Stage F via
+`train.py` only; the scaled A→E path is unaffected) but a real latent crash for
+any GPU fine-tuning run.
+
+### 17.2 `torch.load` weights_only portability (hardened)
+
+`trainer.load` and `generate.load` called `torch.load` without
+`weights_only=`. Checkpoints carry Python/NumPy/torch RNG state (non-tensor
+pickled objects); torch ≥ 2.6 defaults `weights_only=True` and would refuse to
+unpickle them, breaking `--resume` — exactly the thing a multi-day run cannot
+afford, and easy to hit if the GPU box runs a newer torch than the dev box
+(2.2.2). Added an explicit `weights_only=False` at both sites (no-op on 2.2.2,
+correct on newer torch). Shard loads in `CachedChunkDataset` are plain-tensor
+dicts and were left as-is.
+
+### 17.3 Two efficiency changes applied at owner request
+
+Both items §16.2 had deferred were pulled in (owner: "I don't really care about
+dropout", which removes the one reason the second was non-trivial):
+
+- **EMA target now deterministic.** `EMATargetEncoder.__init__` puts
+  `target_encoder`/`target_proj` in `.eval()` (dropout off) — the standard
+  BYOL/DINO choice. Nothing flips them back (the wrapper is not an nn.Module, so
+  `model.train()` never reaches them).
+- **Shared encoder pass deduplicated.** New `model.encode_chunks()` computes the
+  order-aware chunk latents ONCE per step; `forward_grounded`,
+  `forward_self_supervised`, and `forward_gen_predictor` each take an optional
+  `chunk_vecs=` and reuse it (methods still self-encode when called standalone —
+  Stage F, eval, generate). Wired through `trainer._loss_on` and
+  `train.train_stages_a_to_e`. Online `chunk_encoder` forwards per D–E step drop
+  **3 → 1** (verified by forward-hook count); the EMA target still runs its own
+  single pass. `gen_predictor` isolation is preserved by detaching the shared
+  vecs (verified: gen loss reaches no `chunk_encoder` param). Because the three
+  branches previously drew independent dropout masks, D+ numerics shift slightly
+  vs the pre-change run (A–C are bit-identical — grounded's single encode was
+  already shared); `latent_std` stays ~0.43, no collapse, losses still decrease.
+
+### 17.4 Standing recommendation before launch
+
+`--amp`/bf16 is still only validated by `rocm_smoke.py`, never a real GPU
+training step. Run the STRIX_HALO.md go/no-go (`rocm_smoke.py` +
+`bench_throughput.py`) on the actual box first; that autocast path is the
+largest remaining untested surface.
+
+### 17.5 Re-verification (what was actually run this pass)
+
+- **Full A→E via the exact big-run path** (`data_prep.py --offline --preset
+  smoke` → `train_scaled.py`, budgets 3/3/3/3/3): every stage transition fires,
+  `ssl`/`gen`/`ponder` move correctly (ponder activates at E), checkpoints
+  write, `latent_std` ~0.43 (no collapse). Re-run after the §17.3 changes: A–C
+  bit-identical, D+ shifts only by the shared-dropout-mask/deterministic-target
+  amount, still healthy.
+- **Checkpoint → `--resume`**: continues schedule-exact (LR mid-cosine,
+  losses/`latent_std` continuous) — the §15.3 fix still holding.
+- **Encoder-pass dedup**: forward-hook count confirms **1** online
+  `chunk_encoder` forward per D–E step (was 3) + 1 EMA target forward; EMA
+  target confirmed in eval mode; `gen_predictor` still isolated (gen loss
+  reaches zero `chunk_encoder` params).
+- **`generate.py`**: still loads the existing `runs/model.pt` (with the expected
+  missing-`gen_predictor` warning for that pre-§15 checkpoint) and scores.
+- All files byte-compile. No large training run was started.
+
+Files changed this session: `files/train.py` (17.1 device fix, 17.3 wiring),
+`files/trainer.py` (17.2 load flag, 17.3 wiring), `files/generate.py` (17.2
+load flag), `files/ema_target.py` (17.3 eval target), `files/model.py` (17.3
+`encode_chunks` + `chunk_vecs=` reuse), `notes.md` (this section).

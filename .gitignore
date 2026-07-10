@@ -1,5 +1,20 @@
-.hf_cache
+# Python environment (regenerate with pip; see STRIX_HALO.md)
 .venv
+
+# HuggingFace dataset/model cache (re-downloaded on demand)
+.hf_cache
+
+# Pre-chunked shard caches (rebuild with data_prep.py)
+chunk_cache/
+chunk_cache_shakedown/
 wiki_cache/
+
+# Model checkpoints / shards -- large, regenerable by training.
+# runs/ keeps its metrics.json + *.png plots tracked; only the .pt is ignored.
+*.pt
+
+# OS / editor cruft
 .DS_Store
+
+# Research PDFs (kept on disk, not in the repo)
 *.pdf

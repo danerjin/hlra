@@ -36,14 +36,21 @@ run, not a specific perplexity.
 
 ---
 
-## 1. What you need before you start
+## 1. Prerequisites: GPU and PyTorch
+
+> ⚠️ **Before starting this guide, read and follow `STRIX_HALO.md`** (at the repo
+> root). It has the ROCm setup and the exact `pip install` command for PyTorch
+> on your GPU hardware. Come back here once PyTorch is installed and
+> `torch.cuda.is_available()` returns `True` on your GPU box.
+
+Once that's done, you need:
 
 - A machine with the **AMD ROCm GPU** (Strix Halo / Radeon 8060S) — or any CUDA
   GPU. The AMD GPU shows up to the code as "cuda"; that is normal.
 - Python with **PyTorch (GPU build)**, plus `datasets`, `transformers`,
   `matplotlib`.
 - The local GPT-2 tokenizer folder must exist at the project root: **`gpt2_tok/`**
-  (it should already be there — check in Step 1).
+  (it should already be there — check below).
 - Disk space: roughly **~10 GB** for the prepared data cache, plus a few GB per
   checkpoint.
 
@@ -70,15 +77,14 @@ See `STRIX_HALO.md` for the full ROCm setup notes if the GPU isn't detected.
 
 ## 2. One-time environment setup
 
-Activate the project's Python environment and install the training
-dependencies. **On the GPU box you must install a GPU (ROCm/CUDA) build of
-PyTorch** — the exact wheel depends on your ROCm version; see `STRIX_HALO.md`.
+Activate the project's Python environment and install the remaining training
+dependencies (PyTorch must already be installed from Step 1 / `STRIX_HALO.md`):
 
 ```bash
 cd "$PROJECT"
 source .venv/bin/activate          # activates the project environment
 
-# Install training deps (skip torch here if your GPU torch is already installed):
+# Install the other training deps:
 pip install datasets transformers matplotlib
 ```
 

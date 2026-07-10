@@ -127,7 +127,22 @@ If none of that gets the ETA acceptable, the levers are: smaller token budget
 - **Stage E expectation (notes §15.5)** — the halting head is trained only by
   the ponder cost, so `halt_prob → 1` (always halt at minimum depth) is the
   *expected* Stage-E behavior, not a regression; don't burn run time tuning
-  `act_ponder_cost` against it.
-- **Peak memory (notes §15.5)** — activation graphs span whole documents in
-  Stages C+ (transitive memory credit); the bench's peak-GB numbers already
-  include this — trust them, and leave batch-size headroom.
+  `act_ponder_cost` against it. (notes §21.5 fixed a small ACT gradient leak —
+  the ponder cost was reaching one thought back through the raw h/l chain; the
+  fix is in `hrm_loop._TruncationSchedule` and does not change this `halt_prob → 1`
+  expectation.)
+- **Peak memory (notes §15.5, §21.2)** — activation graphs span whole documents
+  in Stages C+ (transitive memory credit — intended per §3.6, *not* a leak the
+  `memory_grad_window` should have stopped); the bench's peak-GB already includes
+  this. At `small`, the single largest activation term is the **Talker logits**
+  (`N·L·vocab` = 32·64·50258 ≈ 103M elements/batch-item, retained across all
+  chunks until backward): ~13 GB bf16 @ batch 64 (up to ~26 GB if cross-entropy
+  keeps an fp32 copy), on top of the ~2.5 GB model+optimizer. So OOM is unlikely
+  at `small` on 128 GB — but `--grad-accum N` is the escape hatch if a batch
+  doesn't fit (N smaller micro-batches, each freeing its graph, ~N× less
+  activation memory at the same effective batch).
+- **"128 GB" is not necessarily allocable to the GPU** — unified memory is shared
+  with the CPU/OS and gated by the amdgpu GTT pool (§1). The real ceiling is what
+  `rocm_smoke.py` prints on startup: `device memory: XXX GB total, YYY GB free`
+  (`torch.cuda.mem_get_info()`). Check that number against the peak-GB the bench
+  reports **before** committing a batch size — don't assume the full 128 GB.

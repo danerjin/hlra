@@ -85,7 +85,28 @@ class _TruncationSchedule:
             # survive, or truncation silently degrades to full-document BPTT.
             cut = self.step == max(0, self.total - self.window)
         else:
-            cut = self.in_graph >= self.window
+            # Rolling cut every `window` steps bounds the backward horizon. Also
+            # force a cut at the thought's first step (`self.step == 0`) to sever
+            # the entering (previous-thought) h/l states, mirroring the
+            # fixed-depth max(0, total-window) guarantee. This closes TWO paths of
+            # raw cross-thought BPTT that the plain rolling cut leaves open:
+            #   (1) the footgun (notes §18.2): a thought that halts in <= window
+            #       steps never triggers the rolling cut, so the *returned* state
+            #       stays wired to the previous thought. Not reachable at the
+            #       shipped config (min ACT depth n_cycles*(l_steps+1)=8 > window
+            #       <=5), but silent if the cycle/window counts change.
+            #   (2) LIVE at the shipped config: the ponder cost reads halt_prob on
+            #       the H-state at each cycle boundary (op index l_steps=3), which
+            #       is BEFORE the first rolling cut (op index `window`=5) -- so the
+            #       ponder gradient leaked one thought back through the raw h/l
+            #       chain even though the returned state was severed. §18.2 missed
+            #       this because it only checked the returned state. Cross-thought
+            #       credit must flow through the gestalt memory (its own window),
+            #       never the raw chain (§3.6); the entry cut enforces that for the
+            #       ponder term too. (Verified: entering-state grad is None after;
+            #       non-None before. Stage-E metrics shift ~1e-4, the size of the
+            #       severed ponder-weight=0.01 leak; nll/ssl unaffected.)
+            cut = self.step == 0 or self.in_graph >= self.window
         if cut:
             self.in_graph = 0
             return h.detach(), l.detach()

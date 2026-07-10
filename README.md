@@ -166,6 +166,28 @@ on a tiny synthetic cache; **no large training run has been done**.
 > fixed stage budgets, an unmasked input-lane read, and missing RNG state in
 > checkpoints.
 
+> **Eighth pre-scale review (notes §21):** verification pass — ran the A→E path
+> end-to-end offline at both `smoke` and `small` presets (+ schedule-exact
+> resume), byte-compiled, and ran an adversarial gradient-flow audit. Fixed one
+> real (small) bug: in Stage E the **ACT ponder-cost gradient leaked one thought
+> back through the raw h/l state chain** — the ponder term reads the halting head
+> at the first cycle boundary (op 3), *before* the ACT rolling truncation's first
+> cut (op 5), so cross-thought credit was flowing through the raw state instead
+> of only the gestalt memory (§3.6). Fixed by forcing a truncation cut at each
+> thought's entry (`hrm_loop._TruncationSchedule`); this also closes the §18.2
+> footgun (a thought halting in ≤ `grad_window` steps). Verified by direct
+> autograd test (entering-state grad `None` after, non-`None` before) and an
+> old-vs-new A→E diff (`nll`/`ssl`/`lstd` bit-identical; only `ponder`/`gen`/
+> `val_loss` move ~1e-4, the size of the severed leak). Confirmed *not* bugs
+> (already §3.6-documented intended behavior): the memory autograd graph spans
+> the whole document in Stages C+ via transitive credit — the `memory_grad_window`
+> bounds direct per-hop reach/magnitude, not graph depth (budget GPU memory via
+> the bench). Memory-headroom estimate: at `small` on 128 GB the dominant term is
+> the Talker logits (`N·L·vocab` retained across chunks) at ~13–26 GB @ batch 64
+> plus ~2.5 GB model/optimizer — ample headroom, so throughput (not OOM) is the
+> real constraint; still confirm the *GPU-visible* memory ceiling from
+> `rocm_smoke.py`'s `mem_get_info` line, since 128 GB unified ≠ 128 GB allocable.
+>
 > **Seventh pre-scale review (notes §19):** independent pass (different model
 > family than the prior six) before the big run. No critical bug in the A→E
 > scaled path. Fixed: `data_prep.py` couldn't select a HF dataset *config*

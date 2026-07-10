@@ -1436,3 +1436,124 @@ honest docstring), `files/hrm_loop.py` (import/comments), `files/config.py`
 `files/profile_transition.py` (new, 20.4), `README.md` +
 `latent-thought-architecture.md` (20.2 docs), `notes.md` (this section). No
 training run started; forward numerics unchanged.
+
+---
+
+## 21. Eighth pre-scale review (2026-07-10) — verification pass + one ACT fix
+
+Independent review of the spec + the full A→E code path before the big run,
+requested as a final "are there critical bugs" check. **No critical (run-ending)
+bug found.** The §11–§20 passes hold. Empirical re-verification of the runtime
+path, plus an adversarial gradient-flow audit — which came back clean on Stages
+A–D (every candidate it raised for the memory path was already-documented §3.6
+intended behavior), but chasing its one ACT finding surfaced a small live
+gradient leak now fixed (§21.5). One code change this pass: `files/hrm_loop.py`
+(ACT entry cut).
+
+### 21.1 What was actually run
+
+- Offline `data_prep.py --offline` at **both** `smoke` and `small` presets →
+  `train_scaled.py` A→E (budgets 4/4/4/4/4 and 2/2/2/2/2): every stage fires,
+  SSL+gen turn on at D, ponder at E, `latent_std` logged, rolling + `model.pt`
+  checkpoints written, curriculum advances A→F. Confirms the `small` preset's
+  wider dims / head count / chunk dims (64,32,256) build and step with no shape
+  or config error (the smoke preset alone wouldn't catch a small-specific bug).
+- `--resume` from a Stage-E checkpoint with the identical schedule: continues
+  schedule-exact (val_loss bit-matches at the resumed step; nll within
+  data-order/dropout noise, as in §18.3/§19.8).
+- All `files/*.py` byte-compile.
+- Micro-test of the §19.2 EOS advanced-indexing (`model.forward_grounded`,
+  `target_mask[has_end, lengths[has_end]] = True`) across full / short / empty /
+  len-1 chunks: EOS mark lands on the first pad position only for active
+  shorter-than-max chunks, full chunks unmarked, inactive rows all-False. Correct.
+
+### 21.2 Adversarial gradient-flow audit — both findings are already-documented behavior
+
+A fresh-eyes pass scoped to the truncated-BPTT / loss-masking / SSL-isolation /
+memory-truncation code (deliberately given the code but **not** the spec, to
+avoid anchoring) raised exactly two candidates, both of which reduce to intended,
+already-logged behavior:
+
+- **"Memory truncation doesn't bound backward horizon / the 1→5 warmup is a
+  no-op."** The transitive full-document chain it describes is **exactly §3.6's
+  documented caveat** ("credit reaches arbitrarily far back transitively,
+  attenuated ~30×/hop; the autograd graph spans the whole document in Stages C+;
+  only per-hop reach and gradient magnitude are bounded, not graph depth"). The
+  "no-op" characterization is wrong: `memory_grad_window` bounds *direct* per-hop
+  reach (window in-graph slots vs the rest detached) and per-hop gradient
+  magnitude, which is what the warmup is for — it was never claimed to bound graph
+  depth. Not a bug. The one real operational consequence — activation memory
+  spans the document in C+ — is the §3.6 "budget GPU memory accordingly; trust
+  the bench's peak-GB" note; nothing new.
+- **"ACT rolling-cut can skip severing entering states if a thought runs ≤
+  grad_window steps."** Raised as the §18.2 footgun ("not reachable at current
+  config"). Investigating it turned up something §18.2 *missed* — see §21.5: a
+  smaller version of the leak is actually LIVE at the shipped config through the
+  ponder term. Fixed this pass.
+
+Independently confirmed CORRECT in the same pass: fixed-depth inner-loop
+truncation (exact `window`-trailing-step cut, entering states severed), Talker
+right-shift ↔ NLL target alignment, per-chunk NLL masking/normalization with no
+padded-row leakage, SSL→shared-encoder connected while gen-head is
+input+target-detached, EMA target stop-grad, and FIFO `vectors`/`role_ids`
+index-parity through `truncate_gradient_window`.
+
+### 21.3 Watch items for the run (all previously documented — restated for the operator)
+
+- **`--stage-steps` must be passed explicitly.** `DEFAULT_STAGE_STEPS` (12k ≈
+  230M tokens @ batch 16) under-trains the ~1.2B budget ~5× (§19.8). TRAINING.md
+  Step 6 computes the right value.
+- **Treat `latent_std ≲ 0.1` as collapse** even though nonzero: the VICReg floor
+  still reads train-mode (dropout-noised) latents, ~4–5× weaker than nominal at
+  full collapse; the grounded anchor at frequency 1.0 is the real defense (§19.4).
+- **`--amp` is untested on real hardware.** Run `rocm_smoke.py` → then
+  `bench_throughput.py` on the ROCm box first (peak-GB there reflects the §3.6
+  full-document graph).
+
+### 21.4 Deliberately not changed
+
+- The §20.3 loop-constant-`e` caching stays dropped — §20.4 measured l_gate at
+  ~0.3% of a step; not worth perturbing the truncated-BPTT path.
+- AdamW still decays `theta`/`log_dt`/LayerNorms (§18.2). A no-decay param group
+  is standard hygiene, but introducing an optimizer change that shifts the
+  smoke-validated dynamics right before a multi-day run is the wrong trade;
+  left for a future pass, as §18.2 already flagged.
+
+### 21.5 M16 — ACT cross-thought raw-chain leak via the ponder term (fixed)
+
+Chasing the §18.2 "ACT rolling-cut footgun" (nominally *not reachable at current
+config*) turned up a smaller instance of the same leak that **is** live at the
+shipped config, which §18.2 missed by only examining the *returned* thought
+state.
+
+`_TruncationSchedule.maybe_detach` in ACT mode used a pure rolling cut
+(`in_graph >= window`); a fresh per-thought schedule starts at `in_graph=0`, so
+the first cut fires only at op index `window` (=5). The *returned* H-state is
+severed from the previous thought by that op-5 cut (min ACT depth
+`n_cycles*(l_steps+1)`=8 > 5), which is what §18.2 checked. **But the ponder
+cost reads `halt_prob` on the H-state at each cycle boundary — op index
+`l_steps`=3 for the first cycle — which is BEFORE the op-5 cut.** So the
+ponder-cost gradient flowed one thought back into the previous thought's raw
+`h_state`/`l_state`, i.e. exactly the raw cross-thought BPTT §3.6 says must go
+through the gestalt memory (with its own window), never the raw chain.
+
+*Confirmed with a direct autograd test* (`hrm_loop` + a leaf entering state,
+`use_act=True`, backward on `h.sum()+ponder`): pre-fix `h_prev.grad`/`l_prev.grad`
+are **non-None** at `window=5`; post-fix both are **None** at `window=5` *and* at
+`window=100` (the footgun regime). *Fix*: force a cut at the thought's first step
+(`self.step == 0 or self.in_graph >= self.window`), mirroring the fixed-depth
+`max(0, total-window)` guarantee — the entering states are severed at entry, so
+neither the returned state (footgun) nor the mid-thought ponder term (live leak)
+can reach the previous thought's raw chain. Fixed-depth branch untouched.
+
+*Impact*: the leak was small — ponder weight 0.01, one thought back — so it was
+never going to blow up a run, but it was an unintended gradient path against the
+design. Offline A→E smoke (budgets 3/3/3/3/6): **`nll`/`ssl`/`lstd` bit-identical
+to the pre-fix baseline; only `ponder`/`gen`/`val_loss` move at the ~1e-4 level**
+— exactly the magnitude of the severed leak, confirming nothing else is touched.
+Stage-E trajectory (val_loss, latent_std) unchanged in shape. Byte-compiles;
+full A→E run completes and advances A→F.
+
+Files changed this session: `files/hrm_loop.py` (21.5 ACT entry cut), `README.md`
+(eighth-review block), `STRIX_HALO.md` (§6 memory + ACT-fix notes), `notes.md`
+(this §21). No training run started.

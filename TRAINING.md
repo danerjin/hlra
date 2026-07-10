@@ -29,6 +29,15 @@ Everything else is diagnostic. As long as `val_loss` is trending down (or flat)
 and `lstd` is above ~0.1, the run is healthy. The rest of this document is about
 getting to that point and keeping it there.
 
+`val_loss` measures the **autoencoder-like reconstruction loss**: the model
+encodes a chunk of text into a latent "thought," then decodes that same chunk
+back out, and `val_loss` is how well the decoded text matches the original. It's
+autoencoder-*like* (not a plain autoencoder) because the encode→decode path runs
+through the reasoning loop and a latent bottleneck. This loss is the run's
+**anti-collapse anchor** — a model can't reconstruct varied text from a
+collapsed (constant) latent, so keeping it healthy is what keeps the whole run
+healthy.
+
 A "chance" (untrained) `val_loss` is about **10.8**. A good run drives it well
 below that over time. It will never reach GPT-2 quality at this scale — that is
 expected and fine (see `README.md`); the goal is a **healthy, non-collapsed**
@@ -360,7 +369,7 @@ looking for **trends**, not exact values.
 | Field | What it is | Healthy behavior | Warning sign |
 |---|---|---|---|
 | `stage=` | current stage (A→E) | advances A→B→C→D→E over the run | stuck far past its budget (shouldn't happen with `--stage-steps`) |
-| `val_loss=` | **reconstruction quality** | **decreasing**, then flat; starts ~10.8 | **rising** over many logs (esp. after Stage D begins) |
+| `val_loss=` | **reconstruction quality** (autoencoder-like: encode→reason→decode the same chunk) | **decreasing**, then flat; starts ~10.8 | **rising** over many logs (esp. after Stage D begins) |
 | `lstd=` | **latent health** | stays **> 0.15** (0.2–0.7 normal) | **< 0.1** and staying there |
 | `nll` | training reconstruction loss | decreasing | rising steadily |
 | `ssl` | self-supervised loss (**starts at Stage D**) | small, wobbles ~0.02–0.5 | racing to ~0.0 **while `val_loss` rises** = collapse |
@@ -559,7 +568,9 @@ python generate.py --ckpt "$PROJECT/runs/scaled/model.pt" --score "a sentence to
 
 - **Stage (A–E):** the run trains in five phases; each turns on one more part of
   the model. You don't manage them — `--stage-steps` sets how long each lasts.
-- **`val_loss`:** how well the model rebuilds text it's shown. Lower is better.
+- **`val_loss` / reconstruction loss:** the **autoencoder-like** loss — how well
+  the model rebuilds a chunk of text after squeezing it through a latent
+  "thought" (encode → reason → decode the same chunk). Lower is better.
 - **`lstd` / latent_std:** a health check for "did the model's internal
   representation go flat/dead." Above ~0.1 = alive.
 - **Collapse:** the specific failure where the model cheats the self-supervised

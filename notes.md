@@ -1156,3 +1156,168 @@ that autocast path is now expected to *pass* rather than crash at step 4.
 
 Files changed this session: `files/ema_target.py` (18.1 autocast-safe target),
 `notes.md` (this section).
+
+---
+
+## 19. Seventh pre-scale review (2026-07-09) — independent pass, new model family
+
+Full review of spec + all 25 source files before the big run, run as three
+parallel review passes (core model math; training/data pipeline; spec
+conformance + inference) plus an independent line-by-line read, each finding
+re-verified against the code and empirically where possible. **No critical bug
+in the A→E scaled training path** — the §11–§18 passes genuinely cleaned it.
+What this pass found lives at the edges the earlier passes under-weighted: the
+prep CLI, the *inference* contract of the checkpoint being trained, and the
+observability of the collapse defense.
+
+### 19.1 C9 — `data_prep.py` could not select a HF dataset config (prep blocker, fixed)
+
+`iter_hf_single` has a `name` parameter, but `data_prep.py` never passed it and
+had no `--name` flag — so §15.6's own big-run plan ("point `--dataset` at
+`HuggingFaceFW/fineweb-edu` `sample-10BT`") was **unexecutable**: `name=None`
+resolves to fineweb-edu's *default* config (the full multi-TB corpus) and,
+because prep was hard-coded non-streaming, would begin downloading all of it;
+`--max-tokens` only caps iteration, not the download. §15.6 asserted this route
+"handles" it — it didn't. Fixed: `--name` and `--streaming` flags wired through
+(`data_prep.py`), source echoed at startup. Big-run prep is now:
+`python data_prep.py --dataset HuggingFaceFW/fineweb-edu --name sample-10BT
+--streaming --preset small --max-tokens 1200000000`.
+
+### 19.2 C10 — no end-of-chunk supervision: generation could never terminate a chunk (training-side, fixed)
+
+The grounded NLL masked to real tokens only, so no position past a chunk's true
+length ever received gradient — there was no EOS in the vocab and PAD-after-end
+was unsupervised. `talker_decode` additionally hard-banned PAD, so **every**
+generated chunk ran to the full `max_chunk_len` tokens; everything past the
+natural end was sampled from an *untrained* distribution, then the garbage tail
+was re-encoded (`gen != 0` all-True) to seed the next latent — contaminating
+every subsequent thought. Distinct from the documented "smoke-scale output is
+incoherent" caveat: this is structural, would persist at any scale, and an
+inference-side patch cannot retroactively add missing supervision to a finished
+checkpoint — which is why it had to land *before* the big run.
+
+Fix (both sides, verified):
+- `model.forward_grounded` now includes the **first pad position** of every
+  active shorter-than-max chunk in the NLL target mask — one supervised
+  end-of-chunk step, PAD (reserved id 0, never a real token) acting as EOS.
+  Full-length chunks get no end mark (a capped span legitimately continues).
+  Cost: ~1 extra supervised token per short chunk (~2–5% of the loss mass);
+  NLL values shift accordingly vs pre-§19 runs (same-config comparisons remain
+  valid, cross-§19 comparisons are off by the EOS term).
+- `generate.talker_decode` treats a sampled PAD as stop (banned only at
+  position 0, so a pre-§19 checkpoint with untrained PAD logits can't emit a
+  degenerate empty chunk); the re-encode of a stopped chunk automatically
+  masks the tail.
+- Verified: PAD row of `talker.lm_head` receives gradient (norm 0.54 on the
+  micro-test; exactly 0 before the fix); full/short/absent-chunk mask cases
+  checked independently; A→E offline run trains normally with the new term.
+
+### 19.3 M13 — `generate.py --score` was chunk-weighted, not token-weighted (fixed)
+
+`score()` averaged per-chunk *mean* NLLs with equal weight per chunk, while
+`baseline_gpt.eval_ppl` token-weights — so a 3-token chunk counted as much as a
+48-token one and short chunks (systematically higher per-token NLL) biased the
+latent model's number relative to the baseline's. Any non-saturated post-run
+perplexity comparison would have been invalid (§13.3's ppl≈1 regime masked it).
+Fixed: accumulate `mean_nll × n_real_tokens`, divide by total real tokens.
+Labeled "avg NLL/token" is now true. (Real-token positions only — the EOS term
+of 19.2 is deliberately excluded so the number stays comparable with the
+baseline, which has no EOS.)
+
+### 19.4 M14 — collapse monitor measured dropout noise, not collapse (fixed); variance floor attenuation (documented)
+
+`latent_collapse_metric` ran with the encoder in train mode (the trainer calls
+it right after `evaluate()` restores `.train()`), and dropout noise alone reads
+as per-dim std ≈0.05–0.08 — the same order as the 0.1 floor. Verified: a fully
+collapsed encoder (zeroed embeddings) read `latent_std = 0.078` in train mode
+vs the true `0.0` in eval mode. At the `small` preset a Stage-D collapse could
+have logged ≈0.1 and looked healthy for days. Fixed: the monitor now switches
+the chunk encoder to eval for the measurement and restores train mode
+(monitor-only; training dynamics untouched; healthy readings barely move —
+0.65 vs 0.62 on the micro-test).
+
+**Documented, deliberately NOT changed:** the VICReg variance floor itself is
+computed on train-mode (dropout-noised) latents, so at full collapse its hinge
+fires at ≈`0.1−0.08`, i.e. ~4–5× weaker than nominal. Changing where the floor
+is measured would alter training dynamics days before the run; the grounded
+anchor at `grounded_loss_min_frequency=1.0` remains the primary defense, the
+floor is the last-resort net. Operational rule: **at scale, treat
+`latent_std ≲ 0.1` as collapse even though it's nonzero.**
+
+### 19.5 M15 — checkpoints carried no training schedule; resume trusted the CLI (hardened)
+
+`Trainer.save` stored model/optimizer/EMA/curriculum/RNG but nothing from
+`train_cfg` — a resume with a drifted command line (different `--stage-steps`,
+`--lr`, `--lr-schedule`, or edited defaults) would reinterpret the restored
+`stage_idx`/`step_in_stage` against different budgets and silently diverge —
+the §15.3 drift class reintroduced through the config side door (wrong
+`--preset` fails loudly; wrong schedule flags failed silently). Now: the
+checkpoint embeds the resolved schedule (stage budgets, LR family, accum,
+batch, loss weights, AMP) and `load` prints a loud field-by-field warning on
+any mismatch. Verified: clean resume silent; drifted resume prints the diff.
+
+### 19.6 Run-ops hardening (small, each verified)
+
+- **Numbered checkpoint archives**: `--archive-every N` keeps
+  `checkpoint_{step}.pt` snapshots alongside the rolling `checkpoint.pt` —
+  rollback depth for slow pathologies noticed hours after onset (the rolling
+  file alone cannot rewind past onset). Off by default; recommended ~2000 for
+  the big run (each snapshot is model+optimizer+EMA sized).
+- **Stale/mixed cache guard**: `CachedChunkDataset` now errors if the manifest
+  `total` disagrees with the loaded shard rows (a crashed re-prep into an
+  existing dir leaves the old manifest next to a mix of old/new shards; it
+  previously trained on the blend silently). Always prep into a fresh dir.
+- **`--amp` off-CUDA**: `Trainer` now runs full precision with a printed note
+  instead of crashing at step 1 on MPS (torch 2.2 raises on mps autocast; on
+  newer torch the EMA-target C8 pattern would resurface). CUDA/ROCm unchanged.
+  `bench_throughput.py` similarly stops printing `amp=bf16` while silently
+  timing fp32 off-CUDA.
+- **`generate.py --ckpt`**: the big run's checkpoint (`runs/scaled/model.pt`)
+  is now reachable without copying files around.
+
+### 19.7 Spec/docs corrections (no behavior change)
+
+- Spec §5.1 "next-chunk NLL" — stale pre-§2.2 wording, now corrected in place
+  (the grounded loss is same-chunk reconstruction; the code was right).
+- `parcae.py` claimed "PreNorm is applied by the caller" — false
+  (`norm.PreNormWrapper` is instantiated nowhere); comment now states the real
+  invariant (hard-normalized state + normalized injection bound the residual's
+  inputs).
+- README "What's simplified" now records: Stage A skips the H-update entirely
+  (spec says one H-update); the scaled prep path chunks with regex boundaries,
+  not SaT (only `train.py LATENT_USE_HF=1` uses real SaT); and the Stage F
+  loop trains user turns through the grounded/self path, so the §4.2 two-lane
+  separation is wired but **not exercised** by Stage F as written — fix before
+  Stage F fine-tuning is treated as real (irrelevant to the A→E run).
+- `data_prep.py` docstring no longer claims SaT.
+
+### 19.8 Re-verification (what was actually run this pass)
+
+- Micro-tests: EOS mask cases (short/full/absent chunks, per-row), PAD-row
+  lm_head gradient present after fix, eval-mode collapse monitor reads 0.0000
+  at forced collapse / 0.65 healthy, train-mode restored after measurement.
+- Offline end-to-end at smoke preset: `data_prep --offline` → `train_scaled`
+  budgets 3/3/3/3/3 — every stage fires, SSL+gen at D, ponder at E,
+  `latent_std` healthy (0.62→0.40), rolling + numbered checkpoints written.
+- Interrupted-resume: stop at step 7 → resume → stage transitions land on the
+  same steps, final val 8.0965 vs 8.0987 uninterrupted (known data-order
+  noise); drifted-schedule resume prints the field-by-field warning.
+- `generate.py` against the pre-§19 `runs/model.pt`: `--score` (now
+  token-weighted) and generation both run end-to-end; `--ckpt` flag works.
+- All files byte-compile. **No large training run was started.**
+
+Standing recommendation (unchanged from §17.4/§18.3): run the STRIX_HALO.md
+go/no-go (`rocm_smoke.py` → `bench_throughput.py`) on the actual box first.
+Two planning reminders surfaced by this pass: `DEFAULT_STAGE_STEPS` (12k steps
+≈ 230M tokens at batch 16) is far short of the §14.1 ~1.2B-token budget — set
+`--stage-steps` explicitly; and `trainer.save` labels every checkpoint
+`tokenizer_name: gpt2` even for a stub-tokenizer cache, so don't point
+`generate.py` at a checkpoint trained from an `--offline` cache.
+
+Files changed this session: `files/data_prep.py` (19.1, 19.7), `files/model.py`
+(19.2 EOS supervision, 19.4 eval-mode monitor), `files/generate.py` (19.2
+PAD-stop, 19.3 token-weighting, 19.6 --ckpt), `files/trainer.py` (19.5 schedule
+guard, 19.6 archives + amp gate), `files/config.py` + `files/train_scaled.py`
+(19.6 archive knob), `files/data.py` (19.6 cache guard), `files/parcae.py` +
+`files/bench_throughput.py` + `README.md` + `latent-thought-architecture.md`
+(19.7), `notes.md` (this section).

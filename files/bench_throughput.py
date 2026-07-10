@@ -92,12 +92,15 @@ def main():
         flags = StageFlags(use_hrm_loop=True, detach_memory=False, inner_loop_grad_window=5,
                            memory_grad_window=5, use_act=True, use_input_lanes=False)
 
-    autocast = (torch.autocast(device_type="cuda", dtype=dtype) if (args.amp and device == "cuda")
+    amp_on = args.amp and device == "cuda"     # autocast is CUDA-only here
+    autocast = (torch.autocast(device_type="cuda", dtype=dtype) if amp_on
                 else torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=False))
     N, L = cfg.max_chunks_per_doc, cfg.max_chunk_len
 
+    if args.amp and not amp_on:
+        print(f"NOTE: --amp requested but device={device}; timing full precision.")
     print(f"device={device}  preset={args.preset}({n_params/1e6:.0f}M)  stage={args.stage}  "
-          f"amp={'off' if not args.amp else args.amp_dtype}  chunks/doc={N} chunk_len={L}")
+          f"amp={args.amp_dtype if amp_on else 'off'}  chunks/doc={N} chunk_len={L}")
     print(f"{'batch':>6} {'step s':>9} {'dense tok/s':>13} {'real tok/s':>12} {'peak GB':>9} "
           f"{'ETA @'+str(int(args.token_budget/1e9))+'B (days)':>18}")
 

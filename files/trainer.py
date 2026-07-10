@@ -48,12 +48,31 @@ class Trainer:
         self.metrics = []
         self._train_iter = None
 
-        # Mixed precision. Off on CPU; a GradScaler is only needed for CUDA fp16.
-        self.use_amp = bool(train_cfg.amp) and self.device.type != "cpu"
+        # Mixed precision. CUDA (incl. ROCm, which presents as cuda) only: CPU
+        # gains nothing, and MPS autocast either raises outright (torch<=2.2)
+        # or would re-expose the §18.1 eval-mode-encoder dtype mix. A GradScaler
+        # is only needed for CUDA fp16.
+        self.use_amp = bool(train_cfg.amp) and self.device.type == "cuda"
+        if bool(train_cfg.amp) and not self.use_amp:
+            print(f"[trainer] --amp requested but device is {self.device.type}; "
+                  f"running full precision.", flush=True)
         self.amp_dtype = torch.bfloat16 if train_cfg.amp_dtype == "bf16" else torch.float16
         self.scaler = (torch.cuda.amp.GradScaler()
                        if self.use_amp and self.device.type == "cuda" and self.amp_dtype == torch.float16
                        else None)
+
+    # Fields that define the training schedule/objective. Stored in every
+    # checkpoint and compared on resume: the restored curriculum position and
+    # LR are only meaningful against the SAME budgets/flags, so a resume with
+    # a drifted command line must not proceed silently.
+    _SCHEDULE_FIELDS = ("stage_steps", "per_stage_lr", "lr", "min_lr_ratio",
+                        "warmup_steps", "total_steps", "batch_size",
+                        "grad_accum_steps", "grounded_loss_min_frequency",
+                        "ssl_loss_weight", "ssl_var_weight", "gen_loss_weight",
+                        "amp", "amp_dtype")
+
+    def _schedule_snapshot(self) -> dict:
+        return {k: getattr(self.train_cfg, k, None) for k in self._SCHEDULE_FIELDS}
 
     # ------------------------------------------------------------------
     def _autocast(self):
@@ -206,6 +225,12 @@ class Trainer:
 
             if self.train_cfg.checkpoint_every and self.global_step % self.train_cfg.checkpoint_every == 0:
                 self.save("checkpoint.pt")
+                # Numbered snapshots (rollback depth): the rolling checkpoint
+                # alone can't rewind past a slow pathology (drift/late collapse)
+                # noticed hours after onset.
+                arch = getattr(self.train_cfg, "checkpoint_archive_every", 0)
+                if arch and self.global_step % arch == 0:
+                    self.save(f"checkpoint_{self.global_step:07d}.pt")
 
             if self.curriculum.stage == Stage.F:
                 break
@@ -232,6 +257,7 @@ class Trainer:
             "ema": self.ema.state_dict(),
             "scaler": self.scaler.state_dict() if self.scaler is not None else None,
             "curriculum": self.curriculum.state_dict(),
+            "train_schedule": self._schedule_snapshot(),
             "global_step": self.global_step,
             "metrics": self.metrics,
             "model_cfg": asdict(self.model_cfg),
@@ -258,6 +284,22 @@ class Trainer:
         if self.scaler is not None and ckpt.get("scaler") is not None:
             self.scaler.load_state_dict(ckpt["scaler"])
         self.curriculum.load_state_dict(ckpt["curriculum"])
+        # Guard against silent schedule drift on resume: the restored
+        # stage_idx/step_in_stage and LR curve are computed against the CLI's
+        # budgets/flags, so any difference from the checkpoint's schedule means
+        # the resumed run is NOT a continuation of the original one.
+        saved = ckpt.get("train_schedule")
+        if saved:
+            diffs = {k: (v, getattr(self.train_cfg, k, None)) for k, v in saved.items()
+                     if getattr(self.train_cfg, k, None) != (tuple(v) if isinstance(v, list) else v)}
+            if diffs:
+                print("[trainer] " + "!" * 60, flush=True)
+                print("[trainer] WARNING: resume schedule differs from checkpoint:", flush=True)
+                for k, (old, new) in diffs.items():
+                    print(f"[trainer]   {k}: checkpoint={old!r}  now={new!r}", flush=True)
+                print("[trainer] LR curve / stage boundaries will NOT match the "
+                      "original run. Continue only if this is intentional.", flush=True)
+                print("[trainer] " + "!" * 60, flush=True)
         self.global_step = ckpt["global_step"]
         self.metrics = ckpt.get("metrics", [])
         rng = ckpt.get("rng")

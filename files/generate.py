@@ -18,6 +18,7 @@ NOT be coherent. This script demonstrates the *inference path*, not quality.
 
 Run:  python generate.py "Your prompt here"
       python generate.py --score "text to score perplexity on"
+      python generate.py --ckpt runs/scaled/model.pt "prompt"   # scaled-run checkpoint
 """
 from __future__ import annotations
 
@@ -41,8 +42,8 @@ from losses import grounded_nll_loss
 CKPT = os.path.join(PROJECT, "runs", "model.pt")
 
 
-def load():
-    ckpt = torch.load(CKPT, map_location="cpu", weights_only=False)  # carries non-tensor RNG/cfg state
+def load(ckpt_path: str = CKPT):
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)  # carries non-tensor RNG/cfg state
     cfg = ModelConfig(**ckpt["model_cfg"])
     tok_src = ckpt.get("tokenizer_path") if os.path.isdir(ckpt.get("tokenizer_path", "")) else TOKENIZER_DIR
     chunker, _ = build_regex_gpt2_chunker(cfg, tok_src)
@@ -88,19 +89,29 @@ def read_prompt(model, chunker, cfg, prompt):
 
 @torch.no_grad()
 def talker_decode(model, thought, memory, max_len, temperature=0.9, greedy=False):
-    """Autoregressively decode one chunk's tokens from a thought."""
+    """
+    Autoregressively decode one chunk's tokens from a thought. PAD (id 0) is
+    the trained end-of-chunk signal (model.forward_grounded supervises the
+    first pad position of every short chunk), so emitting PAD stops the chunk.
+    It is only banned at position 0 to rule out degenerate empty chunks --
+    e.g. under a checkpoint that predates the end-of-chunk supervision, where
+    the PAD logit is untrained noise.
+    """
     ids = []
     for _ in range(max_len):
         inp = torch.zeros(1, max_len, dtype=torch.long)
         for j, g in enumerate(ids):
             inp[0, j] = g
         logits = model.talker(inp, thought, memory)[0, len(ids)]   # (vocab,)
-        logits[PAD] = -1e9                                          # never emit PAD
+        if not ids:
+            logits[PAD] = -1e9
         if greedy:
             nxt = int(logits.argmax())
         else:
             probs = torch.softmax(logits / temperature, dim=-1)
             nxt = int(torch.multinomial(probs, 1))
+        if nxt == PAD:
+            break                                                   # trained end-of-chunk
         ids.append(nxt)
         if len(ids) >= max_len:
             break
@@ -149,22 +160,35 @@ def score(model, chunker, cfg, text):
         l_state = h_state
         memory.write(h_state.detach(), SELF)
         logits = model.talker(chunk_ids, h_state, memory)
-        total_nll += grounded_nll_loss(logits, chunk_ids, chunk_ids != 0).item()
-        n += 1
+        # Token-weighted accumulation: grounded_nll_loss returns the per-token
+        # MEAN within this chunk, so weight it by the chunk's real-token count.
+        # (A plain mean-of-chunk-means over-weights short chunks and is not
+        # comparable with baseline_gpt.eval_ppl's token-weighted number.)
+        n_tok = int((chunk_ids != 0).sum())
+        total_nll += grounded_nll_loss(logits, chunk_ids, chunk_ids != 0).item() * n_tok
+        n += n_tok
     avg = total_nll / max(n, 1)
     return avg, math.exp(min(avg, 20))
 
 
 def main():
     args = sys.argv[1:]
-    if not os.path.exists(CKPT):
-        raise SystemExit(f"no checkpoint at {CKPT} -- run train_real.py first")
+    ckpt_path = CKPT
+    if "--ckpt" in args:                       # e.g. --ckpt runs/scaled/model.pt
+        i = args.index("--ckpt")
+        ckpt_path = args[i + 1]
+        if not os.path.isabs(ckpt_path):
+            ckpt_path = os.path.join(PROJECT, ckpt_path)
+        args = args[:i] + args[i + 2:]
+    if not os.path.exists(ckpt_path):
+        raise SystemExit(f"no checkpoint at {ckpt_path} -- run train_real.py first "
+                         f"(or pass --ckpt runs/scaled/model.pt)")
     do_score = args and args[0] == "--score"
     if do_score:
         args = args[1:]
     prompt = " ".join(args) if args else "The history of science shows that"
 
-    model, chunker, cfg, ckpt = load()
+    model, chunker, cfg, ckpt = load(ckpt_path)
     print(f"[generate] checkpoint stage={ckpt.get('stage_reached')} "
           f"vocab={ckpt.get('vocab_size')}  ({ckpt.get('note','')})\n")
 

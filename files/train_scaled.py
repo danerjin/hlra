@@ -57,6 +57,9 @@ def main():
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--checkpoint-every", type=int, default=500)
+    ap.add_argument("--archive-every", type=int, default=0,
+                    help="also keep a numbered checkpoint_{step}.pt every N steps "
+                         "(rollback depth for long runs; 0 = off)")
     ap.add_argument("--stage-steps", default=None, help="comma list A,B,C,D,E,F")
     ap.add_argument("--lr-schedule", default="per-stage", choices=["per-stage", "global"],
                     help="per-stage: warmup+cosine within each stage's budget (fixes D/E LR "
@@ -97,6 +100,7 @@ def main():
         grad_accum_steps=args.grad_accum, amp=args.amp, amp_dtype=args.amp_dtype,
         num_workers=args.num_workers, log_every=args.log_every,
         checkpoint_every=args.checkpoint_every,
+        checkpoint_archive_every=args.archive_every,
         warmup_steps=max(100, total_steps // 50), total_steps=total_steps,
         grounded_loss_min_frequency=1.0,   # reconstruction stays the always-on anchor
         stage_steps=stage_steps,

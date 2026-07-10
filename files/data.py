@@ -343,6 +343,16 @@ class CachedChunkDataset(Dataset):
         self.chunk_mask = torch.cat(cms, 0)
         self.raw_ids = torch.cat(ris, 0)
         self.raw_mask = torch.cat(rms, 0)
+        # Guard against a stale/mixed cache (e.g. a re-prep into an existing
+        # dir that crashed mid-way: the old manifest survives next to a mix of
+        # old and new shards, and training would silently use the blend).
+        expected = self.manifest.get("total")
+        if expected is not None and self.chunk_tensor.shape[0] != expected:
+            raise ValueError(
+                f"cache inconsistent: manifest says {expected} examples but shards "
+                f"hold {self.chunk_tensor.shape[0]}. The cache dir likely mixes "
+                f"shards from different prep runs -- re-run data_prep.py into a "
+                f"FRESH directory.")
         self.vocab_size = cfg.get("vocab_size")
         self.config = cfg
 

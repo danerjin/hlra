@@ -15,6 +15,18 @@ Run (offline synthetic, no downloads):
 
 Run (real text, needs `datasets` + local gpt2 tokenizer in ../gpt2_tok):
     python data_prep.py --dataset NeelNanda/pile-10k --preset small --max-tokens 100000000
+
+Datasets with multiple configs need --name (otherwise `datasets` silently picks
+the DEFAULT config -- for fineweb-edu that is the full multi-TB corpus, not the
+sample). For big corpora prefer --streaming so only what --max-tokens keeps is
+ever downloaded:
+    python data_prep.py --dataset HuggingFaceFW/fineweb-edu --name sample-10BT \
+        --streaming --preset small --max-tokens 1200000000
+
+Note: the real-text path here uses the gpt2 tokenizer + regex sentence
+boundaries (build_regex_gpt2_chunker), NOT the SaT segmentation model -- same
+capping logic, stub boundary detector. Wire train.build_sat_chunker in here if
+a prep-time SaT dependency is ever wanted.
 """
 from __future__ import annotations
 
@@ -98,6 +110,12 @@ def main():
     ap.add_argument("--preset", default="small", choices=list(MODEL_PRESETS))
     ap.add_argument("--offline", action="store_true", help="synthetic text + stub chunker (no downloads)")
     ap.add_argument("--dataset", default="NeelNanda/pile-10k")
+    ap.add_argument("--name", default=None,
+                    help="HF dataset config name (e.g. sample-10BT for fineweb-edu); "
+                         "REQUIRED for multi-config datasets or you get the default config")
+    ap.add_argument("--streaming", action="store_true",
+                    help="stream rows instead of downloading the whole dataset first "
+                         "(recommended with --max-tokens on large corpora)")
     ap.add_argument("--text-field", default="text")
     ap.add_argument("--out", default=None, help="cache dir (default DataConfig.cache_dir)")
     ap.add_argument("--docs", type=int, default=None, help="cap #documents")
@@ -120,8 +138,13 @@ def main():
         model_cfg = model_config(args.preset)  # vocab fixed after chunker build
         chunker, vocab_size = build_regex_gpt2_chunker(model_cfg, TOKENIZER_DIR)
         model_cfg.vocab_size = vocab_size
-        text_iter = iter_hf_single(args.dataset, args.text_field, streaming=False, max_docs=args.docs)
+        text_iter = iter_hf_single(args.dataset, args.text_field, name=args.name,
+                                   streaming=args.streaming, max_docs=args.docs)
 
+    src = "offline-synthetic" if args.offline else \
+        f"{args.dataset}" + (f":{args.name}" if args.name else "") + \
+        (" (streaming)" if args.streaming else " (full download)")
+    print(f"[data_prep] source={src}")
     print(f"[data_prep] preset={args.preset} vocab={vocab_size} out={out_dir} "
           f"chunk_dims=({model_cfg.max_chunk_len},{model_cfg.max_chunks_per_doc},{model_cfg.recent_token_window})")
     prepare(text_iter, chunker, model_cfg, out_dir, data_cfg.shard_size, min_chunks,

@@ -69,9 +69,12 @@ class ParcaeStateTransition(nn.Module):
         self.B = nn.Linear(d_model, d_model, bias=False)
 
         # Nonlinear residual R(h, e): a small feed-forward "transformer
-        # sublayer" operating on the concatenation of state and input. The
-        # PreNorm discipline (MagicNorm) is applied by the caller, not here,
-        # so this module stays a pure residual-content function.
+        # sublayer" operating on the concatenation of state and input. Its
+        # inputs are bounded not by an explicit Pre-LN (norm.PreNormWrapper is
+        # not used here) but by the loop's invariants: h enters hard-normalized
+        # to ||h||=sqrt(d) from the previous step's exit (hrm_loop), and the
+        # injected e is LayerNormed/normalized upstream. MagicNorm's hard-norm
+        # half is what actually carries the stability argument in this loop.
         self.residual = nn.Sequential(
             nn.Linear(d_model * 2, d_ff),
             nn.GELU(),

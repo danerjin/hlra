@@ -125,7 +125,11 @@ for a real run. The scaled path fixes that:
 ```bash
 # 1. Pre-chunk the corpus ONCE into a shard cache (needs `datasets` + local gpt2
 #    tokenizer in ../gpt2_tok). Chunk dims come from the size preset.
-python data_prep.py --dataset NeelNanda/pile-10k --preset small --max-tokens 100000000
+#    Multi-config datasets NEED --name (else `datasets` picks the default config
+#    -- for fineweb-edu that's the full multi-TB corpus); use --streaming so a
+#    --max-tokens-capped prep doesn't download a whole snapshot first.
+python data_prep.py --dataset HuggingFaceFW/fineweb-edu --name sample-10BT \
+    --streaming --preset small --max-tokens 1200000000
 
 # 2. Train from the cache (no tokenizer/SaT at train time; fast, worker-friendly).
 python train_scaled.py --preset small --cache chunk_cache --device cuda --amp \
@@ -143,7 +147,10 @@ python train_scaled.py --preset small --cache chunk_cache --resume runs/scaled/c
   accumulation (`--grad-accum`), a warmup→cosine LR schedule, periodic
   checkpoint/resume, and **fixed per-stage step budgets** (`--stage-steps
   A,B,C,D,E,F`) instead of the smoke's plateau hack. It logs the `latent_std`
-  collapse monitor every eval so a regression is caught early.
+  collapse monitor every eval (dropout-free eval-mode reading since review 7,
+  so true collapse reads ~0) so a regression is caught early. Checkpoints
+  carry the resolved training schedule and a resume with a drifted command
+  line warns loudly; `--archive-every N` keeps numbered rollback snapshots.
 - The anti-collapse recipe (reconstruction anchor always-on, separate SSL head,
   variance floor, momentum 0.996) is carried over unchanged.
 
@@ -156,6 +163,26 @@ on a tiny synthetic cache; **no large training run has been done**.
 > metric, doc-length-dependent ponder scaling, warmup ramps that ignored the
 > fixed stage budgets, an unmasked input-lane read, and missing RNG state in
 > checkpoints.
+
+> **Seventh pre-scale review (notes §19):** independent pass (different model
+> family than the prior six) before the big run. No critical bug in the A→E
+> scaled path. Fixed: `data_prep.py` couldn't select a HF dataset *config*
+> (`--name`/`--streaming` added — the documented fineweb-edu `sample-10BT` plan
+> was otherwise unexecutable and would begin a full-corpus download); the
+> Talker got **end-of-chunk supervision** (first pad position of short chunks
+> trained as EOS — without it generation could never terminate a chunk and
+> every generated chunk carried an untrained 48/64-token tail that was
+> re-encoded into the next latent); `generate.py --score` was chunk-weighted
+> (short chunks over-weighted; incomparable with the token-weighted baseline);
+> the `latent_std` monitor read dropout noise (~0.05–0.08) instead of ~0 at
+> true collapse (now eval-mode); checkpoints now embed the training schedule
+> and warn on resume drift; numbered checkpoint archives; a stale-mixed-cache
+> guard in `CachedChunkDataset`. Documented, not changed: Stage F trains user
+> turns through the grounded/self path (two-lane separation not exercised by
+> the current Stage F loop); the variance floor still sees train-mode latents
+> (at full collapse its effective hinge is ~4–5× weaker than nominal — the
+> grounded anchor at frequency 1.0 remains the real defense; treat
+> `latent_std ≲ 0.1` as collapse at scale).
 
 > **Third pre-scale review (notes §15):** found and fixed a critical
 > inference-path bug — generation fed the SSL-projection-space predictor's
@@ -215,3 +242,18 @@ where the doc leaves things open, and keeps the two "honest limits" from
 - **ACT halting is per-batch**, not per-thought (a single halting decision per
   step, soft/expected-value ponder cost). Per-thought adaptive depth (§1.1)
   would need a real ACT accumulator.
+- **Stage A skips the H-update entirely** (the chunk encoder's latent feeds the
+  Talker directly), where spec §5.1 describes "one H-update, no L-iteration".
+  Stage-A memory slots therefore hold encoder latents, a distribution the
+  loop's readers re-learn from Stage B (whose warmup exists for exactly that).
+- **The scaled prep path (`data_prep.py`) uses regex sentence boundaries + the
+  gpt2 tokenizer, not the SaT model** — same SaT-Capped capping logic, stub
+  boundary detector. Only `train.py LATENT_USE_HF=1` wires real SaT. Training
+  and inference are consistent (generate.py uses the same regex chunker), but
+  a big run from the cache is trained on regex boundaries.
+- **The Stage F loop trains every dialogue turn — user turns included —
+  through the grounded (self-lane) path**: user text is injected into the HRM
+  recurrent state and reconstructed by the Talker, so the §4.2 two-lane
+  separation is wired but not actually exercised by Stage F training as
+  written. Fine for the A→E run (Stage F isn't part of it); must be fixed
+  before Stage F fine-tuning is treated as real.

@@ -237,11 +237,25 @@ class LatentThoughtModel(nn.Module):
         Mean per-dimension standard deviation of the shared chunk latents over a
         batch. ~0 means the encoder has collapsed to a (near-)constant vector;
         healthy representations sit well above 0. A cheap collapse monitor.
+
+        Measured in eval mode: with dropout active, dropout noise alone reads
+        as per-dim std ~0.05-0.08 (same order as the 0.1 collapse floor), so a
+        fully collapsed encoder would log a healthy-looking nonzero value --
+        exactly the silent failure this monitor exists to catch. Eval mode
+        makes true collapse read as ~0. (Monitor only; training-time behavior
+        is untouched.)
         """
         batch, n_chunks, chunk_len = chunk_tensor.shape
         flat_ids = chunk_tensor.reshape(batch * n_chunks, chunk_len)
         flat_valid = chunk_mask.reshape(batch * n_chunks)
-        z = self.chunk_encoder(flat_ids, flat_ids != 0)[flat_valid]
+        was_training = self.chunk_encoder.training
+        if was_training:
+            self.chunk_encoder.eval()
+        try:
+            z = self.chunk_encoder(flat_ids, flat_ids != 0)[flat_valid]
+        finally:
+            if was_training:
+                self.chunk_encoder.train()
         if z.shape[0] < 2:
             return 0.0
         return z.std(dim=0).mean().item()
@@ -328,8 +342,23 @@ class LatentThoughtModel(nn.Module):
             memory.apply_grad_truncation(stage.memory_grad_window)
 
             # Grounded NLL: teacher-force the Talker on this chunk's tokens.
+            # The target mask also covers the FIRST pad position of each active
+            # shorter-than-max chunk: one supervised end-of-chunk step, with PAD
+            # (reserved id 0, never a real token) acting as EOS. Without it, no
+            # position past a chunk's true length ever receives gradient, so
+            # inference-time decoding has no trained way to terminate a chunk --
+            # it would emit max_chunk_len tokens with an untrained tail every
+            # time, and the garbage tail would be re-encoded into the next
+            # latent. Full-length chunks get no end mark: a capped span
+            # legitimately "continues".
             logits = self.talker(chunk_ids, h_state, memory)
-            chunk_nll = grounded_nll_loss(logits, chunk_ids, chunk_token_mask)
+            target_mask = chunk_token_mask
+            lengths = chunk_token_mask.sum(-1)                       # (batch,)
+            has_end = active & (lengths > 0) & (lengths < chunk_len)
+            if has_end.any():
+                target_mask = chunk_token_mask.clone()
+                target_mask[has_end, lengths[has_end]] = True        # target there is id 0 = PAD/EOS
+            chunk_nll = grounded_nll_loss(logits, chunk_ids, target_mask)
             total_nll = total_nll + chunk_nll
             n_valid_chunks += 1
 

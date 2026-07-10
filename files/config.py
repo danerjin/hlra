@@ -125,6 +125,11 @@ class TrainConfig:
     # cosine across A..E (which starves the late stages -> D/E "regression").
     per_stage_lr: bool = False
     checkpoint_every: int = 0                 # steps between checkpoints; 0 = only at end
+    # Additionally keep a NUMBERED checkpoint_{step}.pt every this many steps
+    # (0 = off). The rolling checkpoint.pt is crash-safe but gives no rollback
+    # depth if a slow pathology is noticed late; ~2-4 snapshots/stage is cheap
+    # insurance on a multi-day run (each snapshot is model+optimizer+EMA sized).
+    checkpoint_archive_every: int = 0
     # Fixed per-stage step budgets (A..F) for the curriculum. If set, stage
     # transitions happen on these budgets instead of the noisy plateau gate --
     # far more predictable for long runs. None -> keep plateau gating.

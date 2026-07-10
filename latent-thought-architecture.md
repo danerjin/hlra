@@ -439,7 +439,11 @@ stage's stability as the precondition for turning on the next mechanism.
 Strip out the loop, the memory, and both fancy losses. Use a fixed heuristic chunker
 (off-the-shelf sentence/clause segmenter, not learned yet), a *shallow, fixed-depth* Reasoner
 (one H-update, no L-iteration — essentially JEPA-Reasoner's own first, plain pretraining phase),
-and train Talker + Reasoner jointly on ordinary next-chunk NLL.
+and train Talker + Reasoner jointly on the grounded loss. (Correction, review 7: this sentence
+originally said "next-chunk NLL" — stale wording predating §2.2's correction. The grounded loss
+is same-chunk reconstruction through the latent bottleneck, per §2.2; the implementation follows
+§2.2. Note also the implementation simplifies further: Stage A injects the chunk encoder's latent
+directly, with no H-update at all — see README "What's simplified".)
 
 **Goal**: get "latent → decodable text" working at all, cheaply, before anything recurrent or
 adaptive is layered on. This mirrors why JEPA-Reasoner itself does ordinary pretraining before its

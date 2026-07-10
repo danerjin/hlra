@@ -22,12 +22,19 @@ this table:
 
 | Number in the log | Name | ✅ Healthy | 🚨 Abort / investigate |
 |---|---|---|---|
-| `val_loss=` | reconstruction quality (lower = better) | goes **down**, then flattens | **rises and keeps rising**, especially right after Stage D starts |
-| `lstd=` | latent health (collapse monitor) | stays **above 0.15** (normal range 0.2–0.7) | **drops below 0.1** and stays there |
+| `val_loss=` | reconstruction quality (lower = better) — **the primary collapse signal** | goes **down**, then flattens; keeps falling *through* the Stage-D boundary | **jumps up right when Stage D starts** and keeps rising |
+| `lstd=` | latent health (secondary) | holds its **own Stages-A–C band** | craters *well below* that band and stays there |
 
 Everything else is diagnostic. As long as `val_loss` is trending down (or flat)
-and `lstd` is above ~0.1, the run is healthy. The rest of this document is about
-getting to that point and keeping it there.
+— especially with no jump when Stage D turns SSL on — the run is healthy.
+
+> ⚠️ **Do NOT abort on an absolute `lstd` number.** The old "healthy > 0.15,
+> collapse < 0.1" rule was calibrated on the tiny 192-d smoke model; at
+> `small` (512-d) the natural `lstd` is **lower** — a validated-healthy run sat
+> around **0.07–0.18** with `val_loss` falling the whole time (notes §26.1). So:
+> note the `lstd` band during Stages A–C, and only worry if it *craters below
+> that band*. The reliable collapse tell is **`val_loss` rising at Stage D**, not
+> `lstd`'s absolute value.
 
 `val_loss` measures the **autoencoder-like reconstruction loss**: the model
 encodes a chunk of text into a latent "thought," then decodes that same chunk
@@ -145,7 +152,7 @@ python rocm_smoke.py --preset small
 [2] bf16 matmul finite: True
 [3] built small model: ... M params on cuda
     grounded loss finite: True (nll=...)   grads finite: True
-[4] SSL+gen loss finite: True (...)
+[4] on-loop SSL loss finite: True (...)
 [5] ACT (stage E) loss finite: True (...)
 ================================================================
 PASS: training path runs and stays finite on this GPU under bf16 autocast...
@@ -370,10 +377,9 @@ looking for **trends**, not exact values.
 |---|---|---|---|
 | `stage=` | current stage (A→E) | advances A→B→C→D→E over the run | stuck far past its budget (shouldn't happen with `--stage-steps`) |
 | `val_loss=` | **reconstruction quality** (autoencoder-like: encode→reason→decode the same chunk) | **decreasing**, then flat; starts ~10.8 | **rising** over many logs (esp. after Stage D begins) |
-| `lstd=` | **latent health** | stays **> 0.15** (0.2–0.7 normal) | **< 0.1** and staying there |
+| `lstd=` | **latent health** (width-dependent!) | holds its own A–C band (≈0.07–0.18 seen at `small`) | **craters below that band** and stays there |
 | `nll` | training reconstruction loss | decreasing | rising steadily |
-| `ssl` | self-supervised loss (**starts at Stage D**) | small, wobbles ~0.02–0.5 | racing to ~0.0 **while `val_loss` rises** = collapse |
-| `gen` | generation-head loss (**starts at Stage D**) | decreasing | doesn't matter for run health; ignore unless `nan` |
+| `ssl` | on-loop self-supervised loss (**starts at Stage D**; the HRM loop learning to predict) | decreasing, wobbles | racing to ~0.0 **while `val_loss` rises** = collapse |
 | `ponder` | compute cost (**starts at Stage E**) | small (~0.01–0.05) | `nan` |
 | `lr` | learning rate | rises during warmup, then eases down each stage | — |
 
@@ -383,13 +389,15 @@ The known failure mode of this architecture is **latent collapse** at Stage D,
 when the self-supervised loss turns on. It looks like this:
 
 - `ssl` drops quickly toward **0.0**, **and at the same time**
-- `val_loss` **rises**, **and**
-- `lstd` **falls below ~0.1**.
+- `val_loss` **rises** (the decisive signal — it should *keep falling* through
+  the Stage-D boundary), **and**
+- `lstd` **craters below its Stages-A–C band**.
 
 **All three together = collapse. Stop the run** (see Step 9 to kill it) and see
-Troubleshooting → "Latent collapse". If `ssl` is small but `val_loss` is flat or
-falling and `lstd` is healthy, that is **normal** — `ssl` is a secondary signal
-and a low value alone is fine.
+Troubleshooting → "Latent collapse". A low `ssl` on its own is **normal** — the
+on-loop SSL falling just means the loop is learning to predict; only worry if
+`val_loss` rises with it. (In the §26.1 validation `ssl` fell 2.8→0.4 while
+`val_loss` kept dropping — the healthy case.)
 
 ### The single most important comparison
 
@@ -402,9 +410,11 @@ grep 'stage=D' "$PROJECT/files/train.log" | tail -1
 grep 'stage=E' "$PROJECT/files/train.log" | tail -1
 ```
 
-Across those three lines: `val_loss` should be **flat or lower**, and `lstd`
-should **stay above ~0.1**. If `val_loss` jumps up a lot and `lstd` dives at
-Stage D, that's the collapse pattern.
+Across those three lines: `val_loss` should be **flat or lower** (no jump at the
+C→D transition), and `lstd` should **stay in its A–C band** (not crater). If
+`val_loss` jumps up a lot at Stage D and `lstd` dives well below where it sat in
+A–C, that's the collapse pattern. `val_loss` is the signal that matters; don't
+judge `lstd` against an absolute number (it's lower at 512-d — see §0).
 
 ---
 
@@ -504,7 +514,7 @@ documented; it is not a sign the run failed.
 | `cache/model mismatch on max_chunk_len ...` at training start | Cache was prepped with a different `--preset` than training | Re-prep with the **same** preset, or train with the preset the cache was built for. |
 | `cache inconsistent: manifest says X but shards hold Y` | You re-prepped into an existing cache dir | Delete the cache folder and prep again into a **fresh, empty** directory. |
 | Out-of-memory (OOM) at training start | `--batch-size` too big | Lower `--batch-size`. To keep a large *effective* batch, add e.g. `--grad-accum 4` (does 4 small batches per step). |
-| `val_loss` rising + `ssl` → 0 + `lstd` < 0.1 (all three) | **Latent collapse** | Stop the run. This path already keeps the anti-collapse anchor on every step (`train_scaled.py` hardcodes `grounded_loss_min_frequency=1.0` — don't lower it). If collapse still happens at scale, lower the SSL weight in `config.py` (`ssl_loss_weight` from `0.1` toward `0.05`), then relaunch from the last healthy `--archive-every` snapshot (no re-prep needed). Re-tuning anti-collapse settings at scale is expected (see `notes.md` §9). |
+| `val_loss` **rising at the Stage-D boundary** + `ssl` → 0 + `lstd` craters below its A–C band | **Latent collapse** | Stop the run. This path keeps the anti-collapse anchor on every step (`train_scaled.py` hardcodes `grounded_loss_min_frequency=1.0` — don't lower it) and the on-loop SSL tested collapse-robust (notes §26.1). If collapse still happens at scale, lower the SSL weight (`--ssl-weight`, from the `1.0` default toward `0.5`), then relaunch from the last healthy `--archive-every` snapshot (no re-prep needed). Re-tuning anti-collapse settings at scale is expected (`notes.md` §26). |
 | Loud `WARNING: resume schedule differs from checkpoint` | `--resume` flags don't match the original launch | Make the command identical to the first launch (same `--stage-steps`, `--batch-size`, `--lr`). Only ignore if you *intended* to change the schedule. |
 | Everything is `nan` from the very first step | mixed-precision or data issue | Re-run `rocm_smoke.py`. If that passes but training NaNs, try without `--amp` once to isolate; report which stage it first appears in. |
 | Training extremely slow / GPU underused | batch too small (this model is launch-overhead-bound) | Increase `--batch-size` (the 128 GB unified memory is meant for this); re-check `bench_throughput.py`. |
@@ -572,7 +582,8 @@ python generate.py --ckpt "$PROJECT/runs/scaled/model.pt" --score "a sentence to
   the model rebuilds a chunk of text after squeezing it through a latent
   "thought" (encode → reason → decode the same chunk). Lower is better.
 - **`lstd` / latent_std:** a health check for "did the model's internal
-  representation go flat/dead." Above ~0.1 = alive.
+  representation go flat/dead." Width-dependent — judge it against its own
+  Stages-A–C band (≈0.07–0.18 at `small`), not an absolute number.
 - **Collapse:** the specific failure where the model cheats the self-supervised
   loss by making every internal vector identical. Caught by `lstd` dropping and
   `val_loss` rising together.
@@ -588,5 +599,6 @@ python generate.py --ckpt "$PROJECT/runs/scaled/model.pt" --score "a sentence to
 ---
 
 **If in doubt:** a run is healthy as long as **`val_loss` trends down or flat**
-and **`lstd` stays above ~0.1**. Watch those two, keep checkpoints
+with **no jump when Stage D turns SSL on**, and **`lstd` holds its A–C band**
+(not an absolute 0.1). Watch `val_loss` above all, keep checkpoints
 (`--checkpoint-every` / `--archive-every`), and you're in good shape.

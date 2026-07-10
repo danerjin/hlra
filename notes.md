@@ -1968,3 +1968,44 @@ Re-run the collapse check at `small` on a real cache and re-tune `ssl_loss_weigh
 with scale). The §2.4 collapse history means "no collapse at smoke" is necessary,
 not sufficient. README/spec (§2.1, §2.4, §5.4, file map) still describe the old
 linear SSL + separate-head story and need a fidelity pass to match this design.
+
+### 26.1 Small-scale collapse validation (512-d, real text) — passes
+
+Ran the §26 collapse check at the `small` preset (512-d, 152M) on a real cache
+(658 pile-10k docs, ~268k tokens, dims 64/32/256), MPS, A→E 25/25/25/30/35, the
+new default (on-loop SSL, `ssl_loss_weight=1.0`). This is the width where collapse
+risk is highest, so it is the load-bearing check.
+
+**Result: no collapse.** The reliable signal — a `val_loss` regression when SSL
+turns on at Stage D (the §2.4 signature) — is absent. `val_loss` falls cleanly
+through the D boundary and keeps falling in E:
+
+    end C 10.57 -> D 10.19,9.94,9.81,9.70,9.62,9.57 -> E 9.29 ... 8.82   (monotone down)
+    ssl (Stage D+) 2.85 -> 0.81 -> ... -> 0.39   (loop learning to predict)
+    lstd 0.07-0.18 throughout A-E, same band before and after SSL (no crater)
+
+So on-loop SSL at co-equal weight holds at 512-d, consistent with the §25.1 smoke
+A/B and now confirmed at the wider width.
+
+**Two operator lessons that MUST propagate to the big run:**
+1. **The `lstd < 0.1 = collapse` rule is smoke-calibrated (192-d) and WRONG at
+   512-d.** Natural per-dim std is lower at larger width; here it sat 0.07-0.18
+   with a perfectly healthy (falling) `val_loss`, dipping below 0.1 even in
+   Stages A-C before SSL existed. Do NOT abort on absolute `lstd < 0.1` at
+   `small`+. Instead: (a) note the `lstd` band during Stages A-C for this run,
+   and treat a *sustained crater well below that band* as the collapse flag; and
+   (b) **use `val_loss` regression at the Stage-D boundary as the PRIMARY collapse
+   signal** — it is the one that actually tracked the §2.4 pathology.
+2. **Budget was tiny** (268k tokens, 140 steps); the model was still near chance
+   through A-C. The D-boundary behavior is nonetheless the collapse-relevant
+   signal and it is clean. The full ~1.2B-token run should re-confirm, watching
+   `val_loss` at D, and `ssl_loss_weight` (1.0) may still want tuning once the
+   run is long enough for reconstruction to converge before D.
+
+GPU-box validation recipe (before the multi-day run):
+
+    # small real cache (needs the pile-10k or fineweb-edu cache; see TRAINING.md §5)
+    python train_scaled.py --preset small --cache <real_cache> --device cuda --amp \
+      --batch-size 32 --stage-steps <~1-epoch> --log-every 50 --out runs/validate_ssl
+    # GO iff: val_loss does NOT jump up at the A->...->D transition (grep 'stage=C'|tail -1
+    # vs 'stage=D'|tail -1), ssl decreases, and lstd holds its A-C band (not absolute 0.1).

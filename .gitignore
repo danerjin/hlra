@@ -1,0 +1,5 @@
+.hf_cache
+.venv
+wiki_cache/
+.DS_Store
+*.pdf

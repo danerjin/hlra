@@ -1074,3 +1074,85 @@ Files changed this session: `files/train.py` (17.1 device fix, 17.3 wiring),
 `files/trainer.py` (17.2 load flag, 17.3 wiring), `files/generate.py` (17.2
 load flag), `files/ema_target.py` (17.3 eval target), `files/model.py` (17.3
 `encode_chunks` + `chunk_vecs=` reuse), `notes.md` (this section).
+
+---
+
+## 18. Sixth pre-scale review (2026-07-09) — one critical AMP-path bug
+
+Another independent read of spec + all code before the run. The structural
+fixes from §11/§15/§16/§17 were re-confirmed present and working (offline A→E
+via the exact big-run path fires every stage; `ssl`/`gen`/`ponder` move
+correctly; `latent_std` ~0.47–0.64, no collapse; checkpoint → `--resume`
+schedule-exact, val 8.5737 vs 8.5735 uninterrupted). One **critical bug on the
+`--amp` path** found and fixed — the single largest untested surface, and the
+exact one the big run flips on.
+
+### 18.1 C8 — EMA target encoder crashes under bf16 autocast (critical, AMP path)
+
+`EMATargetEncoder.target_encoder` is kept in `.eval()` (§17.3, for a
+deterministic momentum target) and `encode()` is `@torch.no_grad()`. Under AMP
+autocast, an **eval-mode `nn.TransformerEncoder` with grad disabled takes the
+fused BetterTransformer fast path** (`torch._transformer_encoder_layer_fwd`),
+which feeds autocast-cast **bf16 activations into the encoder's fp32 weights**
+and raises `RuntimeError: mat1 and mat2 must have the same dtype, but got
+BFloat16 and Float`. This fires inside `forward_self_supervised` → `ema.encode`
+**the moment the SSL loss turns on (Stage D)** on any `--amp` run — i.e. it
+would kill the big run at the D transition, and would fail `rocm_smoke.py` step 4.
+
+- *Why every prior AMP check missed it*: the trainer forces AMP **off on CPU**
+  (`device.type != "cpu"`), `rocm_smoke.py` **exits at step 1 without a GPU**
+  (its autocast is hardcoded `device_type="cuda"`), and the one explicit
+  bf16-autocast-on-CPU check (§16.3) predates §17.3's `.eval()` change — so the
+  combination *(eval target encoder + autocast + no_grad)* had never actually
+  executed anywhere. The online `chunk_encoder`/`input_lane` encoders are in
+  `.train()` during the step (no fast path → fine); `evaluate()` runs eval-mode
+  encoders but is **not** autocast-wrapped (fp32 → fine). The EMA target was the
+  sole eval+autocast site.
+- *Confirmed*: minimal repro — `nn.TransformerEncoder` in `eval()` +
+  `no_grad()` + `autocast(cpu, bf16)` raises the dtype error; `train()` mode or
+  no-autocast are both fine. Full model: pre-fix `forward_self_supervised`
+  under bf16 autocast throws at `ema.encode`; post-fix all of stages C / E-ACT /
+  F-lanes give finite `nll`/`ponder`/`ssl`/`gen` and finite grads.
+- *Fix* (`ema_target.encode`): compute the detached momentum target with
+  autocast **disabled** (`torch.autocast(device_type=dev, enabled=False)`, guarded
+  to cpu/cuda; `nullcontext` elsewhere). The target is a stop-grad momentum copy,
+  so full precision is *correct and more accurate*, not a compromise; the online
+  path is unchanged. The fp32 target vs bf16 prediction in the subsequent
+  scaled-cosine loss is handled by eager type promotion (verified finite).
+  No-op on the non-AMP path (A–C bit-identical; C2 gradient reach preserved —
+  SSL still trains `chunk_encoder` 28/28, `gen_predictor` still isolated 4/4).
+
+### 18.2 Documented, deliberately NOT changed
+
+- **ACT-mode truncation has the §15.2 footgun un-hardened.** §15.2 fixed the
+  *fixed-depth* cut (`max(0, total-window)`); the **ACT rolling cut**
+  (`in_graph >= window`) has the same latent issue — if `window` ever exceeds
+  the executed step count the entering cross-thought chain would survive. **Not
+  reachable at current config** (`inner_loop_grad_window_end=5` < the 8-step ACT
+  minimum of `n_cycles*(l_steps+1)=2*4`), so left as-is to avoid an unvalidated
+  gradient-path change days before the run; harden it (mirror the `max(0,…)`
+  guard) only if the cycle counts or the end-window are changed.
+- **AdamW still decays `theta`/`log_dt`/LayerNorms** (§9). Over a long run the
+  weight decay on Parcae's generator params pulls the per-channel decay toward
+  its init ~0.62; benign but worth a no-decay param group if ever revisited.
+
+### 18.3 Re-verification (what was actually run this pass)
+
+- Offline A→E via `data_prep.py --offline --preset smoke` → `train_scaled.py`
+  (budgets 3/3/3/3/3 and 2/2/2/2/2): every stage fires, SSL at D, ponder at E,
+  `gen` logged, `latent_std` healthy, checkpoints written; `--resume` from the
+  step-12 checkpoint continues schedule-exact.
+- bf16-autocast finiteness at `smoke` **and** `small` presets across stages
+  C / E-ACT / F-lanes (`forward_grounded` + `forward_self_supervised` +
+  `forward_gen_predictor`): all losses and grads finite **after** the C8 fix
+  (all crash pre-fix at `ema.encode`).
+- Gradient-isolation audit re-run post-fix: SSL → `chunk_encoder` 28/28 +
+  `ssl_proj` 4/4, `gen_predictor` 0/4; gen → `gen_predictor` 4/4 only.
+- All files byte-compile. **No large training run was started.**
+
+Standing recommendation (unchanged from §17.4): still run the STRIX_HALO.md
+go/no-go (`rocm_smoke.py` → `bench_throughput.py`) on the actual box first —
+that autocast path is now expected to *pass* rather than crash at step 4.
+
+Files changed this session: `files/ema_target.py` (18.1 autocast-safe target),
+`notes.md` (this section).

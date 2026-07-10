@@ -18,6 +18,7 @@ cosine distance in the same representation space.
 from __future__ import annotations
 
 import copy
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -105,9 +106,22 @@ class EMATargetEncoder:
 
     @torch.no_grad()
     def encode(self, chunk_ids: torch.Tensor, chunk_mask: torch.Tensor) -> torch.Tensor:
-        z = self.target_encoder(chunk_ids, chunk_mask)
-        if self.target_proj is not None:
-            z = self.target_proj(z)
+        # The target encoder is kept in eval() (dropout off, deterministic
+        # target). Under AMP autocast, an eval-mode nn.TransformerEncoder takes
+        # the fused BetterTransformer path (torch._transformer_encoder_layer_fwd),
+        # which mixes autocast-cast bf16 activations with the encoder's fp32
+        # weights and raises "mat1 and mat2 must have the same dtype" -- this
+        # crashes forward_self_supervised the moment the SSL loss turns on
+        # (Stage D) on the --amp run. Since this is a detached momentum target,
+        # compute it in full precision with autocast disabled: correct, more
+        # accurate, and backend-agnostic. No-op on the CPU/non-AMP path.
+        dev = chunk_ids.device.type
+        ctx = (torch.autocast(device_type=dev, enabled=False)
+               if dev in ("cpu", "cuda") else nullcontext())
+        with ctx:
+            z = self.target_encoder(chunk_ids, chunk_mask)
+            if self.target_proj is not None:
+                z = self.target_proj(z)
         return z
 
     def to(self, device):

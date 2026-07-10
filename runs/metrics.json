@@ -1,0 +1,210 @@
+[
+  {
+    "step": 10,
+    "stage": "A",
+    "val_loss": 10.672056198120117,
+    "latent_std": 0.4075,
+    "nll": 10.8078,
+    "ponder": 0.0,
+    "loss": 10.8078,
+    "lstd": 0.4075
+  },
+  {
+    "step": 20,
+    "stage": "A",
+    "val_loss": 10.47705340385437,
+    "latent_std": 0.3487,
+    "nll": 10.6074,
+    "ponder": 0.0,
+    "loss": 10.6074,
+    "lstd": 0.3487
+  },
+  {
+    "step": 30,
+    "stage": "A",
+    "val_loss": 10.638302326202393,
+    "latent_std": 0.3158,
+    "nll": 10.7145,
+    "ponder": 0.0,
+    "loss": 10.7145,
+    "lstd": 0.3158
+  },
+  {
+    "step": 40,
+    "stage": "A",
+    "val_loss": 10.79543423652649,
+    "latent_std": 0.2527,
+    "nll": 10.9125,
+    "ponder": 0.0,
+    "loss": 10.9125,
+    "lstd": 0.2527
+  },
+  {
+    "step": 50,
+    "stage": "B",
+    "val_loss": 10.092493295669556,
+    "latent_std": 0.4147,
+    "nll": 10.3667,
+    "ponder": 0.0,
+    "loss": 10.3667,
+    "lstd": 0.4147
+  },
+  {
+    "step": 60,
+    "stage": "B",
+    "val_loss": 9.519083499908447,
+    "latent_std": 0.2465,
+    "nll": 10.3798,
+    "ponder": 0.0,
+    "loss": 10.3798,
+    "lstd": 0.2465
+  },
+  {
+    "step": 70,
+    "stage": "B",
+    "val_loss": 8.94539475440979,
+    "latent_std": 0.3356,
+    "nll": 9.3566,
+    "ponder": 0.0,
+    "loss": 9.3566,
+    "lstd": 0.3356
+  },
+  {
+    "step": 80,
+    "stage": "B",
+    "val_loss": 8.445266723632812,
+    "latent_std": 0.2569,
+    "nll": 8.9465,
+    "ponder": 0.0,
+    "loss": 8.9465,
+    "lstd": 0.2569
+  },
+  {
+    "step": 90,
+    "stage": "C",
+    "val_loss": 8.08008348941803,
+    "latent_std": 0.2426,
+    "nll": 8.4351,
+    "ponder": 0.0,
+    "loss": 8.4351,
+    "lstd": 0.2426
+  },
+  {
+    "step": 100,
+    "stage": "C",
+    "val_loss": 7.884055972099304,
+    "latent_std": 0.2545,
+    "nll": 8.421,
+    "ponder": 0.0,
+    "loss": 8.421,
+    "lstd": 0.2545
+  },
+  {
+    "step": 110,
+    "stage": "C",
+    "val_loss": 7.8221505880355835,
+    "latent_std": 0.3438,
+    "nll": 8.3978,
+    "ponder": 0.0,
+    "loss": 8.3978,
+    "lstd": 0.3438
+  },
+  {
+    "step": 120,
+    "stage": "C",
+    "val_loss": 7.8366769552230835,
+    "latent_std": 0.3607,
+    "nll": 8.6653,
+    "ponder": 0.0,
+    "loss": 8.6653,
+    "lstd": 0.3607
+  },
+  {
+    "step": 130,
+    "stage": "D",
+    "val_loss": 7.755521774291992,
+    "latent_std": 0.3008,
+    "nll": 7.8209,
+    "ponder": 0.0,
+    "ssl": 0.139,
+    "loss": 7.9599,
+    "lstd": 0.3008
+  },
+  {
+    "step": 140,
+    "stage": "D",
+    "val_loss": 7.792269706726074,
+    "latent_std": 0.4059,
+    "nll": 8.3183,
+    "ponder": 0.0,
+    "ssl": 0.1114,
+    "loss": 8.4297,
+    "lstd": 0.4059
+  },
+  {
+    "step": 150,
+    "stage": "D",
+    "val_loss": 7.749420642852783,
+    "latent_std": 0.2774,
+    "nll": 8.0714,
+    "ponder": 0.0,
+    "ssl": 0.0562,
+    "loss": 8.1276,
+    "lstd": 0.2774
+  },
+  {
+    "step": 160,
+    "stage": "D",
+    "val_loss": 7.800371289253235,
+    "latent_std": 0.3013,
+    "nll": 7.8725,
+    "ponder": 0.0,
+    "ssl": 0.0494,
+    "loss": 7.9219,
+    "lstd": 0.3013
+  },
+  {
+    "step": 170,
+    "stage": "E",
+    "val_loss": 7.833904385566711,
+    "latent_std": 0.3751,
+    "nll": 8.2571,
+    "ponder": 0.0289,
+    "ssl": 0.0418,
+    "loss": 8.3278,
+    "lstd": 0.3751
+  },
+  {
+    "step": 180,
+    "stage": "E",
+    "val_loss": 7.86282217502594,
+    "latent_std": 0.5627,
+    "nll": 8.6446,
+    "ponder": 0.0454,
+    "ssl": 0.0803,
+    "loss": 8.7703,
+    "lstd": 0.5627
+  },
+  {
+    "step": 190,
+    "stage": "E",
+    "val_loss": 7.842829585075378,
+    "latent_std": 0.4773,
+    "nll": 8.3985,
+    "ponder": 0.0146,
+    "ssl": 0.0454,
+    "loss": 8.4585,
+    "lstd": 0.4773
+  },
+  {
+    "step": 200,
+    "stage": "E",
+    "val_loss": 7.781936526298523,
+    "latent_std": 0.5162,
+    "nll": 7.7759,
+    "ponder": 0.0154,
+    "ssl": 0.0241,
+    "loss": 7.8154,
+    "lstd": 0.5162
+  }
+]

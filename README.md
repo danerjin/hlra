@@ -70,6 +70,27 @@ python generate.py --score "some text to score"
 full architecture end-to-end. For a real run, see [`TRAINING.md`](TRAINING.md) (the copy-paste guide
 for the A→E scaled run) and [`STRIX_HALO.md`](STRIX_HALO.md) (the ROCm/GPU setup).
 
+## Chatting with a trained checkpoint
+
+Two interactive testers wrap the `generate.py` inference path (both prompt for a checkpoint path on
+start, then load it once — point them at the final A→E run's `model.pt`). They share `chat_core.py`.
+
+```bash
+python chat.py                      # CLI: prompts for the checkpoint path, then a REPL
+python chat.py runs/scaled/model.pt # or pass it directly
+
+python web_chat.py                  # web UI: prompts for the path, serves http://127.0.0.1:8000
+python web_chat.py runs/scaled/model.pt --port 8000
+```
+
+Both surface the model's **chunk-level "thoughts"**: text is shown split at chunk borders (`|` in the
+CLI; numbered pills in the web UI), for both how the input is segmented and each generated chunk.
+CLI commands: `<text>` generate · `:score <t>` perplexity · `:chunks <t>` segmentation · `:sep` toggle
+borders · `:temp f` · `:n k` · `:q`. The web UI adds a debug sidebar: a Generate/Score mode switch,
+chunk-visualization + input-segmentation + per-message-perplexity toggles, temperature / #chunks dials,
+and a field to load a different checkpoint. (`web_chat.py` is stdlib-only — no Flask; inference runs on
+CPU, single-user.) Output coherence tracks the run's scale — smoke-scale is not coherent by design.
+
 ## Scaling up
 
 ```bash

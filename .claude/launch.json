@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web-chat",
+      "runtimeExecutable": ".venv/bin/python3",
+      "runtimeArgs": ["web_chat.py", "proverbs-test/runs/proverbs/model.pt", "--port", "8000"],
+      "port": 8000
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+# Intermediate / regenerable artifacts for the Proverbs experiment.
+# proverbs.jsonl is the canonical committed data; raw_chapters/ is the raw
+# per-chapter API cache that fetch_proverbs.py rebuilds.
+raw_chapters/
+*.log

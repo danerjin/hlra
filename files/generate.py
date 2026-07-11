@@ -150,7 +150,8 @@ def talker_decode(model, latent, cfg, temperature=0.9, greedy=False):
 
 
 @torch.no_grad()
-def generate(model, chunker, cfg, prompt, n_chunks=3, temperature=0.9, greedy=False):
+def generate(model, chunker, cfg, prompt, n_chunks=3, temperature=0.9, greedy=False,
+             separator=" "):
     tok = chunker.tokenizer
     memory, h_state, l_state, last_latent = read_prompt(model, chunker, cfg, prompt)
     out_chunks = []
@@ -176,7 +177,7 @@ def generate(model, chunker, cfg, prompt, n_chunks=3, temperature=0.9, greedy=Fa
             gen[0, j] = g
         last_latent = model.chunk_encoder(gen, gen != 0)
         out_chunks.append(_decode(tok, ids))
-    return " ".join(c for c in out_chunks if c).strip()
+    return separator.join(c for c in out_chunks if c).strip()
 
 
 @torch.no_grad()

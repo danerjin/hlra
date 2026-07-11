@@ -11,7 +11,7 @@ returns `"cuda"` and the bf16 AMP path works as-is. The open questions are
 Memory is a non-issue and actually an advantage: the model+optimizer is ~2.5 GB
 and the ~1.2B-token chunk cache (~10 GB) loads into the 128 GB unified memory
 with room to spare, so the in-RAM `CachedChunkDataset` is fine (memmap optional).
-The real risk is **throughput**: `forward_grounded` is a sequential per-chunk
+The real risk is **throughput**: `forward_self_supervised` (the on-loop predictor) is a sequential per-chunk
 loop of many small ops, which is launch-overhead-bound and underutilizes any
 GPU. The 128 GB is the lever — it lets you run a large batch to amortize that
 overhead. Measure it before committing.
@@ -73,7 +73,7 @@ viable. If it's stuck in the hundreds even at large batch, the sequential chunk
 loop is the bottleneck (next section), not the GPU.
 
 ## 4. Why throughput is loop-bound, and what can actually be sped up
-`forward_grounded` walks a document's chunks **sequentially**. What that means
+`forward_self_supervised` walks a document's chunks **sequentially** through the HRM loop. What that means
 for optimization:
 
 - **Already batched** (notes §11.7): the chunk *encoder* runs once over all
@@ -83,20 +83,18 @@ for optimization:
   memory of thoughts `0..t-1`, which grows as you go. This is the architecture's
   sequential thought loop (§1) — it cannot be parallelized across chunks without
   changing semantics. The L/H steps *within* a chunk are likewise a recurrence.
-- **Batchable with real work — the main code lever if large-batch isn't enough:**
-  the **Talker**. At train time it's teacher-forced (all target tokens known), so
-  its forward is already parallel over positions; and each chunk's decode depends
-  only on that chunk's finished thought + the memory prefix `0..t`. So after the
-  (sequential) thought loop produces all `N` thoughts, the Talker could run in a
-  single batched call over `B*N` chunks with a per-chunk memory-attention mask,
-  instead of `N` separate calls. The Talker is a large share of per-step cost, so
-  this is a real win — but the growing-memory mask is fiddly and it changes the
-  memory-read path, so it **must be tested** (do not land it untested before the
-  run).
+- **The Talker is already off the sequential path.** Reconstruction is a pure
+  autoencoder codec (`forward_grounded`) that decodes all `B*N` chunks in **one
+  parallel Talker call** with an empty memory — it is not inside the loop. The
+  sequential predictor (`forward_self_supervised`) uses only a cheap linear
+  `pred_head`, not the Talker. So the per-step sequential cost is the **HRM loop's
+  L/H recurrence + memory cross-attention**, per chunk — that's the thing large
+  batch amortizes.
 
 **Order of operations:** (1) large batch — free, no code change, measured by the
-bench; (2) if still too slow, batch the Talker across chunks (moderate work +
-tests); (3) the HRM thought recurrence stays sequential by design.
+bench; (2) the HRM thought recurrence stays sequential by design (it cannot be
+parallelized across chunks without changing semantics). If the ETA is still
+unacceptable, the levers are budget/preset/hardware, below.
 
 If none of that gets the ETA acceptable, the levers are: smaller token budget
 (the 1.0–1.5B bracket has slack), a smaller preset, or different hardware.

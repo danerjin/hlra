@@ -6,10 +6,12 @@ loss. A momentum copy of a chunk encoder whose weights are updated as
 `theta' <- m * theta' + (1 - m) * theta` (no gradient through it directly),
 following JEPA/BYOL/DINO-style self-distillation.
 
-The momentum (0.98) is a self-distillation-collapse defense (§3.4): too low
-and predictor/target can collapse to a trivial constant, too high and the
-target is stale. It's a value the source paper's own sweep found for its
-setup, not a universal constant, so it lives in config.py as a tunable.
+The momentum is a self-distillation-collapse defense (§3.4): too low and
+predictor/target can collapse to a trivial constant, too high and the target
+is stale. The source paper's sweep found 0.98 for its setup; this project
+raised it to 0.996 (config.ema_momentum) because a faster-moving target lets a
+small model chase it into a collapsed latent. It's not a universal constant, so
+it lives in config.py as a tunable (re-tune per scale).
 
 We reuse the same chunk-pooling architecture as the online chunk encoder
 (a small transformer + mean pool) so the two are directly comparable via

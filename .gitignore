@@ -17,4 +17,4 @@ wiki_cache/
 .DS_Store
 
 # Research PDFs (kept on disk, not in the repo)
-*.pdf
+# *.pdf

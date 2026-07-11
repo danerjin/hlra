@@ -1,97 +1,97 @@
 [
   {
     "step": 0,
-    "page_nll": 10.9939,
-    "page_ppl": 59507.1
+    "page_nll": 10.9838,
+    "page_ppl": 58914.8
   },
   {
     "step": 100,
-    "train_nll": 8.3681,
-    "page_nll": 8.3526,
-    "page_ppl": 4241.1
+    "train_nll": 7.0326,
+    "page_nll": 7.115,
+    "page_ppl": 1230.3
   },
   {
     "step": 200,
-    "train_nll": 5.407,
-    "page_nll": 5.8451,
-    "page_ppl": 345.5
+    "train_nll": 5.9913,
+    "page_nll": 6.0884,
+    "page_ppl": 440.7
   },
   {
     "step": 300,
-    "train_nll": 5.2103,
-    "page_nll": 5.6448,
-    "page_ppl": 282.8
+    "train_nll": 5.0196,
+    "page_nll": 5.3476,
+    "page_ppl": 210.1
   },
   {
     "step": 400,
-    "train_nll": 4.7894,
-    "page_nll": 5.5058,
-    "page_ppl": 246.1
+    "train_nll": 5.4262,
+    "page_nll": 5.5813,
+    "page_ppl": 265.4
   },
   {
     "step": 500,
-    "train_nll": 5.0982,
-    "page_nll": 5.4271,
-    "page_ppl": 227.5
+    "train_nll": 5.9082,
+    "page_nll": 6.0419,
+    "page_ppl": 420.7
   },
   {
     "step": 600,
-    "train_nll": 4.7877,
-    "page_nll": 5.3576,
-    "page_ppl": 212.2
+    "train_nll": 5.8805,
+    "page_nll": 6.192,
+    "page_ppl": 488.8
   },
   {
     "step": 700,
-    "train_nll": 4.5541,
-    "page_nll": 5.1743,
-    "page_ppl": 176.7
+    "train_nll": 6.1039,
+    "page_nll": 6.3012,
+    "page_ppl": 545.2
   },
   {
     "step": 800,
-    "train_nll": 4.3159,
-    "page_nll": 4.7766,
-    "page_ppl": 118.7
+    "train_nll": 6.3041,
+    "page_nll": 6.4249,
+    "page_ppl": 617.0
   },
   {
     "step": 900,
-    "train_nll": 4.2651,
-    "page_nll": 5.0632,
-    "page_ppl": 158.1
+    "train_nll": 6.3686,
+    "page_nll": 6.4161,
+    "page_ppl": 611.6
   },
   {
     "step": 1000,
-    "train_nll": 3.1301,
-    "page_nll": 4.0658,
-    "page_ppl": 58.3
+    "train_nll": 6.4449,
+    "page_nll": 6.5441,
+    "page_ppl": 695.2
   },
   {
     "step": 1100,
-    "train_nll": 3.3127,
-    "page_nll": 3.7408,
-    "page_ppl": 42.1
+    "train_nll": 6.3346,
+    "page_nll": 6.4991,
+    "page_ppl": 664.5
   },
   {
     "step": 1200,
-    "train_nll": 2.5498,
-    "page_nll": 3.6554,
-    "page_ppl": 38.7
+    "train_nll": 5.9476,
+    "page_nll": 5.9203,
+    "page_ppl": 372.5
   },
   {
     "step": 1300,
-    "train_nll": 2.5455,
-    "page_nll": 3.6286,
-    "page_ppl": 37.7
+    "train_nll": 5.8752,
+    "page_nll": 6.1595,
+    "page_ppl": 473.2
   },
   {
     "step": 1400,
-    "train_nll": 2.4245,
-    "page_nll": 3.6129,
-    "page_ppl": 37.1
+    "train_nll": 6.0533,
+    "page_nll": 6.3461,
+    "page_ppl": 570.2
   },
   {
     "step": 1500,
-    "train_nll": 2.5201,
-    "page_nll": 3.6407,
-    "page_ppl": 38.1
+    "train_nll": 6.2098,
+    "page_nll": 6.3656,
+    "page_ppl": 581.5
   }
 ]

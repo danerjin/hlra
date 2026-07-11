@@ -309,39 +309,38 @@ text(s, 0.7, 1.52, 12.0, 0.4, [[
 ix, iy, iw, ih = 0.7, 2.12, 3.05, 4.24
 rect(s, ix, iy, iw, ih, fill=CARD, lc=BLUE, lw=1.3, radius=0.05, shadow=True)
 inx, inw = ix+0.25, iw-0.5
-text(s, inx, iy+0.2, inw, 0.3, [[("INPUT LANE", dict(size=13, color=BLUE, bold=True, font=BODY, spacing=1.8))]])
-text(s, inx, iy+0.5, inw, 0.25, [[("read-only · never writes self-state", dict(size=9.5, color=MUTE, font=BODY))]])
-# two source chips
-for k,(a,b) in enumerate([("Raw tokens","current turn"),("Aged gestalt summaries","prior turns")]):
-    cy = iy+0.92 + k*0.72
-    rect(s, inx, cy, inw, 0.6, fill=BG2, lc=LINE, lw=1, radius=0.12)
-    text(s, inx+0.16, cy+0.09, inw-0.3, 0.25, [[(a, dict(size=11.5, color=TEXT, bold=True, font=BODY))]])
-    text(s, inx+0.16, cy+0.33, inw-0.3, 0.22, [[(b, dict(size=9.5, color=MUTE, font=BODY))]])
-arrow(s, ix+iw/2, iy+2.4, ix+iw/2, iy+2.66, color=BLUE, w=1.4)
-# input-lane encoder
-rect(s, inx, iy+2.72, inw, 0.62, fill=CARD2, lc=BLUE, lw=1.2, radius=0.12)
-text(s, inx, iy+2.83, inw, 0.25, [[("Input-lane encoder", dict(size=11.5, color=BLUE, bold=True, font=BODY))]], align=PP_ALIGN.CENTER)
-text(s, inx, iy+3.06, inw, 0.22, [[("bidirectional", dict(size=9.5, color=MUTE, font=BODY))]], align=PP_ALIGN.CENTER)
-text(s, inx, iy+3.5, inw, 0.7, [
-    [("Role tags  ", dict(size=10, color=MUTE, font=BODY)),
-     ("USER · SELF · SYSTEM", dict(size=10, color=TEXT, bold=True, font=BODY))],
-    [("The loop only cross-attends to it — the substrate for a self / input boundary.",
-      dict(size=9.5, color=FAINT, italic=True, font=BODY))],
-], line=1.16, space_after=3)
+text(s, inx, iy+0.16, inw, 0.3, [[("INPUT LANE", dict(size=13, color=BLUE, bold=True, font=BODY, spacing=1.8))]])
+text(s, inx, iy+0.45, inw, 0.25, [[("read-only · two-tier context", dict(size=9.5, color=MUTE, font=BODY))]])
+# tier 1: raw tokens -> input-lane encoder
+rect(s, inx, iy+0.82, inw, 0.56, fill=BG2, lc=LINE, lw=1, radius=0.12)
+text(s, inx+0.16, iy+0.9, inw-0.3, 0.24, [[("Raw tokens", dict(size=11.5, color=TEXT, bold=True, font=BODY))]])
+text(s, inx+0.16, iy+1.13, inw-0.3, 0.2, [[("current turn · full fidelity", dict(size=9, color=MUTE, font=BODY))]])
+arrow(s, ix+iw/2, iy+1.4, ix+iw/2, iy+1.58, color=BLUE, w=1.3)
+rect(s, inx, iy+1.62, inw, 0.54, fill=CARD2, lc=BLUE, lw=1.2, radius=0.12)
+text(s, inx, iy+1.69, inw, 0.24, [[("Input-lane encoder", dict(size=11, color=BLUE, bold=True, font=BODY))]], align=PP_ALIGN.CENTER)
+text(s, inx, iy+1.91, inw, 0.2, [[("bidirectional", dict(size=9, color=MUTE, font=BODY))]], align=PP_ALIGN.CENTER)
+line(s, inx, iy+2.34, inx+inw, iy+2.34, color=LINE, w=1)
+# tier 2: aged gestalts -- NOT a second store; the memory's USER/SYSTEM slots, recalled
+rect(s, inx, iy+2.48, inw, 0.56, fill=BG2, lc=BLUE, lw=1, radius=0.12)
+text(s, inx+0.16, iy+2.56, inw-0.3, 0.24, [[("Aged gestalts", dict(size=11.5, color=TEXT, bold=True, font=BODY))]])
+text(s, inx+0.16, iy+2.79, inw-0.3, 0.2, [[("prior turns · compressed", dict(size=9, color=MUTE, font=BODY))]])
+text(s, inx, iy+3.12, inw, 0.5, [[("The same gestalt memory's USER/SYSTEM slots, recalled — not a second store.",
+     dict(size=8.5, color=FAINT, italic=True, font=BODY))]], line=1.12)
+text(s, inx, iy+3.74, inw, 0.4, [[("Role tags ", dict(size=9, color=MUTE, font=BODY)),
+     ("USER·SELF·SYSTEM", dict(size=9, color=TEXT, bold=True, font=BODY)),
+     (" · never writes self-state", dict(size=9, color=MUTE, font=BODY))]], line=1.14)
 
 # ---------- GENERATION SPINE (right) ----------
 sx, sw = 5.55, 6.95
 scx = sx + sw/2
-# 1. chunk encoder
+# 1. chunk encoder (chunks come from the SaT-Capped chunker)
 y1 = 2.12
 rect(s, sx, y1, sw, 0.6, fill=CARD, lc=TEAL, lw=1.3, radius=0.07, shadow=True)
-text(s, sx, y1, sw, 0.6, [[
-    ("CHUNK ENCODER", dict(size=12, color=TEAL, bold=True, font=BODY, spacing=1.4)),
-    ("     chunk cₜ  →  192-d thought latent", dict(size=10.5, color=MUTE, font=BODY))]],
-    align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
-arrow(s, scx, y1+0.6, scx, y1+0.88, color=TEAL)
+text(s, sx, y1+0.09, sw, 0.26, [[("CHUNK ENCODER", dict(size=12, color=TEAL, bold=True, font=BODY, spacing=1.4))]], align=PP_ALIGN.CENTER)
+text(s, sx, y1+0.34, sw, 0.22, [[("SaT-Capped chunker  →  chunk cₜ  →  192-d thought latent", dict(size=9.5, color=MUTE, font=BODY))]], align=PP_ALIGN.CENTER)
+arrow(s, scx, y1+0.6, scx, y1+0.86, color=TEAL)
 # 2. inner HRM loop
-y2 = 3.02; h2 = 1.2
+y2 = 3.0; h2 = 1.2
 rect(s, sx, y2, sw, h2, fill=CARD, lc=TEAL, lw=1.7, radius=0.07, shadow=True)
 text(s, sx, y2+0.13, sw, 0.28, [[("INNER HRM LOOP  ·  SELF LANE", dict(size=12, color=TEAL, bold=True, font=BODY, spacing=1.2))]], align=PP_ALIGN.CENTER)
 lxx = scx-1.06; mmy = y2+0.5
@@ -353,38 +352,47 @@ rect(s, lxx+0.12, mmy, 0.5, 0.38, fill=TEALDIM, lc=TEAL, lw=1, radius=0.16)
 text(s, lxx+0.12, mmy, 0.5, 0.38, [[("H", dict(size=12, color=TEXT, bold=True, font=BODY))]], align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
 text(s, sx, y2+0.95, sw, 0.24, [[("fast L ×3  →  slow H ×1   ·   Parcae-stable · adaptive depth · writes self-state",
     dict(size=10, color=MUTE, font=BODY))]], align=PP_ALIGN.CENTER)
-arrow(s, scx, y2+h2, scx, y2+h2+0.28, color=TEAL)
-text(s, scx+0.15, y2+h2+0.01, 2.2, 0.26, [[("write thought zₜ", dict(size=9.5, color=TEAL, italic=True, font=BODY))]])
-# 3. gestalt memory
-y3 = 4.5
-rect(s, sx, y3, sw, 0.74, fill=CARD2, lc=BLUE, lw=1.3, radius=0.08, shadow=True)
-text(s, sx+0.3, y3+0.14, sw-2.4, 0.28, [[("GESTALT MEMORY", dict(size=12, color=BLUE, bold=True, font=BODY, spacing=1.4))]])
-text(s, sx+0.3, y3+0.42, sw-2.4, 0.24, [[("FIFO · role-tagged · ungated gradient · next thought recalls it at O(1)", dict(size=10, color=MUTE, font=BODY))]])
-zx = sx+sw-2.05
+arrow(s, scx, y2+h2, scx, y2+h2+0.26, color=TEAL)
+text(s, scx+0.15, y2+h2-0.02, 2.2, 0.26, [[("write thought zₜ (SELF)", dict(size=9.5, color=TEAL, italic=True, font=BODY))]])
+# 3. gestalt memory -- THE single hub, role-partitioned
+y3 = 4.46; h3 = 0.92
+rect(s, sx, y3, sw, h3, fill=CARD2, lc=BLUE, lw=1.4, radius=0.08, shadow=True)
+text(s, sx+0.3, y3+0.1, sw-2.35, 0.26, [[("GESTALT MEMORY", dict(size=12, color=BLUE, bold=True, font=BODY, spacing=1.4)),
+    ("   — one store", dict(size=10, color=MUTE, italic=True, font=BODY))]])
+text(s, sx+0.3, y3+0.37, sw-2.35, 0.22, [[("FIFO · role-tagged · ungated gradient · O(1) recall", dict(size=9.5, color=MUTE, font=BODY))]])
+text(s, sx+0.3, y3+0.62, sw-2.35, 0.24, [[
+    ("SELF", dict(size=9.5, color=TEAL, bold=True, font=BODY)), (" = this loop's thoughts     ", dict(size=9.5, color=MUTE, font=BODY)),
+    ("USER/SYSTEM", dict(size=9.5, color=BLUE, bold=True, font=BODY)), (" = aged input", dict(size=9.5, color=MUTE, font=BODY))]])
+zx = sx+sw-2.02
 for k in range(3):
-    rect(s, zx, y3+0.22, 0.5, 0.34, fill=BG2, lc=BLUE, lw=1, radius=0.16)
-    text(s, zx, y3+0.22, 0.5, 0.34, [[("z%d"%(k+1), dict(size=10, color=TEXT, bold=True, font=BODY))]], align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
-    zx += 0.56
-text(s, zx-0.02, y3+0.26, 0.4, 0.3, [[("…", dict(size=13, color=MUTE, font=BODY))]])
-arrow(s, scx, y3+0.74, scx, y3+1.02, color=GREEN)
+    rect(s, zx, y3+0.31, 0.48, 0.32, fill=BG2, lc=BLUE, lw=1, radius=0.16)
+    text(s, zx, y3+0.31, 0.48, 0.32, [[("z%d"%(k+1), dict(size=10, color=TEXT, bold=True, font=BODY))]], align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
+    zx += 0.54
+text(s, zx-0.02, y3+0.34, 0.4, 0.3, [[("…", dict(size=13, color=MUTE, font=BODY))]])
+arrow(s, scx, y3+h3, scx, y3+h3+0.2, color=GREEN)
 # 4. talker
-y4 = 5.54
+y4 = 5.58
 rect(s, sx, y4, sw, 0.72, fill=CARD, lc=GREEN, lw=1.3, radius=0.08, shadow=True)
 text(s, sx, y4+0.13, sw, 0.28, [[("TALKER  →  output tokens", dict(size=12.5, color=GREEN, bold=True, font=BODY, spacing=0.6))]], align=PP_ALIGN.CENTER)
 text(s, sx, y4+0.41, sw, 0.24, [[("autoregressive · sampling noise can't leak back into reasoning", dict(size=10, color=MUTE, font=BODY))]], align=PP_ALIGN.CENTER)
 
-# ---------- cross-attention (read-only) dashed arrows ----------
-arrow(s, ix+iw, 3.55, sx-0.05, 3.55, color=BLUE, w=1.4, dashed=True)
-text(s, ix+iw+0.05, 3.28, sx-ix-iw, 0.24, [[("cross-attend · read-only", dict(size=9, color=BLUE, italic=True, font=BODY))]], align=PP_ALIGN.CENTER)
-arrow(s, ix+iw, 5.9, sx-0.05, 5.9, color=BLUE, w=1.4, dashed=True)
-text(s, ix+iw+0.05, 5.63, sx-ix-iw, 0.24, [[("raw tokens · exact quotes", dict(size=9, color=BLUE, italic=True, font=BODY))]], align=PP_ALIGN.CENTER)
+# ---------- cross-lane arrows ----------
+# input lane -> loop (read-only cross-attend)
+arrow(s, ix+iw, 3.5, sx-0.05, 3.5, color=BLUE, w=1.4, dashed=True)
+text(s, ix+iw+0.05, 3.24, sx-ix-iw, 0.24, [[("cross-attend · read-only", dict(size=9, color=BLUE, italic=True, font=BODY))]], align=PP_ALIGN.CENTER)
+# memory -> input lane (aged-gestalt recall): the one store feeding tier 2
+arrow(s, sx, 4.92, ix+iw+0.03, 4.92, color=BLUE, w=1.5, dashed=True)
+text(s, ix+iw+0.05, 4.66, sx-ix-iw, 0.24, [[("recall · aged gestalts", dict(size=9, color=BLUE, italic=True, font=BODY))]], align=PP_ALIGN.CENTER)
+# input lane -> talker (raw tokens for exact quotes)
+arrow(s, ix+iw, 5.94, sx-0.05, 5.94, color=BLUE, w=1.4, dashed=True)
+text(s, ix+iw+0.05, 5.68, sx-ix-iw, 0.24, [[("raw tokens · exact quotes", dict(size=9, color=BLUE, italic=True, font=BODY))]], align=PP_ALIGN.CENTER)
 
 # ---------- legend ----------
 ly0 = 6.62
 line(s, sx, ly0, sx+0.4, ly0, color=TEXT, w=2.0)
-text(s, sx+0.5, ly0-0.12, 3.0, 0.24, [[("data flow · writes self-state", dict(size=9.5, color=MUTE, font=BODY))]])
-line(s, sx+3.5, ly0, sx+3.9, ly0, color=BLUE, w=1.6, dash="dash")
-text(s, sx+4.0, ly0-0.12, 3.0, 0.24, [[("read-only cross-attention", dict(size=9.5, color=MUTE, font=BODY))]])
+text(s, sx+0.5, ly0-0.12, 3.2, 0.24, [[("generation flow · writes self-state", dict(size=9.5, color=MUTE, font=BODY))]])
+line(s, sx+3.75, ly0, sx+4.15, ly0, color=BLUE, w=1.6, dash="dash")
+text(s, sx+4.25, ly0-0.12, 3.0, 0.24, [[("read-only cross-attention / recall", dict(size=9.5, color=MUTE, font=BODY))]])
 pagenum(s, 4, "Proposed Solution · Pipeline")
 
 # ============================================================
@@ -549,9 +557,9 @@ pagenum(s, 7, "Preliminary Findings")
 # ============================================================
 s = slide(BG)
 eyebrow(s, "Baseline Comparison", color=BLUE)
-title(s, "At matched compute, competitive with a standard GPT")
+title(s, "Ahead of a width-matched GPT, behind a param-matched one")
 text(s, 0.7, 1.5, 12.1, 0.4, [[
-    ("Memorizing one Wikipedia page — same gpt2 tokenizer, optimizer, schedule & step budget; ", dict(size=13, color=MUTE, font=BODY)),
+    ("Memorizing one Wikipedia page — same gpt2 tokenizer, optimizer & schedule (the latent needs 4× the batch to memorize); ", dict(size=13, color=MUTE, font=BODY)),
     ("only the architecture differs.", dict(size=13, color=TEXT, bold=True, font=BODY))]], line=1.15)
 
 # --- the comparison chart (runs/comparison.png, 1425x870) ---
@@ -566,12 +574,12 @@ px = imgx + img_w + 0.32          # ≈ 8.31
 pw = 12.63 - px                   # ≈ 4.32
 text(s, px, 2.02, pw, 0.3, [[("WHAT IT SHOWS", dict(size=12, color=TEXT, bold=True, font=BODY, spacing=1.5))]])
 takes = [
-    (GREEN, "Both memorize the page",
-     "Latent grounded-only reconstruction → ppl ≈ 1.0, matching the 44.7M same-params GPT (≈ 1.1)."),
-    (CORAL, "Matched-width GPT can't",
-     "The 14.1M same-compute GPT (d=192) plateaus at ≈ 484 — same width, no bottleneck to lean on."),
+    (GREEN, "Beats the width-matched GPT",
+     "The 14.1M same-compute GPT (d=192) plateaus at ≈ 487; the latent, same width, memorizes to ≈ 38."),
+    (CORAL, "A param-matched GPT is more efficient",
+     "The 44.7M same-params GPT reaches ≈ 2; the latent floors at ≈ 38 — the 192-d thought bottleneck caps exact reconstruction — and only at 4× the batch."),
     (AMBER, "The SSL cost is visible",
-     "Under the full A→E curriculum the latent model sits at 936: self-supervision trades page-fit for generalization."),
+     "Under the full A→E curriculum the latent model sits at ≈ 957: self-supervision trades page-fit for generalization."),
 ]
 ty = 2.46; trh = 1.16
 for i,(col,h,b) in enumerate(takes):
@@ -585,7 +593,7 @@ for i,(col,h,b) in enumerate(takes):
 # honest-read strip under the chart (one line)
 by = imgy + img_h + 0.2
 text(s, imgx, by, img_w+0.2, 0.3, [[
-    ("Chance ≈ 50,262.  ", dict(size=10, color=FAINT, bold=True, font=BODY)),
+    ("Chance ≈ 50,257.  ", dict(size=10, color=FAINT, bold=True, font=BODY)),
     ("One-page memorization isn't the goal — the payoff shows only at scale.",
      dict(size=10, color=FAINT, italic=True, font=BODY))]], line=1.1)
 pagenum(s, 8, "Baseline Comparison")

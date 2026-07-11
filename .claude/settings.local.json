@@ -49,7 +49,10 @@
       "Bash(../.venv/bin/python train_scaled.py --preset small --cache chunk_cache_shakedown --device mps --batch-size 4 --num-workers 2 --stage-steps 4,4,4,4,6,0 --log-every 2 --checkpoint-every 10 --out runs/shakedown_small)",
       "Bash(echo \"EXIT: $?\")",
       "Bash(../.venv/bin/python -)",
-      "Bash(.venv/bin/python build_deck.py)"
+      "Bash(.venv/bin/python build_deck.py)",
+      "Bash(../.venv/bin/python data_prep.py --offline --preset smoke --docs 300 --out __TRACKED_VAR__/cc)",
+      "Bash(.venv/bin/python files/train_scaled.py --preset smoke --cache __TRACKED_VAR__/chunk_cache_test --device cpu --batch-size 4 --stage-steps 2,2,2,2,2,0 --log-every 2 --num-workers 0 --out __TRACKED_VAR__/runs_test2)",
+      "Bash(rm -rf /tmp/sm_cache /tmp/sm_run /tmp/sh_run; echo cleaned)"
     ]
   }
 }

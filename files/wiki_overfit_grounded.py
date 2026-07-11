@@ -4,9 +4,11 @@ wiki_overfit_grounded.py
 The latent side of the baseline comparison (notes §13.2/§13.3): can the
 latent-thought architecture memorize a single Wikipedia page, and how fast?
 
-This is the *decisive* grounded-only test: the HRM loop + un-detached gestalt
-memory reconstruction path ONLY -- no SSL, no ACT, no input lanes, no curriculum
--- so the measurement is the architecture's raw capacity to fit the page. The
+This is the *decisive* grounded-only test: the reconstruction/autoencoder codec
+path ONLY -- encode a chunk, decode that same chunk with the Talker (no HRM loop,
+no memory, no SSL/ACT/lanes/curriculum), the post-§27 reconstruction anchor
+(model.forward_grounded) -- so the measurement is the architecture's raw capacity
+to fit the page through the 192-d thought bottleneck. The
 optimizer/schedule/batch/step-budget are IDENTICAL to baseline_gpt.py (AdamW,
 warmup 100 -> cosine to 0.1x over 1500 steps, batch 4), so the comparison plot's
 "same optimizer, schedule, batch; only the architecture differs" claim holds
@@ -33,7 +35,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from config import model_config
-from model import LatentThoughtModel, StageFlags, SELF
+from model import LatentThoughtModel
 from gestalt_memory import GestaltMemoryBank
 from data import CachedChunkDataset, collate_chunked
 from losses import grounded_nll_loss
@@ -42,11 +44,6 @@ from baseline_gpt import lr_at   # shared warmup->cosine schedule, so "same sche
 
 CACHE = os.path.join(PROJECT, "wiki_cache")
 OUT = os.path.join(PROJECT, "runs", "wiki_overfit_grounded")
-
-# Grounded-only flags: the Stage-C reconstruction path, held fixed for the whole
-# run (no SSL/ACT/lanes, memory un-detached with a full grad window).
-GROUNDED = StageFlags(use_hrm_loop=True, detach_memory=False, inner_loop_grad_window=5,
-                      memory_grad_window=5, use_act=False, use_input_lanes=False)
 
 
 def pick_device() -> str:
@@ -60,26 +57,23 @@ def pick_device() -> str:
 @torch.no_grad()
 def page_ppl(model, ds, cfg, device) -> tuple[float, float]:
     """Token-weighted teacher-forced reconstruction NLL over every doc in the
-    page (same accumulation as generate.score / baseline_gpt.eval_ppl, so the
-    number is directly comparable to the GPT baselines)."""
+    page. Pure autoencoder codec -- encode a chunk, decode that SAME chunk with
+    the Talker from an EMPTY memory, NO HRM loop -- exactly what the current
+    model.forward_grounded / generate.score do (notes §27), so the number is
+    directly comparable to the GPT baselines and to the run's val_loss."""
     model.eval()
     tot_nll, n_tok = 0.0, 0
     for i in range(len(ds)):
         ct, cm, _, _ = ds[i]
         ct = ct.unsqueeze(0).to(device)          # (1, C, L)
         cm = cm.unsqueeze(0).to(device)
-        memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
-        h_state = l_state = None
         for t in range(ct.shape[1]):
             if not bool(cm[0, t]):
                 continue
             chunk_ids = ct[:, t, :]
             latent = model.chunk_encoder(chunk_ids, chunk_ids != 0)
-            h_state, _ = model.hrm_loop(latent, memory, None, h_state=h_state, l_state=l_state,
-                                        grad_window=5, use_act=False)
-            l_state = h_state
-            memory.write(h_state.detach(), SELF)   # write before decode (matches training)
-            logits = model.talker(chunk_ids, h_state, memory)
+            empty_mem = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
+            logits = model.talker(chunk_ids, latent, empty_mem)
             k = int((chunk_ids != 0).sum())
             if k == 0:
                 continue
@@ -97,9 +91,9 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--out", default=OUT)
     ap.add_argument("--full-bptt", action="store_true",
-                    help="DIAGNOSTIC: reproduce the pre-C5 (§11.1) no-op truncation -- the inner "
-                         "loop keeps the whole document's raw h/l chain in-graph (full-document "
-                         "BPTT). Tests whether the original §13.2 '->1.0' depended on that bug.")
+                    help="DIAGNOSTIC (now MOOT post-§27): patched the inner-loop truncation, but "
+                         "reconstruction no longer runs the HRM loop -- so this flag is inert here. "
+                         "Kept only so old invocations don't error. Use train_scaled for loop paths.")
     ap.add_argument("--talker-copy", action="store_true",
                     help="DIAGNOSTIC: reproduce the pre-C1 (§1.2) Talker copy bug (no right shift), "
                          "which drives NLL->0 / ppl->1.0 by copying the target instead of using the "
@@ -167,10 +161,12 @@ def main():
             it = iter(loader)
             batch = next(it)
         ct, cm, ri, rm = (t.to(device) for t in batch)
-        memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
-        nll, ponder, _ = model.forward_grounded(ct, cm, ri, rm, memory, SELF, GROUNDED, 0.0)
+        # Current reconstruction is a pure autoencoder codec (encoder -> Talker,
+        # no loop, no memory), notes §27: forward_grounded now takes just
+        # (chunk_tensor, chunk_mask) and returns the reconstruction NLL.
+        nll = model.forward_grounded(ct, cm)
         opt.zero_grad(set_to_none=True)
-        (nll + ponder).backward()
+        nll.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         if step % LOG == 0:

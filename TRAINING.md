@@ -33,7 +33,9 @@ gpt2 quality at this scale — that's expected; the goal is a healthy, non-colla
 Follow [`STRIX_HALO.md`](STRIX_HALO.md) first for the ROCm/GPU PyTorch install. Then you need: the GPU
 box (AMD ROCm shows up as "cuda", which is normal) with a GPU PyTorch build + `datasets transformers
 matplotlib`; the local gpt2 tokenizer at `gpt2_tok/`; ~10-15 GB disk for the cache (it also loads fully
-into RAM at train start, with ~2x that transiently while shards concatenate).
+into RAM at train start, with ~2x that transiently while shards concatenate). Budget disk for
+checkpoints too: each snapshot (model + AdamW moments + EMA) is ~2 GB at `small`, and
+`--archive-every 5000` keeps them all — tens of GB over a long run.
 
 ```bash
 export PROJECT=/path/to/ucsc          # edit to your path
@@ -60,10 +62,15 @@ If `GPU visible` is `False` on the GPU box, stop and fix PyTorch/ROCm (`STRIX_HA
 
 ```bash
 python rocm_smoke.py --preset small
-# [3] autoencoder loss finite: True ...   [4] on-loop SSL (loop+memory) finite: True ...
-# [5] ACT (loop) loss finite: True ...    [6] eval-mode (fused) val path finite: True ...
+# [3] autoencoder loss finite: True ... grads finite: True
+# [4] on-loop SSL (loop+memory) finite: True ... grads finite: True
+# [5] ACT (loop) loss finite: True ... grads finite: True
+# [6] eval-mode (fused) val path finite: True ...
 # PASS: ...
 ```
+
+(Checks [3]-[5] verify the **gradients** too, not just the loss — the sequential loop's
+*backward* kernels are the untested ROCm/bf16 path, and a backward NaN leaves the loss finite.)
 
 If it ends `FAIL:`, do not train — note which `[n]` failed and see Troubleshooting.
 
@@ -76,9 +83,13 @@ python bench_throughput.py --preset small --batch-size 16,32,64,128 --amp --toke
 Pick the largest batch whose `peak GB` fits with ~20% headroom; note its `budget ETA`. The expensive
 path is the **sequential predictor loop**, so this times a full step. Call your chosen batch `BATCH`.
 
-After the cache is prepped (§3), re-check the ETA with the cache's *actual* non-pad fraction —
-the 2026-07-10 chunker fix packs chunks near the cap, so fill is meaningfully higher than the
-old 0.6 guess:
+After the cache is prepped (§3), re-check the ETA with the cache's *actual* non-pad fraction.
+Expect roughly **0.4-0.5** on prose (measured 0.38-0.47 with the post-fix chunker): chunks are
+sentence-granularity, so most sit well under the 64-token cap — the old "0.6" guess was
+optimistic, and more fill means fewer real tokens per step than the bench assumed. The snippet
+below computes the true number from the manifest; trust it over any guess. (The bench ETA is
+also mildly *pessimistic* on the other side: it charges every step at full Stage-C/E cost,
+while Stage A — ~1/6 of the plan — runs the cheap codec only.)
 
 ```bash
 python - <<'PY'
@@ -124,11 +135,12 @@ python - <<'PY'
 import json, os
 m=json.load(open(os.path.join(os.path.dirname(os.getcwd()),"chunk_cache","manifest.json")))
 ex=m["total"]; B=int(os.environ["BATCH"]); total=max(5,ex//B); unit=max(1,total//6)
-print(f"--stage-steps {unit},{unit},{unit},{unit},{2*unit},0")
+print(f"export STAGE_STEPS={unit},{unit},{unit},{unit},{2*unit},0")
 PY
 ```
 
-Copy the printed value as `STAGE_STEPS`. Multiply all numbers by N for N epochs (more is better).
+Run the printed `export` line (the later commands read `$STAGE_STEPS`). Multiply all numbers by N
+for N epochs (more is better).
 
 ---
 
@@ -148,7 +160,7 @@ Then the real run (background, survives disconnects):
 cd "$PROJECT/files"
 nohup python train_scaled.py \
   --preset small --cache chunk_cache --device cuda --amp --amp-dtype bf16 \
-  --batch-size BATCH --stage-steps STAGE_STEPS \
+  --batch-size "$BATCH" --stage-steps "$STAGE_STEPS" \
   --num-workers 8 --log-every 50 --checkpoint-every 1000 --archive-every 5000 \
   --out runs/scaled > train.log 2>&1 &
 ```
@@ -192,7 +204,7 @@ checkpointed — the continuation is statistically equivalent, not sample-exact)
 
 ```bash
 nohup python train_scaled.py --preset small --cache chunk_cache --device cuda --amp --amp-dtype bf16 \
-  --batch-size BATCH --stage-steps STAGE_STEPS \
+  --batch-size "$BATCH" --stage-steps "$STAGE_STEPS" \
   --num-workers 8 --log-every 50 --checkpoint-every 1000 --archive-every 5000 \
   --out runs/scaled --resume "$PROJECT/runs/scaled/checkpoint.pt" >> train.log 2>&1 &
 ```
@@ -226,6 +238,7 @@ trends down with no rise at the Stage-B band, and `latent_std` holds/rises.
 | `cache/model mismatch` at start | Cache prepped with a different `--preset` than training — match them. |
 | `cache inconsistent: manifest says X but shards hold Y` | Re-prepped into an existing dir — delete the folder and prep fresh. |
 | OOM at start | Lower `--batch-size`; keep the effective batch with `--grad-accum N`. |
+| `WARNING: non-finite grad norm ... skipping optimizer step` | A NaN/Inf gradient appeared; the trainer skips that step so weights stay finite (one-off spikes are survivable). It hard-fails after 25 consecutive — if that happens, the run is numerically dead: check the last checkpoint, re-run `rocm_smoke.py`, consider a lower LR or no `--amp`. |
 | **`val_loss` rises at Stage B + `ssl`→0 + `lstd` craters** | **Latent collapse.** Lower `--ssl-weight` (from 1.0 toward 0.5) and relaunch from the last healthy `--archive-every` snapshot. Re-tuning at scale is expected. |
 | `WARNING: resume schedule differs` | Make the resume flags identical to the launch (`--stage-steps`, `--batch-size`, `--lr`). |
 | Everything `nan` from step 1 | Re-run `rocm_smoke.py`; try without `--amp` to isolate; report which stage it first appears in. |

@@ -34,11 +34,13 @@ def scaled_cosine_loss(pred: torch.Tensor, target: torch.Tensor, k: float = 4.0)
 
 
 def grounded_nll_loss(logits: torch.Tensor, targets: torch.Tensor,
-                       target_mask: torch.Tensor, pad_token_id: int = 0) -> torch.Tensor:
+                       target_mask: torch.Tensor) -> torch.Tensor:
     """
     logits:  (batch, chunk_len, vocab_size)
     targets: (batch, chunk_len) ground-truth token ids for this chunk
-    target_mask: (batch, chunk_len) bool, True where a real (non-pad) token
+    target_mask: (batch, chunk_len) bool, True where the position is supervised
+        (the caller decides: real tokens, plus the end-of-chunk PAD position in
+        model.forward_grounded).
     """
     vocab_size = logits.shape[-1]
     loss_per_token = F.cross_entropy(

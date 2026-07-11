@@ -110,3 +110,13 @@ Size presets (`config.MODEL_PRESETS`): `smoke` (~43M) → `small` (512-d, ~152M)
   it**), an ACT ponder/halt fix for ended documents, a resume dataset-fingerprint guard, and a
   bit-exact pad-row encoder skip (~30-45% off both encoder passes); see `notes.md` for the full
   list and the flagged-not-changed items.
+- A third review (2026-07-11, four independent adversarial audits) again found the A→E training
+  semantics clean and landed run-robustness + data-quality fixes: a **non-finite gradient guard**
+  in the trainer (a single NaN grad no longer destroys all weights via the global clip norm — the
+  step is skipped, with a hard-fail after 25 consecutive), a **splitter-fragment merge** in the
+  chunker ('Dr.'/'2.'-style 1-3-token chunks: 17% of the old cache → 0.3%) and a
+  character-boundary hard fallback (no more U+FFFD corruption or over-cap chunks on unicode) —
+  **re-prep any cache built before it (again)** — an aligned input-lane raw window, a
+  generation-path fix (no double loop pass on the last prompt chunk), gradient-finiteness gates
+  in `rocm_smoke.py` [4]/[5], and a `bench_throughput.py` step that mirrors the real trainer.
+  Details in `notes.md`.

@@ -74,6 +74,24 @@ class Curriculum:
         self.stage_idx = 0
         self.step_in_stage = 0
         self.detector = PlateauDetector(train_cfg.plateau_patience, train_cfg.plateau_min_delta)
+        self._skip_zero_budget_stages()
+
+    def _skip_zero_budget_stages(self) -> None:
+        """
+        Under fixed-budget gating, a stage whose budget is 0 should be SKIPPED,
+        not trained for one stray step: advance_step increments step_in_stage
+        before checking the budget, and the trainer reads the stage's flags at
+        the top of the loop -- so without this, `--stage-steps 0,...` (e.g.
+        "relaunch skipping A") silently trained one step under the skipped
+        stage's flags. The last stage (F, budget 0 by convention) is exempt;
+        the trainer breaks on reaching it.
+        """
+        stage_steps = getattr(self.train_cfg, "stage_steps", None)
+        if stage_steps is None:
+            return
+        while not self.is_last_stage() and stage_steps[self.stage_idx] == 0:
+            self.stage_idx += 1
+            self.step_in_stage = 0
 
     @property
     def stage(self) -> Stage:
@@ -105,6 +123,7 @@ class Curriculum:
                 self.stage_idx += 1
                 self.step_in_stage = 0
                 self.detector.reset()
+                self._skip_zero_budget_stages()
                 return True
             return False
 
@@ -123,11 +142,19 @@ class Curriculum:
         return False
 
     def state_dict(self):
-        return {"stage_idx": self.stage_idx, "step_in_stage": self.step_in_stage}
+        # The plateau detector is part of the gating state: without it a
+        # resumed plateau-gated run resets _best/_stale_checks and delays the
+        # next transition. (Fixed-budget runs never consult it.)
+        return {"stage_idx": self.stage_idx, "step_in_stage": self.step_in_stage,
+                "plateau_best": self.detector._best,
+                "plateau_stale": self.detector._stale_checks}
 
     def load_state_dict(self, sd):
         self.stage_idx = sd["stage_idx"]
         self.step_in_stage = sd["step_in_stage"]
+        # .get: checkpoints from before these keys existed resume fine.
+        self.detector._best = sd.get("plateau_best", float("inf"))
+        self.detector._stale_checks = sd.get("plateau_stale", 0)
 
     def _stage_budget(self) -> int:
         """

@@ -254,17 +254,31 @@ def chunk_text_example(text: str, chunker, window: int):
     what can actually be kept (max_chunks_per_doc * max_chunk_len tokens, at a
     conservative 8 chars/token). Without this, a long document (e.g. a PG-19
     book) is SaT-segmented and tokenized in FULL -- typically 10-100x more work
-    than the ~2k tokens that survive -- and, worse, `encode_recent` would take
-    the input-lane window from the *end* of the document, text entirely
-    disjoint from the kept chunks. After truncation the raw window comes from
-    the tail of the kept region, i.e. text the chunks actually cover.
+    than the ~2k tokens that survive.
+
+    The input-lane raw window is the trailing `window` token ids of the KEPT
+    chunks, so it covers text the chunks actually contain *by construction*.
+    (The old form -- `chunker.encode_recent` on the truncated text's tail --
+    was disjoint from the kept chunks for any document longer than the chunk
+    capacity: the 8-chars/token budget deliberately overshoots what
+    max_chunks_per_doc can hold, so the text tail lay beyond the last kept
+    chunk. Measured 0% overlap on 8k+-char docs. raw_ids/raw_mask are unused
+    in Stages A-E -- input lanes are Stage F -- but the cache should not bake
+    in a window that violates its own contract.)
     """
     max_chars = getattr(chunker, "max_chunks_per_doc", 0) * getattr(chunker, "max_chunk_len", 0) * 8
     if max_chars and len(text) > max_chars:
         text = text[:max_chars]
     chunk_tensor, chunk_mask = chunker.chunk_batch([text])       # (1, C, L), (1, C)
-    raw_ids, raw_mask = chunker.encode_recent([text], window)     # (1, W), (1, W)
-    return chunk_tensor[0], chunk_mask[0], raw_ids[0], raw_mask[0]
+    kept = chunk_tensor[0][chunk_mask[0]]                         # (n_kept, L), doc order
+    flat = kept[kept != PAD]                                      # 1-D real ids, doc order
+    tail = flat[-window:]
+    raw_ids = torch.full((window,), PAD, dtype=torch.long)
+    raw_mask = torch.zeros(window, dtype=torch.bool)
+    if tail.numel():
+        raw_ids[: tail.numel()] = tail
+        raw_mask[: tail.numel()] = True
+    return chunk_tensor[0], chunk_mask[0], raw_ids, raw_mask
 
 
 class DocumentChunkDataset(IterableDataset):

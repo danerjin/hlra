@@ -93,6 +93,7 @@ class SegmentAnyTextChunker:
         max_chunks_per_doc: int,
         pad_token_id: int = 0,
         fallback_punctuation: Sequence[str] = DEFAULT_FALLBACK_PUNCTUATION,
+        min_chunk_tokens: int = 4,
     ):
         self.sat_model = sat_model
         self.tokenizer = tokenizer
@@ -100,6 +101,9 @@ class SegmentAnyTextChunker:
         self.max_chunks_per_doc = max_chunks_per_doc
         self.pad_token_id = pad_token_id
         self.fallback_punctuation = fallback_punctuation
+        # Splitter-artifact repair (see chunk_document): "sentences" shorter
+        # than this many tokens are glued to their neighbor before capping.
+        self.min_chunk_tokens = min_chunk_tokens
 
     def _cap_span(self, span: str, punct_idx: int = 0) -> List[str]:
         """
@@ -133,6 +137,12 @@ class SegmentAnyTextChunker:
             chunks: List[str] = []
             cur = ""
             for piece in pieces:
+                if cur and not cur.strip():
+                    # Never DROP a whitespace-only accumulator (it would break
+                    # the verbatim-concatenation property): fold it into the
+                    # piece that follows it instead.
+                    piece = cur + piece
+                    cur = ""
                 if len(self.tokenizer.encode(piece, add_special_tokens=False)) > self.max_chunk_len:
                     # This piece alone exceeds the cap: flush and recurse on it
                     # with the next-finer delimiters only (this one is used up).
@@ -151,18 +161,63 @@ class SegmentAnyTextChunker:
                     cur = tentative
             if cur.strip():
                 chunks.append(cur)
+            elif cur and chunks and len(self.tokenizer.encode(chunks[-1] + cur,
+                                                              add_special_tokens=False)) <= self.max_chunk_len:
+                # Trailing whitespace stays attached -- but only if the merged
+                # chunk still re-encodes within the cap (BPE can grow by one).
+                chunks[-1] = chunks[-1] + cur
             return [c for c in chunks if c.strip()]
 
-        # No punctuation left to split on: hard token-count fallback so we
-        # never emit a span longer than max_chunk_len, no matter what.
-        return [
-            self.tokenizer.decode(ids[i : i + self.max_chunk_len])
-            for i in range(0, len(ids), self.max_chunk_len)
-        ]
+        # No punctuation left to split on: hard fallback so we never emit a
+        # span longer than max_chunk_len, no matter what. Split on a CHARACTER
+        # boundary and recurse (binary split until every piece fits). The old
+        # form -- decode(ids[i:i+L]) windows -- sliced the id stream, which is
+        # NOT length-stable or lossless under byte-level BPE: a window edge
+        # can split a multi-byte character, yielding U+FFFD corruption and
+        # decoded windows that re-encode past the cap (verified on CJK/emoji
+        # runs). A character split can neither corrupt text nor change total
+        # bytes, and the cap check at the top of this method guarantees
+        # termination (each half re-enters with strictly fewer characters).
+        if len(span) < 2:
+            return [span] if span.strip() else []
+        mid = len(span) // 2
+        return self._cap_span(span[:mid], punct_idx) + self._cap_span(span[mid:], punct_idx)
+
+    def _merge_splitter_fragments(self, sentences: List[str]) -> List[str]:
+        """
+        Glue degenerate splitter fragments to their neighbor before capping.
+
+        A sentence-boundary *stub* (RegexSentenceSegmenter splits after any
+        [.!?]+whitespace) emits abbreviations and list markers as standalone
+        "sentences" -- 'Dr.', 'on Jan.', '2.' -- which then become 1-3-token
+        chunks: degenerate thoughts that burn chunk slots and pollute the
+        SSL prediction targets (measured 11% of chunks <=3 tokens on
+        list/abbreviation-heavy text; ~53% on numbered lists). A real SaT
+        model would not produce these boundaries, so merging them is a repair
+        of the stub's approximation, not a change of chunk granularity:
+        anything already >= min_chunk_tokens is left exactly as split.
+        """
+        if self.min_chunk_tokens <= 1:
+            return sentences
+        merged: List[str] = []
+        counts: List[int] = []
+        for s in sentences:
+            if merged and counts[-1] < self.min_chunk_tokens:
+                merged[-1] = merged[-1] + " " + s
+                counts[-1] = len(self.tokenizer.encode(merged[-1], add_special_tokens=False))
+            else:
+                merged.append(s)
+                counts.append(len(self.tokenizer.encode(s, add_special_tokens=False)))
+        # A trailing fragment has no successor: glue it backward instead.
+        if len(merged) >= 2 and counts[-1] < self.min_chunk_tokens:
+            tail = merged.pop()
+            merged[-1] = merged[-1] + " " + tail   # may exceed the cap; _cap_span handles it
+        return merged
 
     def chunk_document(self, text: str) -> List[str]:
         """SaT sentence split, then cap every sentence to `max_chunk_len` tokens."""
         sentences = self.sat_model.split(text)
+        sentences = self._merge_splitter_fragments(sentences)
         capped_spans: List[str] = []
         for sentence in sentences:
             capped_spans.extend(self._cap_span(sentence))

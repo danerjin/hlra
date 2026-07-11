@@ -2,12 +2,17 @@
 gestalt_memory.py
 =================
 The persistent gestalt memory (§1.2, §3.6, §4.2): a fixed-capacity FIFO bank
-of finished thought vectors. Two readers cross-attend into it: the next
-thought's inner HRM loop, and the Talker. Writes are *not* detached by
-default -- gradient from a later thought's loss is allowed to reach back
-into the state that produced an earlier thought, subject to truncation
-(handled by the caller via `utils.truncate_gradient_window`, applied to the
-list of stored vectors before each cross-attention read).
+of finished thought vectors, read by cross-attention from the inner HRM loop
+(the predictive branch's reader -- the one that trains). The Talker also
+holds a `GestaltCrossAttentionReader`, but since the §27 restructure the
+codec path always hands it an EMPTY bank (reconstruction conditions on the
+chunk's own latent only), so that reader is untrained dead weight kept for
+checkpoint compatibility -- do not wire a populated bank into the Talker
+without training it first. Writes are *not* detached by default -- gradient
+from a later thought's loss is allowed to reach back into the state that
+produced an earlier thought, subject to truncation (handled by the caller
+via `utils.truncate_gradient_window`, applied to the list of stored vectors
+before each cross-attention read).
 
 Role tags (§4.2): every slot also carries a role id (USER / SELF / SYSTEM)
 so that cross-attention can learn source-dependent weighting instead of

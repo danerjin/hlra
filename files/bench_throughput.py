@@ -104,23 +104,29 @@ def main():
     print(f"device={device}  preset={args.preset}({n_params/1e6:.0f}M)  stage={args.stage}  "
           f"amp={args.amp_dtype if amp_on else 'off'}  chunks/doc={N} chunk_len={L}")
     print(f"{'batch':>6} {'step s':>9} {'dense tok/s':>13} {'real tok/s':>12} {'peak GB':>9} "
-          f"{'ETA @'+str(int(args.token_budget/1e9))+'B (days)':>18}")
+          f"{'ETA @'+f'{args.token_budget/1e9:g}'+'B (days)':>18}")
 
     def run_step(batch_data):
         ct, cm, ri, rm = batch_data
         opt.zero_grad(set_to_none=True)
         memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
         with autocast:
-            # Full step: cheap autoencoder anchor + the SEQUENTIAL on-loop SSL
+            # Full step, mirroring trainer._loss_on exactly: ONE shared online
+            # encoder pass reused by both branches (omitting chunk_vecs= here
+            # double-ran the encoder fwd+bwd and inflated step time & peak GB),
+            # then the cheap autoencoder anchor + the SEQUENTIAL on-loop SSL
             # (the loop reading/writing memory) -- the latter dominates cost.
-            nll = model.forward_grounded(ct, cm)
+            chunk_vecs = model.encode_chunks(ct)
+            nll = model.forward_grounded(ct, cm, chunk_vecs=chunk_vecs)
             ssl, ponder = model.forward_self_supervised(
                 ct, cm, ri, rm, memory, SELF, flags, ema,
-                cos_weight=1.0, var_weight=2.0, ponder_weight=cfg.act_ponder_cost)
+                cos_weight=1.0, var_weight=2.0, ponder_weight=cfg.act_ponder_cost,
+                chunk_vecs=chunk_vecs)
             loss = nll + ssl + ponder
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
+        ema.update(model.chunk_encoder)   # part of every real optimizer step
 
     for B in batches:
         try:

@@ -58,9 +58,15 @@ def pick_device() -> str:
 def page_ppl(model, ds, cfg, device) -> tuple[float, float]:
     """Token-weighted teacher-forced reconstruction NLL over every doc in the
     page. Pure autoencoder codec -- encode a chunk, decode that SAME chunk with
-    the Talker from an EMPTY memory, NO HRM loop -- exactly what the current
-    model.forward_grounded / generate.score do (notes §27), so the number is
-    directly comparable to the GPT baselines and to the run's val_loss."""
+    the Talker from an EMPTY memory, NO HRM loop -- the same computation as
+    model.forward_grounded / generate.score EXCEPT the loss mask: this masks
+    only real tokens (`id != 0`), while forward_grounded also supervises the
+    end-of-chunk PAD position of every shorter-than-max chunk. Omitting the
+    EOS term sits ~0.2 nats BELOW val_loss/--score on the same text (measured
+    on the shipped checkpoint: 6.166 vs 6.366) -- do NOT eyeball this number
+    against the run's val_loss without that offset in mind. It is kept mask-
+    matched to the GPT baselines (which have no EOS supervision either), so
+    the baseline comparison itself stays apples-to-apples."""
     model.eval()
     tot_nll, n_tok = 0.0, 0
     for i in range(len(ds)):

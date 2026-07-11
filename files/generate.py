@@ -7,11 +7,12 @@ and output text. Two things happen, matching the architecture:
   1. READ  -- the prompt is chunked, each chunk encoded to a latent and run
      through the HRM inner loop, building up the gestalt memory and the running
      H-state ("thought"). This is the model reading the prompt as self-content.
-  2. GENERATE -- for each new chunk: predict the next latent in encoder space
-     (gen_predictor; notes §15.1), form the next thought via the HRM loop, and let the
-     Talker autoregressively decode tokens for that thought (conditioned on the
-     thought + gestalt memory). The generated chunk is re-encoded to a latent to
-     seed the next step. Decoded to text with the gpt2 tokenizer.
+  2. GENERATE -- for each new chunk: read the next chunk's ENCODER-space latent
+     off the current thought via pred_head (the same map the SSL objective
+     trains), rescale it onto the encoder-latent norm shell, and let the codec
+     Talker autoregressively decode it (empty memory -- the autoencoder codec's
+     training convention). The generated chunk is re-encoded and run through the
+     HRM loop to form the next thought. Decoded to text with the gpt2 tokenizer.
 
 NOTE: the shipped checkpoint is a tiny smoke model (~1.5M tokens); output will
 NOT be coherent. This script demonstrates the *inference path*, not quality.
@@ -98,6 +99,10 @@ def read_prompt(model, chunker, cfg, prompt):
     """Chunk + encode the prompt, running the HRM loop to build up its gestalt
     memory (so the loop can reason forward from it). Returns (memory, h, l, last_latent)."""
     ct, cm = chunker.chunk_batch([prompt])           # (1, C, L)
+    if bool(cm[0].all()):
+        print(f"[generate] NOTE: input filled all {cfg.max_chunks_per_doc} chunk slots "
+              f"(~{cfg.max_chunks_per_doc * cfg.max_chunk_len} tokens); any text beyond "
+              f"that was silently dropped (chunker keeps the head).")
     memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
     h_state = l_state = last_latent = None
     for t in range(ct.shape[1]):
@@ -149,14 +154,21 @@ def generate(model, chunker, cfg, prompt, n_chunks=3, temperature=0.9, greedy=Fa
     tok = chunker.tokenizer
     memory, h_state, l_state, last_latent = read_prompt(model, chunker, cfg, prompt)
     out_chunks = []
-    for _ in range(n_chunks):
+    for i in range(n_chunks):
         # The HRM loop predicts the next chunk's ENCODER-space latent, reading its
         # accumulating gestalt memory; the codec Talker then decodes that predicted
         # latent (same encoder space the Talker was trained on, notes §27).
-        pred_latent, h_state = model.predict_next_latent(last_latent, memory, h_state=h_state,
-                                                         l_state=l_state, grad_window=5, use_act=False)
-        l_state = h_state
-        memory.write(h_state.detach(), SELF)   # write the thought (loop state) to memory
+        # First continuation chunk: read_prompt ALREADY ran the loop on the last
+        # prompt chunk and wrote its thought, so read pred_head straight off that
+        # state (training's pred_head(h_t) -> chunk t+1). Re-running the loop here
+        # ingested the same chunk twice and wrote a duplicate thought to memory.
+        reuse = i == 0 and h_state is not None
+        pred_latent, h_new = model.predict_next_latent(last_latent, memory, h_state=h_state,
+                                                       l_state=l_state, grad_window=5,
+                                                       use_act=False, reuse_thought=reuse)
+        if not reuse:
+            h_state = l_state = h_new
+            memory.write(h_new.detach(), SELF)   # write the thought (loop state) to memory
         ids = talker_decode(model, pred_latent, cfg, temperature, greedy)
         # re-encode the produced chunk to seed the next step
         gen = torch.zeros(1, cfg.max_chunk_len, dtype=torch.long)
@@ -175,6 +187,12 @@ def score(model, chunker, cfg, text):
     a hand-rolled loop that masked only `id != 0` under-counted by ~0.4 nats and
     was NOT val_loss-comparable). No HRM loop is involved."""
     ct, cm = chunker.chunk_batch([text])
+    if not bool(cm.any()):
+        raise SystemExit("[generate] --score: text produced no chunks (empty/whitespace "
+                         "input) -- nothing to score.")
+    if bool(cm[0].all()):
+        print(f"[generate] NOTE: text filled all {cfg.max_chunks_per_doc} chunk slots; "
+              f"only the first ~{cfg.max_chunks_per_doc * cfg.max_chunk_len} tokens are scored.")
     avg = float(model.forward_grounded(ct, cm))
     return avg, math.exp(min(avg, 20))
 

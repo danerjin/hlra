@@ -52,9 +52,13 @@ class TalkerDecoderLayer(nn.Module):
 
 class Talker(nn.Module):
     """
-    Autoregressively reconstructs a chunk's tokens from its finished thought
-    vector, cross-attending both to the thought itself and to the
-    persistent gestalt memory (for coreference / long-range grounding, §1.2).
+    Autoregressively reconstructs a chunk's tokens from a latent, cross-
+    attending to the latent plus a memory readout slot. NOTE (§27): every
+    live caller -- forward_grounded, generate.talker_decode -- passes an
+    EMPTY memory bank (the codec conditions purely on the chunk's own
+    latent), so `memory_reader` receives no gradient and its readout is a
+    constant zero. It is kept so existing checkpoints load and as the hook
+    for a future memory-conditioned decoding experiment; it is NOT trained.
     """
 
     def __init__(self, vocab_size: int, d_model: int, n_heads: int, d_ff: int,

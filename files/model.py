@@ -294,12 +294,21 @@ class LatentThoughtModel(nn.Module):
 
     @torch.no_grad()
     def predict_next_latent(self, latent, memory, h_state=None, l_state=None,
-                             grad_window: int = 5, use_act: bool = False):
+                             grad_window: int = 5, use_act: bool = False,
+                             reuse_thought: bool = False):
         """
         Inference-time next-latent prediction (generate.py): run the inner loop on
         `latent` and read the next latent off the finished thought via pred_head
         (the same map forward_self_supervised trains). Returns (pred_latent,
         thought); the thought is the carried loop state.
+
+        `reuse_thought=True` skips the loop pass and reads pred_head directly off
+        the caller's `h_state` -- for the case where the loop has ALREADY run on
+        `latent` (generate.read_prompt runs it on every prompt chunk, including
+        the last). Re-running it would ingest the same chunk twice from a state
+        that already contains it, reading a memory holding its own thought -- a
+        configuration training never produces. This matches the training
+        convention pred_head(h_t) -> chunk t+1 exactly.
 
         The SSL loss is a scaled COSINE (scale-invariant), so pred_head learns the
         target's direction but its output norm is unconstrained (measured ~0.6x the
@@ -310,8 +319,11 @@ class LatentThoughtModel(nn.Module):
         and the incoming `latent`'s own norm is the right target (fall back to
         sqrt(d) if the caller passed a zero vector, e.g. an empty prompt).
         """
-        h, _ = self.hrm_loop(latent, memory, None, h_state=h_state, l_state=l_state,
-                              grad_window=grad_window, use_act=use_act)
+        if reuse_thought and h_state is not None:
+            h = h_state
+        else:
+            h, _ = self.hrm_loop(latent, memory, None, h_state=h_state, l_state=l_state,
+                                  grad_window=grad_window, use_act=use_act)
         pred = self.pred_head(h)
         tgt_norm = latent.norm(dim=-1, keepdim=True)
         tgt_norm = torch.where(tgt_norm > 1e-3, tgt_norm,

@@ -86,11 +86,12 @@ the design doc. Three fixes landed, none touching the training path:
 Flagged, deliberately not changed:
 
 - **Stage F would leak the SSL target through the input lane.**
-  `encode_recent` takes the raw window from the document *tail*, so with
-  `use_input_lanes=True` the loop could cross-attend to chunk t+1's own tokens
-  while predicting it. Irrelevant to A→E (lanes off) and to real dialogue data
-  (the lane is the fixed user turn), but fix before training Stage F on
-  generic documents.
+  The raw window covers the *end* of the kept text (since the 2026-07-11
+  review it is the kept chunks' trailing ids, no longer `encode_recent` on the
+  doc tail — better aligned, same leak), so with `use_input_lanes=True` the
+  loop could cross-attend to chunk t+1's own tokens while predicting it.
+  Irrelevant to A→E (lanes off) and to real dialogue data (the lane is the
+  fixed user turn), but fix before training Stage F on generic documents.
 - `CachedChunkDataset` holds the whole cache in RAM (~10 GB at 1.2B tokens,
   ~2x transient at init). Fine on the 128 GB Linux box with fork workers;
   don't move the run to a spawn-based platform without rethinking it.
@@ -155,6 +156,103 @@ Flagged, deliberately not changed:
 - The `LATENT_USE_HF=1 train.py` mixture path likely needs `trust_remote_code` for pg19/
   RedPajama with modern `datasets` — not on the big-run path (data_prep uses `iter_hf_single`).
 
+## Third pre-flight review (2026-07-11, four independent adversarial audits)
+
+A third full pass before the big run: one audit each on gradient-routing/truncation, the
+trainer/LR/resume/AMP machinery, the data pipeline + chunker, and the inference/monitoring
+tooling — plus an offline A→F walk and a fixed-vs-resumed `train_scaled` equivalence re-check.
+**The A→E training-loss semantics came through clean for the third time** (routing matrix,
+truncation cuts at windows 0-6, ended-doc isolation, PAD supervision, SSL target alignment all
+re-verified empirically, down to float64 finite-difference checks on pred_head/halting-head
+gradients). Fixes landed, each verified; the offline A→F walk is *numerically identical*
+before/after (the training path is untouched on healthy steps):
+
+- **Trainer non-finite gradient guard (the important one for a multi-day run).**
+  `clip_grad_norm_` computes ONE global norm, so a single NaN/Inf grad element made the clip
+  coefficient NaN, scaled EVERY gradient to NaN, and one `optimizer.step()` destroyed all
+  weights — after which the run kept training and overwriting checkpoints with the corpse
+  (bf16 has no GradScaler to filter it; the §21.2 "grad-clip bounds the blast radius" argument
+  holds for finite spikes but *globalizes* non-finite ones). The trainer now checks the norm
+  it already computed: non-finite → skip the step (weights bit-unchanged, verified with
+  poisoned grads), warn, and hard-fail after 25 consecutive so an unattended run can't spin
+  dead. Healthy steps are bit-identical.
+- **Chunker: splitter-fragment merge (`min_chunk_tokens=4`).** The 2026-07-10 `_cap_span`
+  rewrite killed the capper's fragment spray, but the *regex sentence splitter* still emitted
+  abbreviations and list markers ('Dr.', 'on Jan.', '2.') as standalone 1-3-token chunks —
+  measured 53% of chunks ≤3 tokens on numbered lists, 11% on a realistic mix: degenerate
+  thoughts that burn chunk slots and pollute SSL targets across fineweb-edu. Tiny "sentences"
+  are now glued to their neighbor before capping (a repair of the stub splitter's
+  approximation — real SaT wouldn't produce these boundaries; sentences ≥4 tokens are
+  untouched). Post-fix realistic mix: ≤1-token 0.00% (old cache 9.09%), ≤3-token 0.28%
+  (17.18%), fill 0.31 → 0.38. **Prep the big-run cache with this chunker.**
+- **Chunker: character-boundary hard fallback.** The no-punctuation fallback sliced the token
+  *id* stream and decoded windows — not lossless under byte-level BPE: window edges split
+  multi-byte characters, yielding U+FFFD corruption (emoji/CJK) and windows that re-encode
+  past the cap (65 > 64, silently truncated in `chunk_batch`). Now splits on character
+  boundaries (binary split, recursing until every piece fits): verbatim round-trip, exact cap,
+  zero corruption on the CJK/emoji adversarial set. Whitespace-only accumulators are also no
+  longer dropped at flush boundaries (fold-forward; trailing whitespace attaches only if the
+  merged chunk still re-encodes within the cap).
+- **Input-lane raw window now comes from the kept chunks** (`chunk_text_example`): the old
+  `encode_recent`-on-truncated-text-tail was provably disjoint from the kept chunks for any
+  doc past the chunk capacity (the 8-chars/token budget deliberately overshoots; measured 0%
+  overlap on 8k+-char docs) — the cache baked in `raw_ids` that were noise. The window is now
+  the trailing `recent_token_window` ids of the kept chunks, aligned by construction. Inert
+  for A→E (lanes are Stage F), but the cache no longer violates its own contract. The Stage-F
+  SSL-target-leak flag from the first review still stands: the window covers the *last* kept
+  chunks, so a mid-doc prediction could still see its target through the lane — fix before
+  training Stage F on generic documents.
+- **Generation no longer runs the loop twice on the last prompt chunk.** `read_prompt` runs
+  the loop on every prompt chunk (writing each thought), then `generate()` ran
+  `predict_next_latent` on the last chunk's latent *again* — re-ingesting it from a state that
+  already contained it, reading a memory holding its own thought (a configuration training
+  never produces), and writing a duplicate thought carried for the whole continuation
+  (~15% state shift on a non-converged model). The first continuation chunk now reads
+  `pred_head` straight off the prompt's final thought (`reuse_thought=`), exactly the training
+  convention; loop passes happen only on re-encoded generated chunks.
+- **`rocm_smoke.py` checks [4]/[5] now verify gradient finiteness** (they gated on the loss
+  only, letting a backward-kernel NaN print PASS — and the sequential loop's *backward* is
+  precisely the untested ROCm/bf16 path). `bench_throughput.py` now mirrors the real trainer
+  step (shared `chunk_vecs` encoder pass — it was double-running the encoder — plus
+  `ema.update`), so step time and peak-GB read true.
+- **Curriculum:** a `0` entry in `--stage-steps` now *skips* the stage instead of training one
+  stray step under its flags; the plateau detector's state rides in the checkpoint (fixed-
+  budget runs never consult it; old checkpoints load fine). Trainer checkpoints now record
+  `stage_reached`; per-micro-batch `.item()` syncs only happen on log steps (three fewer
+  host-device syncs per step on a launch-overhead-bound workload).
+- **Docs/honesty:** TRAINING.md's launch/resume commands are now copy-pasteable
+  (`export STAGE_STEPS=...`, `"$BATCH"`) — they previously passed the literal string `BATCH`
+  and died in argparse inside `nohup`, visible only in train.log. Expected cache fill
+  corrected to ~0.4-0.5 (the ">0.6" guess was wrong — sentence-granularity chunks sit under
+  the cap; the manifest snippet computes the true number). `wiki_overfit_grounded.page_ppl`'s
+  "exactly val_loss-comparable" claim was false (it omits the end-of-chunk PAD supervision:
+  measured 0.20 nats / ~20% ppl below `--score` on the same text) — docstring now states the
+  offset; the mask is kept matched to the GPT baselines, which have no EOS term either.
+  `talker.memory_reader` is documented as untrained dead weight (every live caller passes an
+  empty bank post-§27; kept for checkpoint compatibility). `generate.py` warns when input
+  overflows the chunk budget (silent head-truncation) and refuses to score empty text
+  (previously printed perplexity 1.0).
+
+Flagged, deliberately not changed:
+
+- **Ponder/cosine losses weight documents by length**: the ponder averages over *active* rows
+  (a batch's longest doc's tail gets up-weighted as others end), the cosine over concatenated
+  pairs (long docs contribute more pairs). Internally consistent, deterministic; noted so the
+  loss composition isn't re-derived mid-run.
+- **The pad-row encoder skip is bit-exact on losses; grads match to fp32 reduction-order
+  noise (~1e-8)** — re-verified, claim stands with that precision caveat.
+- **`data_prep` is not resumable** — a crash hours into the 1.2B prep restarts from zero
+  (and requires deleting the partial dir). Known cost; the streaming prep is ~4-5 h single
+  process at measured 70-93k kept-tokens/s.
+- **fp16-only edges**: `torch.cuda.amp.GradScaler` is the deprecated namespace on torch ≥2.4
+  (FutureWarning; only constructed under fp16), and a fully-degenerate accumulation window
+  would crash `scaler.step` — both unreachable on the planned bf16 run.
+- **`--lr-schedule global` (legacy) can spend a short run entirely inside warmup**
+  (`warmup_steps = max(100, total//50)` can exceed a tiny `total_steps`); the default
+  per-stage schedule caps warmup at `budget//10` and is immune.
+- **`metrics.json` flushes only on checkpoint saves** — the plot lags the log by up to
+  `--checkpoint-every` steps; `tail -f train.log` is the live view.
+
 ## Open items before a large run
 
 - **Re-confirm at full scale (~1.2B tokens):** watch `val_loss` at the Stage-B predictor boundary; the
@@ -166,7 +264,12 @@ Flagged, deliberately not changed:
 - **Stage F** (two-lane dialogue, anti-sycophancy loss) is designed but not exercised.
 - **`--amp`** validated only on synthetic tensors; run `rocm_smoke.py` on the GPU box first
   (now 6 checks — it must end `PASS`, incl. the eval-mode monitoring path added in the
-  2026-07-10 pre-flight review).
+  2026-07-10 pre-flight review and the gradient-finiteness gates on the SSL/ACT backwards
+  added 2026-07-11).
+- **Re-prep the cache with the post-2026-07-11 chunker** (splitter-fragment merge +
+  character-boundary fallback): any cache built earlier — including one built right after the
+  2026-07-10 `_cap_span` fix — has the tiny-chunk pathology and, on unicode-heavy docs,
+  corrupted fallback chunks.
 
 ---
 

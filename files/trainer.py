@@ -55,6 +55,7 @@ class Trainer:
         self.global_step = 0
         self.metrics = []
         self._train_iter = None
+        self._nonfinite_streak = 0   # consecutive optimizer steps skipped on non-finite grads
 
         # Mixed precision. CUDA (incl. ROCm, which presents as cuda) only: CPU
         # gains nothing, and MPS autocast either raises outright (torch<=2.2)
@@ -128,17 +129,18 @@ class Trainer:
             batch = next(self._train_iter)
         return tuple(t.to(self.device) for t in batch)
 
-    def _loss_on(self, batch, flags, plan, run_grounded):
+    def _loss_on(self, batch, flags, plan, want_logs=True):
         ct, cm, ri, rm = batch
         total, logs = None, {}
         # One shared online encoder pass per step, reused by both branches.
         chunk_vecs = self.model.encode_chunks(ct)
         if plan.use_grounded_loss:
             # Autoencoder anchor (encoder -> Talker, no loop): cheap, parallel,
-            # always on. run_grounded is ignored -- the anchor never thins.
+            # always on -- the anchor never thins.
             nll = self.model.forward_grounded(ct, cm, chunk_vecs=chunk_vecs)
             total = nll
-            logs["nll"] = round(nll.item(), 4)
+            if want_logs:
+                logs["nll"] = round(nll.item(), 4)
         if plan.use_self_supervised_loss:
             # On-loop SSL (§2.1/§27): the HRM loop predicts the next latent,
             # SEQUENTIALLY, reading its accumulating gestalt memory. Trains the
@@ -149,8 +151,12 @@ class Trainer:
                 cos_weight=self.train_cfg.ssl_loss_weight, var_weight=self.train_cfg.ssl_var_weight,
                 ponder_weight=self.model_cfg.act_ponder_cost, chunk_vecs=chunk_vecs)
             total = (ssl if total is None else total + ssl) + ponder
-            logs["ssl"] = round(ssl.item(), 4)
-            logs["ponder"] = round(ponder.item(), 4)
+            if want_logs:
+                logs["ssl"] = round(ssl.item(), 4)
+                logs["ponder"] = round(ponder.item(), 4)
+        # want_logs=False skips the .item() calls: each is a host-device sync,
+        # and three syncs per micro-batch on a launch-overhead-bound workload
+        # is measurable -- the values are only ever printed on log steps.
         return total, logs, (ct, cm)
 
     @torch.no_grad()
@@ -180,10 +186,12 @@ class Trainer:
 
             self.optimizer.zero_grad(set_to_none=True)
             step_logs, last_cc = {}, None
+            want_logs = (self.train_cfg.log_every > 0
+                         and (self.global_step + 1) % self.train_cfg.log_every == 0)
             for _ in range(accum):
                 batch = self._next_batch()
                 with self._autocast():
-                    loss, logs, cc = self._loss_on(batch, flags, plan, True)
+                    loss, logs, cc = self._loss_on(batch, flags, plan, want_logs)
                 last_cc = cc
                 # A batch with zero valid chunks returns a grad-free zero
                 # (model.forward_grounded's empty guard); backward() on it
@@ -197,11 +205,31 @@ class Trainer:
 
             if self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.train_cfg.grad_clip)
+            total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.train_cfg.grad_clip)
             if self.scaler is not None:
+                # The fp16 scaler already skips the step on inf/nan grads.
                 self.scaler.step(self.optimizer); self.scaler.update()
-            else:
+            elif bool(torch.isfinite(total_norm)):
                 self.optimizer.step()
+                self._nonfinite_streak = 0
+            else:
+                # Non-finite guard (bf16/fp32 have no GradScaler to filter this):
+                # clip_grad_norm_ computes ONE global norm, so a single NaN/Inf
+                # grad element makes clip_coef NaN and scales EVERY parameter's
+                # grad to NaN -- one unguarded optimizer.step() then destroys
+                # all weights, and the run would keep training and overwriting
+                # checkpoints with the corpse. Skip the step instead (grads are
+                # zeroed at the top of the next iteration) and hard-fail if it
+                # persists, so an unattended run can't burn days spinning.
+                self._nonfinite_streak += 1
+                print(f"[trainer] WARNING: non-finite grad norm ({float(total_norm)}) at step "
+                      f"{self.global_step + 1}; skipping optimizer step "
+                      f"({self._nonfinite_streak} consecutive).", flush=True)
+                if self._nonfinite_streak >= 25:
+                    raise RuntimeError(
+                        f"25 consecutive non-finite gradient steps (last norm {float(total_norm)}). "
+                        f"The run is numerically dead -- weights are still finite (steps were "
+                        f"skipped), so inspect the last checkpoint and the data/LR before resuming.")
             self.ema.update(self.model.chunk_encoder)
             self.global_step += 1
 
@@ -267,6 +295,7 @@ class Trainer:
                 "metrics": self.metrics,
                 "model_cfg": asdict(self.model_cfg),
                 "vocab_size": self.model_cfg.vocab_size,
+                "stage_reached": self.curriculum.stage.name,
                 "tokenizer_name": "gpt2", "chunker": "regex_gpt2",
             }, f)
             f.flush()

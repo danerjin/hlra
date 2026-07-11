@@ -138,8 +138,15 @@ def main():
         loss4 = ssl + ponder
     loss4.backward()
     torch.cuda.synchronize()
-    print(f"[4] on-loop SSL (loop+memory) finite: {finite(loss4)} (ssl={float(ssl):.4f})")
-    ok &= finite(loss4)
+    # Check the GRADIENTS too, exactly as [3] does: the sequential loop's
+    # backward (memory cross-attention, hard_normalize division, decay-gate
+    # exp) is the untested ROCm/bf16 code path this tool exists to probe. A
+    # backward NaN leaves the LOSS finite -- gating on the loss alone lets a
+    # broken backward print PASS and corrupt weights on the run's first
+    # optimizer step (clip_grad_norm_ propagates one NaN grad to all).
+    grad4 = all(finite(p.grad) for p in model.parameters() if p.grad is not None)
+    print(f"[4] on-loop SSL (loop+memory) finite: {finite(loss4)} (ssl={float(ssl):.4f})   grads finite: {grad4}")
+    ok &= finite(loss4) and grad4
 
     # 5. ACT path (Stage D) -- variable inner-loop depth + halting head under autocast.
     model.zero_grad(set_to_none=True)
@@ -153,8 +160,9 @@ def main():
         loss_e = ssl_e + ponder_e
     loss_e.backward()
     torch.cuda.synchronize()
-    print(f"[5] ACT (loop) loss finite: {finite(loss_e)} (ponder={float(ponder_e):.4f})")
-    ok &= finite(loss_e)
+    grad_e = all(finite(p.grad) for p in model.parameters() if p.grad is not None)
+    print(f"[5] ACT (loop) loss finite: {finite(loss_e)} (ponder={float(ponder_e):.4f})   grads finite: {grad_e}")
+    ok &= finite(loss_e) and grad_e
 
     # 6. the monitoring path: eval-mode forward (Trainer.evaluate + the lstd
     # collapse metric run this every log_every steps, WITHOUT autocast). An

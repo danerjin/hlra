@@ -289,8 +289,12 @@ class HRMInnerLoop(nn.Module):
                 # accumulator; for clarity we use expected-value ponder cost
                 # and a soft, differentiable "continue probability" schedule
                 # rather than hard branching, so the graph stays simple.
-                halt_vote = float((halt_prob * w).sum() / denom)
-                if step + 1 >= n_cycles and halt_vote > 0.5:
+                # The float() is a host-device sync; only pay it on steps where
+                # the vote can actually trigger a break (step+1 >= n_cycles) --
+                # the decision sequence is identical, but the sync on earlier
+                # steps (one per chunk, per optimizer step, in Stages D/E) is
+                # skipped on a launch-overhead-bound workload.
+                if step + 1 >= n_cycles and float((halt_prob * w).sum() / denom) > 0.5:
                     break
 
         # grad_window <= 0 means "no gradient through the loop at all" (the

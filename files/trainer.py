@@ -234,7 +234,7 @@ class Trainer:
             self.global_step += 1
 
             val_loss = None
-            if self.global_step % self.train_cfg.log_every == 0:
+            if self.train_cfg.log_every and self.global_step % self.train_cfg.log_every == 0:
                 val_loss = self.evaluate()
                 lstd = self.model.latent_collapse_metric(*last_cc) if last_cc else 0.0
                 print(f"[step {self.global_step}] stage={self.curriculum.stage.name} lr={lr:.2e} "

@@ -253,6 +253,52 @@ Flagged, deliberately not changed:
 - **`metrics.json` flushes only on checkpoint saves** — the plot lags the log by up to
   `--checkpoint-every` steps; `tail -f train.log` is the live view.
 
+## Fourth pre-flight review (2026-07-11, three independent adversarial audits + full smoke suite)
+
+A fourth full pass, run fresh against commit 261de64b: one audit each on gradient-routing/
+truncation (86 float64 checks incl. finite differences and an adversarial garbage-token
+active-mask probe), the chunker/data pipeline (real gpt2 tokenizer, 27 adversarial cases +
+400-doc unicode fuzz), and the trainer/resume/curriculum machinery (87 checks incl. a real
+SIGKILL-and-resume of `train_scaled.py`). **The A→E training semantics came through clean for
+the fourth time** — every routing/truncation/masking/guard claim in this file re-verified
+empirically, the chunker holds all its invariants (cap exact, verbatim, zero U+FFFD, ≤3-token
+chunks 0.0% on the realistic mix), the non-finite guard leaves weights bit-identical on skipped
+steps and hard-fails exactly at 25, and kill/resume reproduces the uninterrupted trajectory
+(LR/stage boundaries exact; val_loss within 0.1% reshuffle noise). Post-fix integration walk:
+A→E on a fresh offline cache, all stages fire, `val_loss` 8.95→8.18 with no Stage-B jump.
+
+Three small fixes landed, none touching training semantics (the ACT edit is verified
+**bit-identical** on losses and every gradient in float64, including an ended-doc row):
+
+- **`trainer.py`: `--log-every 0` no longer crashes.** The eval branch divided by
+  `log_every` unguarded (ZeroDivisionError at step 1); anyone "disabling logging" with 0
+  killed the run instantly. One-line guard; `--log-every 50` behavior unchanged.
+- **`hrm_loop.py`: the ACT halt-vote host sync is only paid when a break is possible.**
+  `float(halt_vote)` ran every ACT step, but the break requires `step+1 >= n_cycles` — so the
+  step-0 sync (one per chunk per optimizer step in Stages D/E, up to 32/step at `small`) was
+  pure launch-overhead waste. The vote is only consumed by that break, so moving the read
+  inside the condition is provably decision-identical.
+- **`data.py`: an empty cache (0 shards) now raises a clear ValueError** instead of the opaque
+  `torch.cat(): expected a non-empty list of Tensors`.
+
+Flagged, deliberately not changed:
+
+- **Over-cap pure-whitespace runs are silently dropped by the chunker's hard fallback**
+  (`_cap_span("hello" + " "*200 + ...)` loses the spaces; threshold ~100-200 spaces). Only
+  whitespace is ever lost, never text; a 64-token all-whitespace chunk would be a garbage
+  thought anyway. Accepted.
+- **The fp16 GradScaler path has no non-finite streak counter** — it skips bad steps silently
+  forever, so an `--amp-dtype fp16` run could spin unattended with no 25-strike hard-fail.
+  The big run is bf16 (guard active); do not switch to fp16 unattended.
+- Two unreachable-config nits: `act_max_ponder_steps < h_updates_per_thought` would silently
+  cap ACT depth below the fixed-depth minimum (shipped 6 > 2); a `chunk_mask=True` chunk with
+  zero real tokens (a data-contract violation the pipeline prevents) yields a degenerate SSL
+  pair against a zero target. Neither is reachable from the shipped pipeline/config.
+- Cosmetic: a crash mid-save can leave a stale `checkpoint.pt.tmp` (overwritten next save);
+  at step 5000 `--checkpoint-every 1000` and `--archive-every 5000` both fire (two
+  back-to-back saves, seconds wasted); per-stage warmup legitimately starts below the cosine
+  floor (standard warmup, not a bug — noted so nobody "fixes" it).
+
 ## Open items before a large run
 
 - **Re-confirm at full scale (~1.2B tokens):** watch `val_loss` at the Stage-B predictor boundary; the

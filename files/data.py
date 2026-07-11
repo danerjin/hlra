@@ -353,6 +353,11 @@ class CachedChunkDataset(Dataset):
             d = torch.load(os.path.join(cache_dir, shard))
             cts.append(d["chunk_tensor"]); cms.append(d["chunk_mask"])
             ris.append(d["raw_ids"]); rms.append(d["raw_mask"])
+        if not cts:
+            raise ValueError(
+                f"cache at {cache_dir} contains no shards -- the prep run kept zero "
+                f"documents (all filtered by min_chunks, or --max-tokens too small). "
+                f"Re-run data_prep.py with looser limits.")
         self.chunk_tensor = torch.cat(cts, 0)
         self.chunk_mask = torch.cat(cms, 0)
         self.raw_ids = torch.cat(ris, 0)

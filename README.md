@@ -120,3 +120,10 @@ Size presets (`config.MODEL_PRESETS`): `smoke` (~43M) → `small` (512-d, ~152M)
   generation-path fix (no double loop pass on the last prompt chunk), gradient-finiteness gates
   in `rocm_smoke.py` [4]/[5], and a `bench_throughput.py` step that mirrors the real trainer.
   Details in `notes.md`.
+- A fourth review (2026-07-11, three independent adversarial audits: 86 float64
+  gradient/truncation checks, a real-tokenizer chunker fuzz, and a SIGKILL-and-resume trainer
+  audit) again found the A→E training semantics clean and landed three small off-path fixes:
+  a `--log-every 0` crash guard in the trainer, an ACT halt-vote host-sync removal in
+  `hrm_loop.py` (verified bit-identical losses/gradients; saves up to one sync per chunk per
+  step in Stages D/E), and a clear error for an empty chunk cache. See `notes.md` for the
+  full audit results and the accepted-as-is flags.

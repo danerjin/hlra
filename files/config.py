@@ -95,13 +95,11 @@ class TrainConfig:
     # rather than fixed iteration counts.
     plateau_patience: int = 10
     plateau_min_delta: float = 1e-3
-    # Fraction of Stage-D+ steps that run the grounded (reconstruction) loss.
-    # §2.4 CORRECTION to §5.7.1: reconstruction is the always-on anti-collapse
-    # anchor and must run EVERY step (=1.0); the empirical collapse (notes §5)
-    # happened precisely when reconstruction was thinned to a low floor while
-    # SSL ran every step. Compute is managed by keeping SSL (cheap/parallel) as
-    # the frequent one, NOT by thinning the anchor. Default 1.0 so every entry
-    # point is safe-by-default; lower it only with eyes open.
+    # MOOT since the §27 restructure (kept only so old checkpoints/CLIs don't
+    # break): reconstruction is now a cheap parallel autoencoder codec (encoder ->
+    # Talker, no loop) and always runs every step as the anti-collapse anchor.
+    # The expensive path is now the SEQUENTIAL on-loop SSL, not reconstruction, so
+    # there is nothing to thin here. Leave at 1.0.
     grounded_loss_min_frequency: float = 1.0
     # The grounded (reconstruction) loss is the always-on anti-collapse anchor on
     # the shared chunk encoder (runs every step at frequency 1.0). The on-loop SSL

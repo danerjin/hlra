@@ -101,12 +101,6 @@ def _to_device(batch, device):
 # ----------------------------------------------------------------------
 # Training
 # ----------------------------------------------------------------------
-def run_grounded_step(model, chunk_tensor, chunk_mask, raw_ids, raw_mask,
-                       memory, role_id, stage_flags, ponder_weight, chunk_vecs=None):
-    return model.forward_grounded(
-        chunk_tensor, chunk_mask, raw_ids, raw_mask, memory, role_id, stage_flags,
-        ponder_weight, chunk_vecs=chunk_vecs,
-    )
 
 
 def train_stages_a_to_e(model, ema, curriculum: Curriculum, model_cfg, train_cfg,
@@ -131,43 +125,31 @@ def train_stages_a_to_e(model, ema, curriculum: Curriculum, model_cfg, train_cfg
         stage_flags = curriculum.stage_flags()
         loss_plan = curriculum.loss_plan()
 
-        memory = GestaltMemoryBank(model_cfg.memory_capacity, model_cfg.d_model)
-
         optimizer.zero_grad()
         total_loss = None
         logs = {"stage": curriculum.stage.name}
 
-        run_grounded = True
-        if loss_plan.use_self_supervised_loss:
-            # The grounded loss is expensive/sequential (§5.7.1), so once the
-            # cheap parallel SSL loss is active, thin the grounded loss to its
-            # configured frequency floor rather than running it every step --
-            # but hold it AT the floor so it never tapers into the
-            # ungrounded-drift regime §3.7 warns about.
-            run_grounded = random.random() < train_cfg.grounded_loss_min_frequency
-
-        # One shared online encoder pass, reused by every branch this step.
+        # One shared online encoder pass, reused by both branches this step.
         chunk_vecs = model.encode_chunks(chunk_tensor)
 
-        if run_grounded and loss_plan.use_grounded_loss:
-            nll, ponder, _ = run_grounded_step(
-                model, chunk_tensor, chunk_mask, raw_ids, raw_mask,
-                memory, SELF, stage_flags, model_cfg.act_ponder_cost, chunk_vecs=chunk_vecs,
-            )
-            total_loss = loss_plan.grounded_loss_weight * (nll + ponder)
+        if loss_plan.use_grounded_loss:
+            # Autoencoder anchor (encoder -> Talker, no loop), always on.
+            nll = model.forward_grounded(chunk_tensor, chunk_mask, chunk_vecs=chunk_vecs)
+            total_loss = nll
             logs["nll"] = round(nll.item(), 4)
-            logs["ponder"] = round(ponder.item(), 4)
 
         if loss_plan.use_self_supervised_loss:
-            # On-loop SSL (§2.1/§25): the HRM loop is the next-latent predictor.
-            # It trains the loop + encoder to reason forward; the variance floor
-            # is the anti-collapse backstop, the grounded loss the anchor.
-            ssl = model.forward_self_supervised(chunk_tensor, chunk_mask, stage_flags, ema,
-                                                cos_weight=train_cfg.ssl_loss_weight,
-                                                var_weight=train_cfg.ssl_var_weight,
-                                                chunk_vecs=chunk_vecs)
-            total_loss = ssl if total_loss is None else total_loss + ssl
+            # On-loop SSL (§2.1/§27): the HRM loop predicts the next latent,
+            # SEQUENTIALLY, reading its accumulating gestalt memory. Trains the
+            # loop + encoder + memory to reason forward; carries the ACT ponder.
+            memory = GestaltMemoryBank(model_cfg.memory_capacity, model_cfg.d_model)
+            ssl, ponder = model.forward_self_supervised(
+                chunk_tensor, chunk_mask, raw_ids, raw_mask, memory, SELF, stage_flags, ema,
+                cos_weight=train_cfg.ssl_loss_weight, var_weight=train_cfg.ssl_var_weight,
+                ponder_weight=model_cfg.act_ponder_cost, chunk_vecs=chunk_vecs)
+            total_loss = (ssl if total_loss is None else total_loss + ssl) + ponder
             logs["ssl"] = round(ssl.item(), 4)
+            logs["ponder"] = round(ponder.item(), 4)
 
         if total_loss is not None:
             total_loss.backward()
@@ -201,23 +183,15 @@ def train_stages_a_to_e(model, ema, curriculum: Curriculum, model_cfg, train_cfg
 def evaluate(model, ema, val_loader, model_cfg, curriculum: Curriculum) -> float:
     model.eval()
     device = next(model.parameters()).device
-    stage_flags = curriculum.stage_flags()
     losses = []
     for i, batch in enumerate(val_loader):
         if i >= 4:  # keep validation cheap
             break
         chunk_tensor, chunk_mask, raw_ids, raw_mask = _to_device(batch, device)
-        memory = GestaltMemoryBank(model_cfg.memory_capacity, model_cfg.d_model)
-        nll, _, _ = run_grounded_step(
-            model, chunk_tensor, chunk_mask, raw_ids, raw_mask,
-            memory, SELF, stage_flags, model_cfg.act_ponder_cost,
-        )
-        # Grounded (reconstruction) NLL only -- this is the decodability signal
-        # we actually care about, and keeps val comparable across stage
-        # boundaries (adding the SSL term would inflate it at Stage D, and the
-        # ACT ponder cost would inflate it at Stage E, falsely looking like
-        # regressions). Also what the plateau gate keys on.
-        losses.append(nll.item())
+        # Reconstruction (autoencoder) NLL only -- the decodability signal, and
+        # comparable across stage boundaries (independent of loop/SSL/ponder, so
+        # no contaminated-eval jump; notes §5.6). Also what the plateau gate keys on.
+        losses.append(model.forward_grounded(chunk_tensor, chunk_mask).item())
     model.train()
     return sum(losses) / max(len(losses), 1)
 
@@ -241,23 +215,23 @@ def train_stage_f(model, ema, curriculum: Curriculum, model_cfg, train_cfg, opti
         optimizer.zero_grad()
         total_loss = torch.zeros((), device=device)  # must match the per-turn losses' device
         n_turns = 0
-        last_chunks = None
 
         for role_id, text in dialogue:
             ct, cm, ri, rm = chunk_text_example(text, model.chunker, model_cfg.recent_token_window)
             ct, cm, ri, rm = _to_device((ct.unsqueeze(0), cm.unsqueeze(0),
                                           ri.unsqueeze(0), rm.unsqueeze(0)), device)
-            last_chunks = (ct, cm)
-            nll, ponder, _ = run_grounded_step(
-                model, ct, cm, ri, rm, memory, role_id, stage_flags, model_cfg.act_ponder_cost,
-            )
-            total_loss = total_loss + nll + ponder
+            # Autoencoder anchor (codec) per turn.
+            total_loss = total_loss + model.forward_grounded(ct, cm)
+            # On-loop SSL per turn: the loop reasons over the dialogue-spanning,
+            # role-tagged memory (persists across turns, §4.2). Writes carry this
+            # turn's role_id.
+            if loss_plan.use_self_supervised_loss:
+                ssl, ponder = model.forward_self_supervised(
+                    ct, cm, ri, rm, memory, role_id, stage_flags, ema,
+                    cos_weight=train_cfg.ssl_loss_weight, var_weight=train_cfg.ssl_var_weight,
+                    ponder_weight=model_cfg.act_ponder_cost)
+                total_loss = total_loss + ssl + ponder
             n_turns += 1
-
-        if loss_plan.use_self_supervised_loss and last_chunks is not None:
-            total_loss = total_loss + model.forward_self_supervised(
-                *last_chunks, stage_flags, ema, cos_weight=train_cfg.ssl_loss_weight,
-                var_weight=train_cfg.ssl_var_weight)
 
         total_loss = total_loss / max(n_turns, 1)
         total_loss.backward()

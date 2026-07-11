@@ -123,45 +123,40 @@ class Trainer:
     def _loss_on(self, batch, flags, plan, run_grounded):
         ct, cm, ri, rm = batch
         total, logs = None, {}
-        # One shared online encoder pass per step, reused by every branch below
-        # (grounded / SSL / gen all consume the same shared-encoder latent).
+        # One shared online encoder pass per step, reused by both branches.
         chunk_vecs = self.model.encode_chunks(ct)
-        if plan.use_grounded_loss and run_grounded:
-            memory = GestaltMemoryBank(self.model_cfg.memory_capacity, self.model_cfg.d_model)
-            nll, ponder, _ = self.model.forward_grounded(
-                ct, cm, ri, rm, memory, SELF, flags, self.model_cfg.act_ponder_cost,
-                chunk_vecs=chunk_vecs)
-            total = nll + ponder
+        if plan.use_grounded_loss:
+            # Autoencoder anchor (encoder -> Talker, no loop): cheap, parallel,
+            # always on. run_grounded is ignored -- the anchor never thins.
+            nll = self.model.forward_grounded(ct, cm, chunk_vecs=chunk_vecs)
+            total = nll
             logs["nll"] = round(nll.item(), 4)
-            logs["ponder"] = round(ponder.item(), 4)
         if plan.use_self_supervised_loss:
-            # On-loop SSL (§2.1/§25): the HRM loop IS the next-latent predictor.
-            # One term trains the loop + encoder to reason forward, with the
-            # variance floor as the anti-collapse backstop.
-            ssl = self.model.forward_self_supervised(
-                ct, cm, flags, self.ema, cos_weight=self.train_cfg.ssl_loss_weight,
-                var_weight=self.train_cfg.ssl_var_weight, chunk_vecs=chunk_vecs)
-            total = ssl if total is None else total + ssl
+            # On-loop SSL (§2.1/§27): the HRM loop predicts the next latent,
+            # SEQUENTIALLY, reading its accumulating gestalt memory. Trains the
+            # loop + encoder + memory to reason forward; carries the ACT ponder.
+            memory = GestaltMemoryBank(self.model_cfg.memory_capacity, self.model_cfg.d_model)
+            ssl, ponder = self.model.forward_self_supervised(
+                ct, cm, ri, rm, memory, SELF, flags, self.ema,
+                cos_weight=self.train_cfg.ssl_loss_weight, var_weight=self.train_cfg.ssl_var_weight,
+                ponder_weight=self.model_cfg.act_ponder_cost, chunk_vecs=chunk_vecs)
+            total = (ssl if total is None else total + ssl) + ponder
             logs["ssl"] = round(ssl.item(), 4)
+            logs["ponder"] = round(ponder.item(), 4)
         return total, logs, (ct, cm)
 
     @torch.no_grad()
     def evaluate(self) -> float:
         self.model.eval()
-        flags = self.curriculum.stage_flags()
         losses = []
         for i, batch in enumerate(self.val_loader):
             if i >= 4:
                 break
             ct, cm, ri, rm = tuple(t.to(self.device) for t in batch)
-            memory = GestaltMemoryBank(self.model_cfg.memory_capacity, self.model_cfg.d_model)
-            nll, _, _ = self.model.forward_grounded(
-                ct, cm, ri, rm, memory, SELF, flags, self.model_cfg.act_ponder_cost)
-            # Reconstruction NLL only: the ponder cost is a training-time
-            # compute penalty, not a quality signal, and including it would
-            # bump val at the Stage-E boundary exactly the way the
-            # contaminated-eval lesson (notes §5.6) warns about.
-            losses.append(nll.item())
+            # Reconstruction (autoencoder) NLL only -- the decodability signal,
+            # comparable across stage boundaries (independent of loop/SSL/ponder,
+            # so no contaminated-eval jump; notes §5.6).
+            losses.append(self.model.forward_grounded(ct, cm).item())
         self.model.train()
         return sum(losses) / max(len(losses), 1)
 

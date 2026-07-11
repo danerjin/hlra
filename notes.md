@@ -5,15 +5,17 @@ and its fix (with the evidence that confirmed it), every training run and its
 numbers, and the theory/observations behind the decisions. The README is the
 map; this is the story. Nothing is omitted.
 
-> ⚠️⚠️ **EXTREMELY IMPORTANT — READ §24–§26 BEFORE ANY TRAINING RUN.** The
-> self-supervised loss now runs **ON the HRM loop** — the loop IS the next-latent
-> predictor (`model.forward_self_supervised`: `loop(encode(chunk_t)) → pred_head`
-> predicts chunk t+1's EMA latent), the design's actual §2.1 intent. The linear
-> SSL (`ssl_proj`/`latent_predictor`) and the detached gen MLP (`gen_predictor`)
-> are **removed** (§26); there is no toggle — this is the design. The on-loop SSL
-> is co-equal with reconstruction (`ssl_loss_weight=1.0`, up from 0.1). Validated
-> at smoke scale (no collapse; §25.1 A/B) but **NOT at `small`+ scale — re-run the
-> collapse check and re-tune `ssl_loss_weight` before committing multi-day compute.**
+> ⚠️⚠️ **EXTREMELY IMPORTANT — READ §24–§27 BEFORE ANY TRAINING RUN.** The
+> architecture was restructured (§27) into a clean role split: **reconstruction =
+> a pure autoencoder (encoder → Talker, NO loop); the HRM loop lives only in the
+> predictive SSL**, run SEQUENTIALLY so it reads its accumulating gestalt memory
+> (`model.forward_self_supervised`). The loop is trained ONLY by prediction; the
+> Talker only by reconstruction; the gestalt memory finally trains (populated
+> sequential memory). **Curriculum reshuffled:** A = autoencoder only; B = loop +
+> SSL (memory detached); C = un-detach memory; D = ACT; E = consolidation. SSL now
+> starts at **B**, not D. `val_loss` = autoencoder reconstruction (no loop).
+> Verified smoke A→E healthy (no collapse); **NOT validated at `small`+ — re-run
+> the collapse check + re-tune `ssl_loss_weight` before multi-day compute.**
 
 ---
 
@@ -2009,3 +2011,80 @@ GPU-box validation recipe (before the multi-day run):
       --batch-size 32 --stage-steps <~1-epoch> --log-every 50 --out runs/validate_ssl
     # GO iff: val_loss does NOT jump up at the A->...->D transition (grep 'stage=C'|tail -1
     # vs 'stage=D'|tail -1), ssl decreases, and lstd holds its A-C band (not absolute 0.1).
+
+---
+
+## 27. Restructure: reconstruction is a pure autoencoder; the HRM loop lives only in the predictor (2026-07-10)
+
+Owner's call, after §22–§26 clarified that the loop was being pulled two ways.
+The architecture now splits cleanly by role.
+
+### 27.1 Why (the objective conflict)
+
+Post-§26, the loop's output h_t = loop(z_t) was used by BOTH losses:
+reconstruction wanted `Talker(h_t)` to decode chunk t (so h_t must *represent the
+current chunk* -- and since the encoder already produced z_t, this trains the loop
+toward an identity-ish pass-through), while SSL wanted `pred_head(h_t) ≈ z_{t+1}`
+(shift *forward*). "Preserve the present" vs "move to the future" are opposing
+pressures on one vector. Removing the loop from reconstruction frees it to be
+purely predictive, and leaves a clean encoder↔Talker codec -- JEPA-Reasoner's
+"Talker is a pure readout of the latent space."
+
+### 27.2 The new design
+
+- **`forward_grounded` = pure autoencoder** (§2.2): encode chunk t → Talker
+  decodes the SAME chunk t, parallel over all chunks, **no loop, no memory**
+  (empty-memory codec Talker). Trains encoder + Talker. The always-on
+  anti-collapse anchor. `val_loss` and `generate.py --score` are this.
+- **`forward_self_supervised` = the loop predictor, SEQUENTIAL** (§2.1): per chunk
+  t, `h_t = loop(z_t, memory)` reads the *accumulating* gestalt memory (Thought
+  Gestalt cross-thought reasoning) → write h_t → `pred_head(h_t)` predicts
+  chunk t+1's EMA-target latent. Trains loop + encoder + pred_head + **the memory
+  readers/writers** (which were dead under §26's parallel/empty-memory SSL --
+  that's the concrete thing that was "orphaned"; the *module* always existed).
+  Carries the ACT ponder.
+- **Generation**: the loop predicts the next encoder-space latent (reading
+  memory); the codec Talker decodes it (same encoder space it was trained on).
+- **Removed**: the loop from reconstruction; the parallel/empty-memory SSL;
+  `run_grounded_step` and grounded-frequency thinning (the anchor is cheap now, so
+  it just runs every step).
+
+### 27.3 Curriculum (reshuffled; SSL now starts at B, not D)
+
+| Stage | Losses | Loop | Memory | ACT |
+|---|---|---|---|---|
+| **A** | autoencoder only | off | — | — |
+| **B** | autoencoder + SSL | on, fixed depth, inner warmup 2→5 | detached | — |
+| **C** | + un-detach memory (warmup 1→5) | on | un-detached | — |
+| **D** | + ACT | on | un-detached | on |
+| **E** | consolidation (same as D) | on | un-detached | on |
+| **F** | + two-lane dialogue | on | spans dialogue | on |
+
+Stage A grounds the encoder+Talker AND makes the EMA target meaningful, so the
+§5.4 "don't turn SSL on against garbage latents" logic is satisfied by
+construction. `val_loss` = autoencoder reconstruction (loop-independent, so it's a
+clean cross-stage signal with no contaminated-eval jump).
+
+### 27.4 Verified
+
+- Gradient audit: (1) autoencoder trains **encoder + Talker only** (not loop /
+  pred_head); (2) on-loop SSL trains **l_transition + h_transition + memory_reader
+  + encoder + pred_head** (memory_reader now gets gradient -- the populated
+  sequential memory), **not** the Talker; (3) EMA target grad-free.
+- Smoke A→E on real gpt2 text (`wiki_cache`, 15/15/15/15/20, CPU): all stages
+  fire, SSL on from B and decreasing (1.47→0.53), val_loss monotone **10.46→7.06**,
+  **lstd healthy 0.20–0.43 throughout (no collapse)**, ponder small from D.
+  Generation + `--score` (autoencoder ppl) work.
+- All 26 `files/*.py` byte-compile; trainer/train/generate/rocm_smoke/bench/
+  profile updated to the new signatures.
+
+### 27.5 Outstanding (before the big run)
+
+- **Scale validation** unchanged in spirit (notes §26.1): re-run A→E at `small` on
+  a real cache, watch `val_loss` for a regression when SSL turns on **at Stage B**
+  now (not D), and `lstd` against its own A-band. Re-tune `ssl_loss_weight`.
+- **README/spec/TRAINING** partially updated for §27; the spec's §5.1 (Stage A
+  wording) and §2.2 are updated, but do a full read before relying on them.
+- Cost note: the expensive path is now the *sequential SSL loop* (not
+  reconstruction, which is a cheap parallel codec). `bench_throughput.py` times the
+  full step (autoencoder + SSL); budget from that.

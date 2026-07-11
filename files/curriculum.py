@@ -8,14 +8,20 @@ can't be safely deepened until it's near a stable fixed point, the outer
 memory gradient is the same problem one level up, and ACT needs a signal
 that already reflects "more compute helped" before it can learn anything.
 
-Stages (§5.1-§5.6), in order:
+Stages (§5, restructured -- notes §27), in order:
 
-  A. Ground the Talker on a shallow, fixed Reasoner (no loop, no memory grad).
-  B. Turn on the inner HRM loop, fixed depth, memory writes detached.
-  C. Un-detach the gestalt memory, with its own truncation warmup.
-  D. Bring in the self-supervised JEPA loss, alongside the grounded loss.
-  E. Turn on adaptive depth (ACT).
+  A. Autoencoder codec only (encoder -> Talker, no loop). Grounds the encoder +
+     Talker and makes the EMA target meaningful.
+  B. Turn on the HRM loop + the on-loop SSL predictor (fixed depth, inner-loop
+     grad warmup 2->5). Memory writes detached (no cross-thought grad yet).
+  C. Un-detach the gestalt memory, with its own 1->5 truncation warmup
+     (cross-thought reasoning -- the loop reads its accumulating memory).
+  D. Turn on adaptive depth (ACT).
+  E. Consolidation (full config, extra budget).
   F. Chatbot fine-tuning: two-lane input/self separation, cross-turn memory.
+
+The autoencoder (reconstruction) anchor runs EVERY stage; the on-loop SSL
+predictor runs from B onward. `val_loss` is the autoencoder reconstruction.
 
 Stage transitions are gated on a validation-loss plateau (§5.7.2), not
 fixed step counts -- `Curriculum.step()` is called once per training step
@@ -142,30 +148,37 @@ class Curriculum:
         stage = self.stage
 
         if stage == Stage.A:
+            # Autoencoder codec only (encoder + Talker). No loop, no SSL -- the
+            # loop flags are irrelevant here because SSL (the only loop user) is
+            # off. Grounds the encoder + Talker and makes the EMA target
+            # meaningful before prediction turns on (notes §27).
             return StageFlags(use_hrm_loop=False, detach_memory=True,
                                inner_loop_grad_window=0, memory_grad_window=0,
                                use_act=False, use_input_lanes=False)
 
-        # Stage B onward: inner loop is on. Its grad window warms up 2->5
-        # (§3.5) over this stage's own duration.
+        # Stage B onward: the loop + on-loop SSL are on. The SSL loop's inner grad
+        # window warms 2->5 (§3.5) over this stage's own duration.
         inner_window = linear_warmup_window(
             self.step_in_stage, self._stage_budget(),
             cfg.inner_loop_grad_window_start, cfg.inner_loop_grad_window_end,
         )
 
         if stage == Stage.B:
+            # Loop + SSL, fixed depth, memory writes DETACHED (loop reads the
+            # accumulating memory but no cross-thought gradient yet -- isolate
+            # "is the single-thought prediction loop stable").
             return StageFlags(use_hrm_loop=True, detach_memory=True,
                                inner_loop_grad_window=inner_window, memory_grad_window=0,
                                use_act=False, use_input_lanes=False)
 
-        # Stage C onward: memory is un-detached, with its own warmup (§3.6, §5.3).
-        # The inner-loop schedule is deepened first (per §5.3's "staggering, not
-        # simultaneity"), so by Stage C the inner window is already at its max.
+        # Stage C onward: memory is un-detached, with its own 1->5 warmup (§3.6,
+        # §5.3) -- cross-thought credit through the gestalt memory. Inner window
+        # already at max (deepened first, §5.3's "staggering, not simultaneity").
         memory_window = linear_warmup_window(
             self.step_in_stage, self._stage_budget(),
             cfg.memory_grad_window_start, cfg.memory_grad_window_end,
         )
-        inner_window = cfg.inner_loop_grad_window_end  # already deepened, held fixed from here on
+        inner_window = cfg.inner_loop_grad_window_end
 
         if stage == Stage.C:
             return StageFlags(use_hrm_loop=True, detach_memory=False,
@@ -173,13 +186,14 @@ class Curriculum:
                                use_act=False, use_input_lanes=False)
 
         if stage == Stage.D:
-            # Self-supervised loss turns on (loss_plan below), no new model behavior flags.
+            # ACT: adaptive inner-loop depth (§5.5), once fixed-depth prediction is stable.
             return StageFlags(use_hrm_loop=True, detach_memory=False,
                                inner_loop_grad_window=inner_window,
                                memory_grad_window=cfg.memory_grad_window_end,
-                               use_act=False, use_input_lanes=False)
+                               use_act=True, use_input_lanes=False)
 
         if stage == Stage.E:
+            # Full config, extra consolidation budget (same flags as D).
             return StageFlags(use_hrm_loop=True, detach_memory=False,
                                inner_loop_grad_window=inner_window,
                                memory_grad_window=cfg.memory_grad_window_end,
@@ -193,17 +207,17 @@ class Curriculum:
 
     def loss_plan(self) -> StageLossPlan:
         stage = self.stage
-        if stage in (Stage.A, Stage.B, Stage.C):
-            # Grounded loss only -- self-supervised loss deliberately withheld
-            # until Stage D (§5.4: reversing JEPA-Reasoner's own phase order,
-            # so the EMA target isn't pretrained against meaningless latents).
+        if stage == Stage.A:
+            # Autoencoder codec ONLY -- ground the encoder + Talker (and make the
+            # EMA target meaningful) before the predictive SSL turns on. This is
+            # the §5.4 "don't pretrain the target against meaningless latents"
+            # logic, now satisfied by construction (notes §27).
             return StageLossPlan(use_grounded_loss=True, use_self_supervised_loss=False,
                                   grounded_loss_weight=1.0, self_supervised_loss_weight=0.0)
 
-        # From Stage D onward both losses run together. The grounded loss is
-        # inherently sequential and expensive (§5.7.1), so its *frequency*
-        # (handled by train.py, not here) is thinned relative to the cheap,
-        # parallel self-supervised loss -- but never below a floor, to avoid
-        # the ungrounded-drift failure mode §3.7 warns about.
+        # Stage B onward: the always-on autoencoder anchor + the on-loop SSL
+        # predictor (which trains the loop + memory to reason forward). The
+        # autoencoder is cheap (codec, parallel) so it runs every step; the SSL is
+        # the sequential/expensive one now.
         return StageLossPlan(use_grounded_loss=True, use_self_supervised_loss=True,
                               grounded_loss_weight=1.0, self_supervised_loss_weight=1.0)

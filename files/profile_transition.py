@@ -25,6 +25,7 @@ import torch
 
 from config import model_config
 from model import LatentThoughtModel, StageFlags, SELF
+from ema_target import EMATargetEncoder
 from gestalt_memory import GestaltMemoryBank
 from decay_gate import DiagonalDecayGate
 from hrm_loop import HRMInnerLoop
@@ -44,6 +45,7 @@ def main():
     device = pick_device()
     cfg = model_config(args.preset, vocab_size=args.vocab)
     model = LatentThoughtModel(cfg, chunker=None).to(device)
+    ema = EMATargetEncoder(model.chunk_encoder, momentum=cfg.ema_momentum).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
 
     flags = StageFlags(use_hrm_loop=True, detach_memory=False, inner_loop_grad_window=5,
@@ -80,8 +82,12 @@ def main():
     def run_step():
         opt.zero_grad(set_to_none=True)
         memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
-        nll, ponder, _ = model.forward_grounded(*data, memory, SELF, flags, cfg.act_ponder_cost)
-        (nll + ponder).backward()
+        # The L-gate runs inside the on-loop SSL (the loop is here now, not in
+        # reconstruction). data = (ct, cm, ri, rm).
+        ssl, ponder = model.forward_self_supervised(*data, memory, SELF, flags, ema,
+                                                    cos_weight=1.0, var_weight=2.0,
+                                                    ponder_weight=cfg.act_ponder_cost)
+        (ssl + ponder).backward()
         opt.step()
 
     for _ in range(args.warmup):

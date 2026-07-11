@@ -8,28 +8,28 @@ Wires every component into the full architecture described in §1-§4:
                                         v                         v
                                  gestalt memory <---------- Talker (tokens out)
 
-Two forward passes are exposed, matching §2's "two losses, two granularities".
-**Both run the HRM loop and train it** -- that is the point (notes §26): the loop
-is the reasoner, so both objectives shape it, just used two different ways:
+Two forward passes, cleanly split by role (notes §27) -- the HRM loop lives in
+ONE of them, the predictive one:
 
-  - `forward_grounded`: the reconstruction/autoencoder branch (§2.2), SEQUENTIAL.
-    Per chunk t: encode -> HRM loop (reading + writing the persistent gestalt
-    memory, carrying h/l state across chunks) -> Talker decodes the SAME chunk t.
-    Masked-NLL against chunk t's own tokens. Trains the loop to produce a
-    *decodable* thought. (Stage A is the one exception: the loop is off, so it's
-    encoder-latent -> Talker directly -- the shallow fixed Reasoner that grounds
-    the Talker first, §5.1.) This is the always-on anti-collapse anchor.
+  - `forward_grounded`: the reconstruction/autoencoder anchor (§2.2). A pure codec
+    -- encode chunk t -> Talker decodes the SAME chunk t -- with **no HRM loop and
+    no memory**, run in parallel over all chunks. Anchors the shared encoder
+    against collapse (a constant latent can't reconstruct varied chunks) and
+    trains the Talker to decode encoder-space latents. Always on.
 
   - `forward_self_supervised`: the JEPA-style predictive branch (§2.1), run ON the
-    HRM loop but PARALLEL across chunks (each chunk's loop is independent -- fresh
-    state, EMPTY memory, no Talker -- so no sequential dependency). `pred_head(
-    loop(encode(chunk_t)))` predicts chunk t+1's EMA-target latent, for every
-    chunk pair at once. Trains the loop to *predict forward* (notes §25/§26).
+    HRM loop and SEQUENTIALLY so the loop reads its accumulating gestalt memory
+    (Thought Gestalt's cross-thought reasoning). Per chunk t: h_t = loop(encode(
+    chunk_t), memory) -> write h_t to memory -> pred_head(h_t) predicts chunk
+    t+1's EMA-target latent. Trains the loop + encoder + pred_head + the memory
+    readers/writers to *reason forward*. Carries the ACT ponder.
 
-So: reconstruction = loop + memory + Talker (decodable); prediction = loop alone
-(forward). Same loop weights, two objectives. `pred_head` is also what generation
-uses (`predict_next_latent`). The former linear SSL / separate projection head /
-detached gen MLP were removed (§26).
+So: reconstruction = encoder + Talker (a codec, no loop); prediction = the loop +
+memory (forward reasoning). The loop is trained ONLY by prediction -- freed from
+the "preserve the current chunk vs. shift to the next" conflict that putting it in
+reconstruction created (notes §27). `pred_head` is also what generation uses
+(`predict_next_latent`); the Talker decodes the loop's predicted (encoder-space)
+latent, the same space it was trained on.
 
 `role_ids` (USER=0 / SELF=1 / SYSTEM=2, see config.role_tags) are threaded
 through explicitly, per §4.2 -- the caller decides whether a given
@@ -152,59 +152,121 @@ class LatentThoughtModel(nn.Module):
         return self.chunk_encoder(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
 
     # ------------------------------------------------------------------
-    # Self-supervised branch: the HRM loop IS the predictor (§2.1 / notes §25).
-    # Parallel across chunks, no memory unroll -- but NOT loop-free.
+    # Reconstruction anchor: a PURE autoencoder (encoder -> Talker). No HRM loop.
     # ------------------------------------------------------------------
-    def forward_self_supervised(self, chunk_tensor: torch.Tensor, chunk_mask: torch.Tensor,
-                                 stage: StageFlags, ema: EMATargetEncoder, cos_weight: float = 1.0,
-                                 var_weight: float = 0.0, chunk_vecs=None) -> torch.Tensor:
+    def forward_grounded(self, chunk_tensor: torch.Tensor, chunk_mask: torch.Tensor,
+                          chunk_vecs=None) -> torch.Tensor:
         """
-        The self-supervised loss, run ON the HRM loop -- the loop is the reasoner
-        that predicts the next chunk's latent, exactly as JEPA-Reasoner runs SSL
-        on its reasoner transformer (§2.1). Returns
-
-            cos_weight * cosine_prediction_loss + var_weight * variance_reg
-
-        PARALLEL across chunks: every chunk's loop is independent -- fresh state,
-        EMPTY memory -- so there is no sequential cross-thought dependency (the
-        "fully parallel across chunks / without unrolling through memory" of §2.1;
-        the Talker and the memory chain are skipped, the loop is NOT). The whole
-        batch*n_chunks set runs through the loop in ONE call. Gradients use the
-        inner-loop 2->5 truncation (stage.inner_loop_grad_window), the §3.5 method
-        the design specifies for exactly this -- so the loop, and under ACT its
-        depth, is trained to reason forward.
-
-        Online = pred_head(loop(encode(chunk_t))); target = the EMA target
-        encoder's next-chunk latent (encoder space, stop-grad). Collapse is held
-        by the always-on reconstruction anchor + the variance floor (on the shared
-        latent) + the slow EMA target -- the A/B (notes §25.1) showed the former
-        projection-head isolation is not needed once SSL is on the loop.
+        The reconstruction/autoencoder anchor (§2.2, notes §27): encode each chunk
+        to a latent, decode THAT SAME chunk's tokens with the Talker. A pure codec
+        -- **no HRM loop, no memory** -- run in parallel over all chunks. This
+        anchors the shared encoder against collapse (a constant latent cannot
+        reconstruct varied chunks) and trains the Talker to decode encoder-space
+        latents: the space the predictor (forward_self_supervised) forecasts into
+        and generation decodes from. The HRM loop is deliberately NOT here --
+        reconstructing the *current* chunk needs a faithful codec, not reasoning,
+        and putting the loop here fought its predictive objective (notes §27).
         """
         batch, n_chunks, chunk_len = chunk_tensor.shape
         device = chunk_tensor.device
         flat_ids = chunk_tensor.reshape(batch * n_chunks, chunk_len)
         if chunk_vecs is None:
             chunk_vecs = self.chunk_encoder(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
-        flat_z = chunk_vecs.reshape(batch * n_chunks, -1)
-
-        # One loop call over every chunk, each independent (empty memory, fresh
-        # state) -- the parallel-across-chunks reasoner pass.
+        flat_valid = chunk_mask.reshape(batch * n_chunks)
+        if not bool(flat_valid.any()):
+            return torch.zeros((), device=device)
+        ids = flat_ids[flat_valid]                                   # (n_real, L)
+        z = chunk_vecs.reshape(batch * n_chunks, -1)[flat_valid]      # (n_real, d)
+        # Codec Talker: conditions purely on the chunk's own latent (empty memory).
         empty_mem = GestaltMemoryBank(self.cfg.memory_capacity, self.cfg.d_model)
-        h_flat, _ = self.hrm_loop(flat_z, empty_mem, None, h_state=None, l_state=None,
-                                  grad_window=stage.inner_loop_grad_window, use_act=stage.use_act)
-        online = self.pred_head(h_flat).reshape(batch, n_chunks, -1)
+        logits = self.talker(ids, z, empty_mem)
+        tok_mask = ids != 0
+        # End-of-chunk (EOS/PAD) supervision on the first pad position of each
+        # shorter-than-max chunk, so decoding can terminate (notes §19.2).
+        lengths = tok_mask.sum(-1)
+        target_mask = tok_mask
+        has_end = (lengths > 0) & (lengths < chunk_len)
+        if has_end.any():
+            target_mask = tok_mask.clone()
+            target_mask[has_end, lengths[has_end]] = True
+        return grounded_nll_loss(logits, ids, target_mask)
 
+    # ------------------------------------------------------------------
+    # Self-supervised branch: the HRM loop IS the predictor, SEQUENTIALLY, reading
+    # the accumulating gestalt memory (§2.1, notes §25/§27).
+    # ------------------------------------------------------------------
+    def forward_self_supervised(self, chunk_tensor: torch.Tensor, chunk_mask: torch.Tensor,
+                                 raw_token_ids: torch.Tensor, raw_mask: torch.Tensor,
+                                 memory: GestaltMemoryBank, role_id: int, stage: StageFlags,
+                                 ema: EMATargetEncoder, cos_weight: float = 1.0,
+                                 var_weight: float = 0.0, ponder_weight: float = 0.0,
+                                 chunk_vecs=None):
+        """
+        The predictive branch (§2.1), run ON the HRM loop and SEQUENTIALLY so the
+        loop reads its *accumulating* gestalt memory as it goes -- Thought
+        Gestalt's cross-thought reasoning (§1.2, §3.6). Per chunk t:
+          h_t = loop(encode(chunk_t), memory)      # attends over all prior thoughts
+          memory.write(h_t)                        # detached in Stage B, un-detached C+
+          pred_head(h_t) -> predict chunk t+1's EMA-target latent (encoder space)
+        Trains the loop, the shared encoder, pred_head, AND the memory
+        readers/writers (which are dead code unless memory is populated -- notes
+        §27). Gradients use the inner-loop 2->5 truncation (§3.5); memory credit is
+        bounded by stage.memory_grad_window (§3.6). Carries the ACT ponder cost.
+
+        Returns (ssl_loss = cos_weight*cos + var_weight*var, ponder_loss). Collapse
+        is held by the always-on autoencoder anchor + the variance floor + the slow
+        EMA target (notes §25.1/§26.1).
+        """
+        batch, n_chunks, chunk_len = chunk_tensor.shape
+        device = chunk_tensor.device
+
+        input_lane_kv, input_lane_mask = None, None
+        if stage.use_input_lanes:
+            aged = memory.filtered_stacked([USER, SYSTEM])
+            aged_mask = (torch.ones(aged.shape[0], aged.shape[1], dtype=torch.bool, device=device)
+                         if aged is not None else None)
+            input_lane_kv, input_lane_mask = self.input_lane(raw_token_ids, raw_mask, aged, aged_mask)
+
+        flat_ids = chunk_tensor.reshape(batch * n_chunks, chunk_len)
+        if chunk_vecs is None:
+            chunk_vecs = self.chunk_encoder(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
         with torch.no_grad():
             tgt = ema.encode(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
 
-        pair = chunk_mask[:, :-1] & chunk_mask[:, 1:]
-        pred, target = online[:, :-1][pair], tgt[:, 1:][pair]
-        cos = (scaled_cosine_loss(pred, target, k=self.cfg.cosine_loss_k)
-               if pred.numel() > 0 else torch.zeros((), device=device))
+        h_state = l_state = None
+        total_ponder = torch.zeros((), device=device)
+        n_valid = 0
+        preds, targets = [], []
+        for t in range(n_chunks):
+            active = chunk_mask[:, t]
+            if not active.any():
+                continue
+            h_state, ponder = self.hrm_loop(
+                chunk_vecs[:, t], memory, input_lane_kv,
+                h_state=h_state, l_state=l_state,
+                grad_window=stage.inner_loop_grad_window, use_act=stage.use_act,
+                input_lane_mask=input_lane_mask,
+            )
+            l_state = h_state
+            total_ponder = total_ponder + ponder
+            n_valid += 1
+            write_vec = h_state.detach() if stage.detach_memory else h_state
+            memory.write(write_vec, role_id)
+            memory.apply_grad_truncation(stage.memory_grad_window)
+            if t + 1 < n_chunks:
+                pair = active & chunk_mask[:, t + 1]
+                if pair.any():
+                    preds.append(self.pred_head(h_state)[pair])
+                    targets.append(tgt[:, t + 1][pair])
+
+        cos = (scaled_cosine_loss(torch.cat(preds, 0), torch.cat(targets, 0), k=self.cfg.cosine_loss_k)
+               if preds else torch.zeros((), device=device))
         flat_valid = chunk_mask.reshape(batch * n_chunks)
-        var = (variance_regularization(flat_z[flat_valid]) if var_weight > 0
-               else torch.zeros((), device=device))
-        return cos_weight * cos + var_weight * var
+        var = (variance_regularization(chunk_vecs.reshape(batch * n_chunks, -1)[flat_valid])
+               if var_weight > 0 else torch.zeros((), device=device))
+        if n_valid > 0:
+            total_ponder = total_ponder / n_valid
+        return cos_weight * cos + var_weight * var, ponder_cost_loss(total_ponder, ponder_weight)
 
     @torch.no_grad()
     def predict_next_latent(self, latent, memory, h_state=None, l_state=None,
@@ -248,114 +310,3 @@ class LatentThoughtModel(nn.Module):
             return 0.0
         return z.std(dim=0).mean().item()
 
-    # ------------------------------------------------------------------
-    # Grounded branch: sequential over chunks, uses the HRM loop + memory + Talker.
-    # ------------------------------------------------------------------
-    def forward_grounded(
-        self,
-        chunk_tensor: torch.Tensor,          # (batch, n_chunks, chunk_len)
-        chunk_mask: torch.Tensor,            # (batch, n_chunks) bool
-        raw_token_ids: torch.Tensor,          # (batch, n_raw) recent raw tokens for input lane
-        raw_mask: torch.Tensor,               # (batch, n_raw) bool
-        memory: GestaltMemoryBank,
-        role_id: int,
-        stage: StageFlags,
-        ponder_weight: float,
-        chunk_vecs=None,
-    ):
-        """
-        Returns (nll_loss, ponder_loss, thoughts) where `thoughts` is the
-        list of per-chunk H-state vectors produced (useful for logging/eval).
-
-        `chunk_vecs` (batch, n_chunks, d_model), if supplied by the caller via
-        encode_chunks, is the shared order-aware chunk latent -- reused here
-        instead of re-encoding, so a step that also runs the SSL/gen branches
-        pays for exactly one online encoder pass.
-        """
-        batch, n_chunks, chunk_len = chunk_tensor.shape
-        device = chunk_tensor.device
-
-        input_lane_kv, input_lane_mask = None, None
-        if stage.use_input_lanes:
-            aged = memory.filtered_stacked([USER, SYSTEM])
-            aged_mask = None
-            if aged is not None:
-                aged_mask = torch.ones(aged.shape[0], aged.shape[1], dtype=torch.bool, device=device)
-            input_lane_kv, input_lane_mask = self.input_lane(raw_token_ids, raw_mask, aged, aged_mask)
-
-        # Order-aware chunk latents from the shared encoder -- the same
-        # representation the self-supervised loss predicts. All chunks are
-        # independent of the loop state, so encode the whole document in one
-        # batched call instead of once per chunk inside the sequential loop.
-        # Reuse the caller's shared encode when provided (encode_chunks).
-        if chunk_vecs is None:
-            flat_ids = chunk_tensor.reshape(batch * n_chunks, chunk_len)
-            chunk_vecs = self.chunk_encoder(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
-
-        h_state, l_state = None, None
-        total_nll = torch.zeros((), device=device)
-        total_ponder = torch.zeros((), device=device)
-        n_valid_chunks = 0
-        thoughts = []
-
-        for t in range(n_chunks):
-            active = chunk_mask[:, t]
-            if not active.any():
-                continue
-
-            chunk_ids = chunk_tensor[:, t, :]                       # (batch, chunk_len)
-            chunk_token_mask = chunk_ids != 0
-            chunk_vec = chunk_vecs[:, t]                             # (batch, d_model)
-
-            if stage.use_hrm_loop:
-                h_state, ponder = self.hrm_loop(
-                    chunk_vec, memory, input_lane_kv,
-                    h_state=h_state, l_state=l_state,
-                    grad_window=stage.inner_loop_grad_window, use_act=stage.use_act,
-                    input_lane_mask=input_lane_mask,
-                )
-                l_state = h_state  # re-seed next chunk's L-state from this thought (§1.1)
-            else:
-                # Stage A: shallow, fixed Reasoner -- the chunk encoder's latent
-                # directly, no recurrence (§5.1's "shallow, fixed-depth Reasoner").
-                h_state = chunk_vec
-                ponder = torch.zeros((), device=device)
-
-            total_ponder = total_ponder + ponder
-            thoughts.append(h_state)
-
-            # Write this thought into the persistent gestalt memory (§1.2).
-            write_vec = h_state.detach() if stage.detach_memory else h_state
-            memory.write(write_vec, role_id)
-            memory.apply_grad_truncation(stage.memory_grad_window)
-
-            # Grounded NLL: teacher-force the Talker on this chunk's tokens.
-            # The target mask also covers the FIRST pad position of each active
-            # shorter-than-max chunk: one supervised end-of-chunk step, with PAD
-            # (reserved id 0, never a real token) acting as EOS. Without it, no
-            # position past a chunk's true length ever receives gradient, so
-            # inference-time decoding has no trained way to terminate a chunk --
-            # it would emit max_chunk_len tokens with an untrained tail every
-            # time, and the garbage tail would be re-encoded into the next
-            # latent. Full-length chunks get no end mark: a capped span
-            # legitimately "continues".
-            logits = self.talker(chunk_ids, h_state, memory)
-            target_mask = chunk_token_mask
-            lengths = chunk_token_mask.sum(-1)                       # (batch,)
-            has_end = active & (lengths > 0) & (lengths < chunk_len)
-            if has_end.any():
-                target_mask = chunk_token_mask.clone()
-                target_mask[has_end, lengths[has_end]] = True        # target there is id 0 = PAD/EOS
-            chunk_nll = grounded_nll_loss(logits, chunk_ids, target_mask)
-            total_nll = total_nll + chunk_nll
-            n_valid_chunks += 1
-
-        if n_valid_chunks > 0:
-            # Normalize both losses per thought, so their magnitudes (and the
-            # effective ponder weight) don't scale with how many chunks a
-            # document happens to have -- doc lengths vary from min_chunks to
-            # max_chunks_per_doc within a run.
-            total_nll = total_nll / n_valid_chunks
-            total_ponder = total_ponder / n_valid_chunks
-        ponder_loss = ponder_cost_loss(total_ponder, ponder_weight)
-        return total_nll, ponder_loss, thoughts

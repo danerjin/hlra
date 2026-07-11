@@ -37,6 +37,7 @@ import torch
 
 from config import model_config
 from model import LatentThoughtModel, StageFlags, SELF
+from ema_target import EMATargetEncoder
 from gestalt_memory import GestaltMemoryBank
 
 
@@ -82,6 +83,7 @@ def main():
 
     cfg = model_config(args.preset, vocab_size=args.vocab)
     model = LatentThoughtModel(cfg, chunker=None).to(device)
+    ema = EMATargetEncoder(model.chunk_encoder, momentum=cfg.ema_momentum).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
     n_params = sum(p.numel() for p in model.parameters())
 
@@ -109,9 +111,13 @@ def main():
         opt.zero_grad(set_to_none=True)
         memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
         with autocast:
-            nll, ponder, _ = model.forward_grounded(ct, cm, ri, rm, memory, SELF, flags,
-                                                    cfg.act_ponder_cost)
-            loss = nll + ponder
+            # Full step: cheap autoencoder anchor + the SEQUENTIAL on-loop SSL
+            # (the loop reading/writing memory) -- the latter dominates cost.
+            nll = model.forward_grounded(ct, cm)
+            ssl, ponder = model.forward_self_supervised(
+                ct, cm, ri, rm, memory, SELF, flags, ema,
+                cos_weight=1.0, var_weight=2.0, ponder_weight=cfg.act_ponder_cost)
+            loss = nll + ssl + ponder
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()

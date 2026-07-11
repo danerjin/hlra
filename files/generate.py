@@ -87,7 +87,8 @@ def _decode(tok, ids):
 
 @torch.no_grad()
 def read_prompt(model, chunker, cfg, prompt):
-    """Chunk + encode the prompt through the HRM loop; return (memory, h, l, last_latent)."""
+    """Chunk + encode the prompt, running the HRM loop to build up its gestalt
+    memory (so the loop can reason forward from it). Returns (memory, h, l, last_latent)."""
     ct, cm = chunker.chunk_batch([prompt])           # (1, C, L)
     memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
     h_state = l_state = last_latent = None
@@ -107,21 +108,21 @@ def read_prompt(model, chunker, cfg, prompt):
 
 
 @torch.no_grad()
-def talker_decode(model, thought, memory, max_len, temperature=0.9, greedy=False):
+def talker_decode(model, latent, cfg, temperature=0.9, greedy=False):
     """
-    Autoregressively decode one chunk's tokens from a thought. PAD (id 0) is
-    the trained end-of-chunk signal (model.forward_grounded supervises the
-    first pad position of every short chunk), so emitting PAD stops the chunk.
-    It is only banned at position 0 to rule out degenerate empty chunks --
-    e.g. under a checkpoint that predates the end-of-chunk supervision, where
-    the PAD logit is untrained noise.
+    Autoregressively decode one chunk's tokens from an ENCODER-space `latent`,
+    using the codec Talker's training convention (empty memory -- the autoencoder
+    conditions purely on the chunk latent). PAD (id 0) is the trained
+    end-of-chunk stop; banned at position 0 to rule out degenerate empty chunks.
     """
+    max_len = cfg.max_chunk_len
+    empty_mem = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
     ids = []
     for _ in range(max_len):
         inp = torch.zeros(1, max_len, dtype=torch.long)
         for j, g in enumerate(ids):
             inp[0, j] = g
-        logits = model.talker(inp, thought, memory)[0, len(ids)]   # (vocab,)
+        logits = model.talker(inp, latent, empty_mem)[0, len(ids)]   # (vocab,)
         if not ids:
             logits[PAD] = -1e9
         if greedy:
@@ -132,8 +133,6 @@ def talker_decode(model, thought, memory, max_len, temperature=0.9, greedy=False
         if nxt == PAD:
             break                                                   # trained end-of-chunk
         ids.append(nxt)
-        if len(ids) >= max_len:
-            break
     return ids
 
 
@@ -143,19 +142,14 @@ def generate(model, chunker, cfg, prompt, n_chunks=3, temperature=0.9, greedy=Fa
     memory, h_state, l_state, last_latent = read_prompt(model, chunker, cfg, prompt)
     out_chunks = []
     for _ in range(n_chunks):
-        # Next-latent prediction in ENCODER space: the HRM loop itself produces it
-        # (run the loop on last_latent, read the next latent off the thought via
-        # pred_head -- the same map forward_self_supervised trains).
-        pred_latent, _ = model.predict_next_latent(last_latent, memory, h_state=h_state,
-                                                   l_state=l_state, grad_window=5, use_act=False)
-        h_state, _ = model.hrm_loop(pred_latent, memory, None, h_state=h_state, l_state=l_state,
-                                    grad_window=5, use_act=False)
+        # The HRM loop predicts the next chunk's ENCODER-space latent, reading its
+        # accumulating gestalt memory; the codec Talker then decodes that predicted
+        # latent (same encoder space the Talker was trained on, notes §27).
+        pred_latent, h_state = model.predict_next_latent(last_latent, memory, h_state=h_state,
+                                                         l_state=l_state, grad_window=5, use_act=False)
         l_state = h_state
-        # Write BEFORE decoding, matching training (model.forward_grounded) and
-        # score(): the Talker is always trained with its own thought as the
-        # newest memory slot, so decoding must see the same memory state.
-        memory.write(h_state.detach(), SELF)
-        ids = talker_decode(model, h_state, memory, cfg.max_chunk_len, temperature, greedy)
+        memory.write(h_state.detach(), SELF)   # write the thought (loop state) to memory
+        ids = talker_decode(model, pred_latent, cfg, temperature, greedy)
         # re-encode the produced chunk to seed the next step
         gen = torch.zeros(1, cfg.max_chunk_len, dtype=torch.long)
         for j, g in enumerate(ids[:cfg.max_chunk_len]):
@@ -167,25 +161,19 @@ def generate(model, chunker, cfg, prompt, n_chunks=3, temperature=0.9, greedy=Fa
 
 @torch.no_grad()
 def score(model, chunker, cfg, text):
-    """Teacher-forced perplexity of `text` under the model."""
+    """Teacher-forced RECONSTRUCTION (autoencoder) perplexity of `text`: encode
+    each chunk, decode it with the codec Talker (empty memory), token-weighted
+    NLL. This is the model's decodability signal -- matches training's val_loss
+    (notes §27); no HRM loop is involved."""
     ct, cm = chunker.chunk_batch([text])
-    memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
-    h_state = l_state = None
+    empty_mem = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
     total_nll, n = 0.0, 0
     for t in range(ct.shape[1]):
         if not bool(cm[0, t]):
             continue
         chunk_ids = ct[:, t, :]
         latent = model.chunk_encoder(chunk_ids, chunk_ids != 0)
-        h_state, _ = model.hrm_loop(latent, memory, None, h_state=h_state, l_state=l_state,
-                                    grad_window=5, use_act=False)
-        l_state = h_state
-        memory.write(h_state.detach(), SELF)
-        logits = model.talker(chunk_ids, h_state, memory)
-        # Token-weighted accumulation: grounded_nll_loss returns the per-token
-        # MEAN within this chunk, so weight it by the chunk's real-token count.
-        # (A plain mean-of-chunk-means over-weights short chunks and is not
-        # comparable with baseline_gpt.eval_ppl's token-weighted number.)
+        logits = model.talker(chunk_ids, latent, empty_mem)
         n_tok = int((chunk_ids != 0).sum())
         total_nll += grounded_nll_loss(logits, chunk_ids, chunk_ids != 0).item() * n_tok
         n += n_tok

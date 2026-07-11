@@ -112,45 +112,48 @@ def main():
     print(f"[3] built {args.preset} model: {n_params/1e6:.1f}M params on {device}")
 
     ct, cm, ri, rm = synth_batch(cfg, args.batch_size, device)
-    # Stage C flags: HRM loop on, memory un-detached, no ACT/lanes -- the
-    # sequential reconstruction path that dominates cost A..E.
     flags = StageFlags(use_hrm_loop=True, detach_memory=False, inner_loop_grad_window=5,
                        memory_grad_window=5, use_act=False, use_input_lanes=False)
-    memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
+    # Autoencoder anchor (encoder -> Talker, no loop): cheap/parallel, exercises
+    # the Talker + encoder + CE under autocast.
     with torch.autocast(device_type="cuda", dtype=dtype):
-        nll, ponder, _ = model.forward_grounded(ct, cm, ri, rm, memory, SELF, flags,
-                                                cfg.act_ponder_cost)
-        loss = nll + ponder
+        loss = model.forward_grounded(ct, cm)
     loss.backward()
     torch.cuda.synchronize()
     grad_finite = all(finite(p.grad) for p in model.parameters() if p.grad is not None)
-    print(f"    grounded loss finite: {finite(loss)} (nll={float(nll):.3f})   grads finite: {grad_finite}")
+    print(f"    autoencoder loss finite: {finite(loss)} (nll={float(loss):.3f})   grads finite: {grad_finite}")
     ok &= finite(loss) and grad_finite
 
-    # 4. forward_self_supervised (on-loop SSL: cosine + variance) under autocast --
-    # This runs the HRM loop (the predictor), so it exercises the loop's ops under
-    # autocast on the SSL path too, not just reconstruction.
+    # 4. forward_self_supervised (on-loop SSL, Stage C: loop + un-detached memory) --
+    # the load-bearing check: it runs the sequential HRM loop reading/writing the
+    # gestalt memory, exercising hard_normalize / the decay gate / masked softmax /
+    # cross-attention under autocast -- exactly the ops that can NaN in mixed precision.
     model.zero_grad(set_to_none=True)
     ema = EMATargetEncoder(model.chunk_encoder, momentum=cfg.ema_momentum).to(device)
+    memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
     with torch.autocast(device_type="cuda", dtype=dtype):
-        ssl = model.forward_self_supervised(ct, cm, flags, ema, cos_weight=1.0, var_weight=2.0)
-    ssl.backward()
+        ssl, ponder = model.forward_self_supervised(ct, cm, ri, rm, memory, SELF, flags, ema,
+                                                    cos_weight=1.0, var_weight=2.0,
+                                                    ponder_weight=cfg.act_ponder_cost)
+        loss4 = ssl + ponder
+    loss4.backward()
     torch.cuda.synchronize()
-    print(f"[4] on-loop SSL loss finite: {finite(ssl)} (ssl={float(ssl):.4f})")
-    ok &= finite(ssl)
+    print(f"[4] on-loop SSL (loop+memory) finite: {finite(loss4)} (ssl={float(ssl):.4f})")
+    ok &= finite(loss4)
 
-    # ACT path too (Stage E) -- variable depth + halting head under autocast.
+    # 5. ACT path (Stage D) -- variable inner-loop depth + halting head under autocast.
     model.zero_grad(set_to_none=True)
     flags_e = StageFlags(use_hrm_loop=True, detach_memory=False, inner_loop_grad_window=5,
                          memory_grad_window=5, use_act=True, use_input_lanes=False)
     memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
     with torch.autocast(device_type="cuda", dtype=dtype):
-        nll_e, ponder_e, _ = model.forward_grounded(ct, cm, ri, rm, memory, SELF, flags_e,
-                                                    cfg.act_ponder_cost)
-        loss_e = nll_e + ponder_e
+        ssl_e, ponder_e = model.forward_self_supervised(ct, cm, ri, rm, memory, SELF, flags_e, ema,
+                                                        cos_weight=1.0, var_weight=2.0,
+                                                        ponder_weight=cfg.act_ponder_cost)
+        loss_e = ssl_e + ponder_e
     loss_e.backward()
     torch.cuda.synchronize()
-    print(f"[5] ACT (stage E) loss finite: {finite(loss_e)} (ponder={float(ponder_e):.4f})")
+    print(f"[5] ACT (loop) loss finite: {finite(loss_e)} (ponder={float(ponder_e):.4f})")
     ok &= finite(loss_e)
 
     print("=" * 64)

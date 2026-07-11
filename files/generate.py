@@ -75,7 +75,16 @@ def load(ckpt_path: str = CKPT):
               f"(Pre-§25 checkpoints trained a different predictor head and cannot "
               f"drive the HRM-loop predictor.)")
     if unexpected:
-        raise SystemExit(f"checkpoint has unexpected keys (wrong model?): {unexpected[:5]}")
+        # Pre-§25/§27 checkpoints carry modules that were since removed (the old
+        # linear-SSL projection head and detached gen MLP). Those are harmless to
+        # ignore -- reconstruction/--score still work; only generation quality is
+        # limited (see the `missing` warning above). Anything else is a wrong model.
+        _LEGACY_KEY_PREFIXES = ("ssl_proj.", "latent_predictor.", "gen_predictor.")
+        truly_unknown = [k for k in unexpected if not k.startswith(_LEGACY_KEY_PREFIXES)]
+        if truly_unknown:
+            raise SystemExit(f"checkpoint has unexpected keys (wrong model?): {truly_unknown[:5]}")
+        print(f"[generate] WARNING: ignoring legacy checkpoint module(s) "
+              f"{sorted({k.split('.')[0] for k in unexpected})} (pre-restructure checkpoint).")
     model.eval()
     return model, chunker, cfg, ckpt
 

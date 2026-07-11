@@ -48,7 +48,7 @@ loop to reason forward. See the design doc §2.3.
 | `data.py` / `data_prep.py` | Real-text pipeline (HF streams) + offline synthetic fallback; offline pre-chunking into a shard cache. |
 | `trainer.py` / `train_scaled.py` | Scale-ready trainer (AMP, grad-accum, LR schedule, checkpoint/resume, per-stage budgets) + its entry point. |
 | `train.py` / `train_real.py` / `run_small.py` | Smoke entry points (offline; ~1M-token real run). |
-| `generate.py` | Load a checkpoint → read prompt → the loop predicts the next latent → the codec Talker decodes it. `--score` = reconstruction perplexity. |
+| `generate.py` | Load a checkpoint → read prompt → the loop predicts the next latent (rescaled onto the encoder-latent shell; the cosine loss trains direction, not scale) → the codec Talker decodes it. `--score` = reconstruction perplexity. |
 | `baseline_gpt.py` | Standard GPT baseline for a matched-scale comparison. |
 | `rocm_smoke.py` / `bench_throughput.py` / `profile_transition.py` | GPU finiteness check, throughput/ETA sweep, L-gate profiler. |
 | `plot_metrics.py` / `plot_comparison.py` | Render training curves / the baseline comparison. |
@@ -98,4 +98,9 @@ Size presets (`config.MODEL_PRESETS`): `smoke` (~43M) → `small` (512-d, ~152M)
 - **`ssl_loss_weight`** (co-equal with reconstruction) is validated collapse-free but may want tuning
   at full scale.
 - **Stage F** (two-lane dialogue, anti-sycophancy loss) is designed but not yet exercised.
-- The `--amp` path is implemented; sanity-check it on the first CUDA run (`rocm_smoke.py`).
+- The `--amp` path is implemented; sanity-check it on the first CUDA run (`rocm_smoke.py`,
+  6 checks covering the training-mode and eval-mode/monitoring paths — it must end `PASS`).
+- A 2026-07-10 pre-flight review (gradient-routing audit, truncation severance, A→E walk,
+  resume equivalence) found the training path clean; see `notes.md` for the three
+  inference/tooling fixes it landed and the items it flagged (notably: fix the input-lane
+  target leak before ever training Stage F on generic documents).

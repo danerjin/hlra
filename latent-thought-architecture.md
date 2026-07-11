@@ -99,7 +99,9 @@ This trains the **loop + encoder + pred_head + the memory readers/writers** to r
 JEPA-Reasoner's self-supervised objective, run *on the reasoner* (the loop) exactly as JEPA-Reasoner
 runs it on its reasoner transformer — and *sequentially with memory* so it is also Thought Gestalt's
 un-detached cross-thought reasoning. Gradients use the inner-loop 2→5 truncation; cross-thought credit
-through memory is bounded by its own window. Generation uses the same `pred_head`.
+through memory is bounded by its own window. Generation uses the same `pred_head`, its output rescaled
+onto the encoder-latent norm shell at inference — the cosine objective trains the prediction's
+*direction*, not its scale, and the Talker consumes latents unnormalized.
 
 ### 2.3 Why the loop is in prediction and not reconstruction
 

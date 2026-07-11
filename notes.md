@@ -56,6 +56,49 @@ memory → **D** ACT → **E** consolidate → **F** dialogue. The predictor tur
   (~2 ppl). Reconstruction alone floors ~38 ppl at smoke scale (the 192-d thought bottleneck). One
   data point, not the architecture's value proposition.
 
+## Pre-flight review before the big run (2026-07-10)
+
+A full spec + code review with fresh smoke audits: per-module gradient routing,
+inner-loop truncation severance (fixed depth and ACT, incl. the ponder term),
+memory grad-window checks, a full A→E walk of `train_scaled.py` on a tiny
+offline cache, and a kill/resume equivalence check (the resumed run reproduces
+the uninterrupted trajectory to ~1e-3; the schedule-drift warning fires on
+changed flags). The A→E training path came through clean — every audit matched
+the design doc. Three fixes landed, none touching the training path:
+
+- **`predict_next_latent` rescales the predicted latent onto the encoder-latent
+  norm shell** (model.py). The SSL objective is a scaled *cosine* — scale-
+  invariant — so `pred_head` learns the target's direction but its output norm
+  is unconstrained (measured ~0.6x the encoder-latent norm on a trained
+  checkpoint), while the Talker consumes latents as *unnormalized*
+  cross-attention K/V. Generation now rescales the prediction to the incoming
+  latent's norm (fallback √d for a zero prompt). Inference-only.
+- **`generate.py` no longer hard-exits on pre-restructure checkpoints.** Known
+  legacy modules (`ssl_proj`, `latent_predictor`, `gen_predictor`) are ignored
+  with a warning, so `--score` (the codec path) works on old checkpoints.
+  Truly unknown state-dict keys still abort.
+- **`rocm_smoke.py` gained check [6]: the eval-mode monitoring path.**
+  `Trainer.evaluate()` and the `lstd` collapse metric run an eval-mode encoder
+  (the fused BetterTransformer kernel, no autocast) every `log_every` steps —
+  a different ROCm code path than the training-mode forwards, and the family
+  that misbehaved before (§18.1). The GPU pre-flight now covers it.
+
+Flagged, deliberately not changed:
+
+- **Stage F would leak the SSL target through the input lane.**
+  `encode_recent` takes the raw window from the document *tail*, so with
+  `use_input_lanes=True` the loop could cross-attend to chunk t+1's own tokens
+  while predicting it. Irrelevant to A→E (lanes off) and to real dialogue data
+  (the lane is the fixed user turn), but fix before training Stage F on
+  generic documents.
+- `CachedChunkDataset` holds the whole cache in RAM (~10 GB at 1.2B tokens,
+  ~2x transient at init). Fine on the 128 GB Linux box with fork workers;
+  don't move the run to a spawn-based platform without rethinking it.
+- AdamW weight-decays LayerNorm gains, embeddings, and the decay-gate
+  `theta`/`log_dt` (no param groups). Left as-is: the validated smoke/512-d
+  runs trained this way, and re-grouping the optimizer right before the big
+  run would invalidate that validation. Optional experiment for later.
+
 ## Open items before a large run
 
 - **Re-confirm at full scale (~1.2B tokens):** watch `val_loss` at the Stage-B predictor boundary; the
@@ -65,7 +108,9 @@ memory → **D** ACT → **E** consolidate → **F** dialogue. The predictor tur
 - **ACT halting doesn't learn** (soft ponder cost, no compute-vs-quality gradient) — a real ACT
   accumulator is needed to make adaptive depth a learned dial.
 - **Stage F** (two-lane dialogue, anti-sycophancy loss) is designed but not exercised.
-- **`--amp`** validated only on synthetic tensors; run `rocm_smoke.py` on the GPU box first.
+- **`--amp`** validated only on synthetic tensors; run `rocm_smoke.py` on the GPU box first
+  (now 6 checks — it must end `PASS`, incl. the eval-mode monitoring path added in the
+  2026-07-10 pre-flight review).
 
 ---
 

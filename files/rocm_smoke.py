@@ -156,6 +156,21 @@ def main():
     print(f"[5] ACT (loop) loss finite: {finite(loss_e)} (ponder={float(ponder_e):.4f})")
     ok &= finite(loss_e)
 
+    # 6. the monitoring path: eval-mode forward (Trainer.evaluate + the lstd
+    # collapse metric run this every log_every steps, WITHOUT autocast). An
+    # eval-mode nn.TransformerEncoder takes the fused BetterTransformer kernel
+    # -- a different ROCm code path than the training-mode forwards above, and
+    # the one that historically misbehaved when mixed with other dtypes (§18.1).
+    model.eval()
+    with torch.no_grad():
+        val = model.forward_grounded(ct, cm)
+    lstd = model.latent_collapse_metric(ct, cm)
+    torch.cuda.synchronize()
+    lstd_ok = lstd == lstd and abs(lstd) != float("inf")   # finite python float
+    print(f"[6] eval-mode (fused) val path finite: {finite(val)} (val={float(val):.3f}, lstd={lstd:.4f})")
+    ok &= finite(val) and lstd_ok
+    model.train()
+
     print("=" * 64)
     if ok:
         print("PASS: training path runs and stays finite on this GPU under "

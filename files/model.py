@@ -276,10 +276,24 @@ class LatentThoughtModel(nn.Module):
         `latent` and read the next latent off the finished thought via pred_head
         (the same map forward_self_supervised trains). Returns (pred_latent,
         thought); the thought is the carried loop state.
+
+        The SSL loss is a scaled COSINE (scale-invariant), so pred_head learns the
+        target's direction but its output norm is unconstrained (measured ~0.6x the
+        encoder-latent norm on a trained checkpoint). The Talker consumes the latent
+        as unnormalized cross-attention K/V, so a mis-scaled latent shifts it off the
+        distribution it was trained on. Rescale the prediction onto the encoder-latent
+        shell: encoder latents end in a LayerNorm, so their norms concentrate tightly
+        and the incoming `latent`'s own norm is the right target (fall back to
+        sqrt(d) if the caller passed a zero vector, e.g. an empty prompt).
         """
         h, _ = self.hrm_loop(latent, memory, None, h_state=h_state, l_state=l_state,
                               grad_window=grad_window, use_act=use_act)
-        return self.pred_head(h), h
+        pred = self.pred_head(h)
+        tgt_norm = latent.norm(dim=-1, keepdim=True)
+        tgt_norm = torch.where(tgt_norm > 1e-3, tgt_norm,
+                               torch.full_like(tgt_norm, self.cfg.d_model ** 0.5))
+        pred = pred / pred.norm(dim=-1, keepdim=True).clamp_min(1e-6) * tgt_norm
+        return pred, h
 
     @torch.no_grad()
     def latent_collapse_metric(self, chunk_tensor: torch.Tensor, chunk_mask: torch.Tensor) -> float:

@@ -148,15 +148,18 @@ combines.
    co-equal with reconstruction, with the variance floor + reconstruction anchor + EMA target holding
    collapse.)*
 
-2. **Grounded end-to-end loss** (expensive, Thought-Gestalt-style): periodically, run the Talker,
-   take its NLL loss on realized tokens, and backprop through the latent thought, through the
-   inner HRM loop, and back through the un-detached gestalt memory into earlier thought-steps.
-   This is what keeps latents *decodable*, not just self-predictive — pure self-distillation
-   objectives can drift toward representations that are self-consistent but not linguistically
-   expressible. Concretely this is a **reconstruction (autoencoder) loss** — encode a chunk, run
-   the loop, decode that same chunk's tokens — which is *why* it resists collapse: a constant latent
-   cannot reconstruct varied chunks. It is therefore the anti-collapse **anchor** for the shared
-   encoder, not merely a regularizer (§2.4).
+2. **Grounded reconstruction loss** — run the Talker on the realized tokens and take its NLL. This is
+   what keeps latents *decodable*, not just self-predictive — pure self-distillation objectives can
+   drift toward representations that are self-consistent but not linguistically expressible.
+   Concretely it is a **pure autoencoder codec**: encode a chunk → the Talker decodes *that same
+   chunk* — with **no HRM loop and no memory** (notes §27; the loop and the un-detached gestalt
+   memory belong to the *predictive* loss (1), which is where forward reasoning and cross-thought
+   credit live). It resists collapse because a constant latent cannot reconstruct varied chunks, so
+   it is the always-on anti-collapse **anchor** for the shared encoder, and the Talker it trains is a
+   clean readout of the encoder's latent space — the space the predictor forecasts into and
+   generation decodes from. *(Earlier drafts ran this through the loop; §27 removed the loop from
+   reconstruction because "preserve the current chunk" and "predict the next" were fighting over the
+   loop's output.)*
 
 3. **Credit-assignment truncation** (HRM-Text, applied at two levels): warm up the backward
    horizon — start by backpropagating through only the last two steps, expand to the last five as
@@ -436,6 +439,20 @@ turn.
 ---
 
 ## 5. Training curriculum
+
+> **RESTRUCTURED (notes §27) — current stage layout.** The per-stage prose below
+> keeps the original reasoning, but the *implemented* curriculum changed when the
+> loop was moved out of reconstruction and into the (sequential) predictor:
+> - **A** — autoencoder codec only (encoder → Talker, no loop). Grounds the codec
+>   + EMA target. (Was: "ground the Talker on a shallow fixed Reasoner".)
+> - **B** — turn on the HRM loop + the on-loop SSL predictor; fixed depth, inner
+>   grad warmup 2→5; memory detached. **SSL now starts here, not at D.**
+> - **C** — un-detach the gestalt memory (cross-thought reasoning), 1→5 warmup.
+> - **D** — ACT (adaptive depth).
+> - **E** — consolidation (full config).  **F** — dialogue / two-lane.
+> The staging *logic* (§5.0: each mechanism needs the prior stable; §5.4: don't
+> turn the predictor on against ungrounded latents — now satisfied by Stage A) is
+> unchanged; only the assignment of mechanisms to stages moved.
 
 ### 5.0 Why this can't be trained end-to-end from a random init
 

@@ -2088,3 +2088,23 @@ clean cross-stage signal with no contaminated-eval jump).
 - Cost note: the expensive path is now the *sequential SSL loop* (not
   reconstruction, which is a cheap parallel codec). `bench_throughput.py` times the
   full step (autoencoder + SSL); budget from that.
+
+### 27.6 512-d validation of the restructured design — passes
+
+Ran A→E at the `small` preset (512-d, 152M) on the real pile-10k cache (658 docs),
+new default (autoencoder anchor + on-loop sequential SSL from Stage B). The
+collapse check is now the **Stage-B** boundary (SSL turns on there, not D):
+
+    A          val 9.78 -> 9.29
+    B (SSL on) val 8.84 -> 8.52     <- monotone DOWN through the boundary; no regression
+    C          val 8.22 -> 8.06
+    D (ACT)    val 7.95 -> 7.84
+    E          val 7.78 -> 7.66
+    lstd rose 0.14 -> 0.79 over the run (healthy; the encoder spreads, opposite of collapse)
+    ssl decreased through B+ (the loop learning to predict); ponder small from D
+
+**Verdict: no collapse.** `val_loss` falls straight through the Stage-B SSL
+boundary, and `lstd` rises rather than craters. Consistent with the smoke A→E and
+the §26.1 512-d check. Still a modest budget (~268k tokens, 90 steps) -- the full
+~1.2B-token run should re-confirm and `ssl_loss_weight` may want tuning -- but the
+restructured design is collapse-clean at the width where risk is highest.

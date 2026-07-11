@@ -14,6 +14,17 @@ end-to-end (Stages A→F) both **offline** (synthetic text, no downloads) and on
 **real text** (a HuggingFace corpus), can **save a checkpoint**, plot training
 curves, and **generate** from the model.
 
+> 🔴 **HIGHLY MAJOR CHANGE (notes §27) — the two losses were split by role.**
+> **Reconstruction is now a pure autoencoder** (encoder → Talker, **no HRM
+> loop**). **The HRM loop lives only in the predictive self-supervised loss**,
+> which runs **sequentially** so the loop reads its accumulating gestalt memory
+> (this is what finally trains the cross-thought memory). The loop is trained
+> *only* by prediction; the Talker *only* by reconstruction. **Curriculum
+> reshuffled** — SSL now starts at **Stage B** (not D); `val_loss` = autoencoder
+> reconstruction. This supersedes the loss/curriculum descriptions throughout
+> this README and the design doc; §27 is the source of truth. Verified at smoke
+> scale (no collapse); **not yet at `small`+.**
+
 > **See [`notes.md`](notes.md) for the full engineering log** — every bug found
 > and fixed, all training-run results, and the theory/observation notes behind
 > the decisions here. This README is the map; `notes.md` is the story.
@@ -32,18 +43,18 @@ curves, and **generate** from the model.
 | `hrm_loop.py` | §1.1, §3.2, §3.5, §5.5 | The inner HRM loop: fast L-module, slow H-module, the diagonal decay gate, ACT adaptive depth (ponder cost rewards halting), and in-loop truncated BPTT (`_TruncationSchedule` — the §3.5 grad window, cut mid-loop on the carried states). |
 | `talker.py` | §1.3 | Lightweight causal decoder reconstructing a chunk's tokens from a finished thought. Teacher forcing is right-shifted internally (learned start vector) so it can't trivially copy the input; boolean causal mask (MPS/AMP-safe). |
 | `input_lane.py` | §4.1, §4.2 | Bidirectional input-lane encoder; read-only via cross-attention, never writes recurrent self-state. All-masked-row guard against NaN. |
-| `ema_target.py` | §2.1, §3.4 | `ChunkEncoder` (the shared latent producer) + `EMATargetEncoder`, a momentum copy of the encoder **and** the SSL projection head, with `state_dict`/`load_state_dict` for checkpointing. All-pad-row guard. |
-| `losses.py` | §2, §5.5, §2.4 | Scaled cosine loss, grounded NLL, ACT ponder cost, and the VICReg-style `variance_regularization` anti-collapse floor. |
-| `model.py` | §1-§4, §2.1 | `LatentThoughtModel`: shared `chunk_encoder`, HRM reasoner, Talker, two-lane input, `pred_head` (the loop's next-latent head), `forward_grounded` (reconstruction anchor), `forward_self_supervised` (the **on-loop** SSL: `loop(encode(chunk_t))→pred_head` predicts chunk t+1's EMA latent + variance floor — the loop IS the predictor, notes §26), `latent_collapse_metric`. The former linear SSL / separate projection head / detached gen MLP were removed (§26). |
-| `curriculum.py` | §5 | Stage A→F flags/loss-plan. Gates on validation-loss plateau *or* fixed per-stage step budgets; `state_dict`/`load` for resume. |
+| `ema_target.py` | §2.1, §3.4 | `ChunkEncoder` (the shared latent producer) + `EMATargetEncoder`, a momentum copy of the encoder (encoder-space `encode`, no projection since §26), with `state_dict`/`load_state_dict`. All-pad-row guard. |
+| `losses.py` | §2, §5.5 | Scaled cosine loss (the SSL prediction term), grounded NLL (autoencoder reconstruction), ACT ponder cost, VICReg-style `variance_regularization` anti-collapse floor. |
+| `model.py` | §1-§4 (notes §27) | `LatentThoughtModel`: shared `chunk_encoder`, HRM reasoner, Talker, two-lane input, `pred_head` (the loop's next-latent head). **`forward_grounded`** = pure autoencoder (encoder→Talker, **no loop/memory**) — the anchor. **`forward_self_supervised`** = the on-loop predictor run **sequentially with the gestalt memory** (`h_t=loop(z_t,memory)`→write→`pred_head(h_t)` predicts chunk t+1's EMA latent + variance floor + ACT ponder). `latent_collapse_metric`. |
+| `curriculum.py` | §5 (notes §27) | Stage A→F flags/loss-plan: **A** autoencoder-only, **B** loop+SSL (memory detached), **C** un-detach memory, **D** ACT, **E** consolidate, **F** dialogue. Gates on plateau *or* fixed per-stage budgets; `state_dict`/`load` for resume. |
 | `data.py` | §3.1, §5.6 | Real-text pipeline: HF mixture stream (`iter_hf_mixture`), single-dataset stream (`iter_hf_single`), offline synthetic-text + stub-SaT fallback, `ReservePadTokenizer` (id-0 = PAD), in-pipeline chunking + length bucketing, and `CachedChunkDataset` (map-style over a pre-chunked shard cache). |
 | `train.py` | §5, §5.7 | Smoke training entry (offline by default; `LATENT_USE_HF=1` = real streaming mixture). Device-aware; grounded/SSL loss orchestration. |
 | `run_small.py` | — | ~1M-token smoke run on real text (pile-10k) via the offline stub chunker (only `datasets` needed). |
 | `train_real.py` | — | ~1.5M-token run with the **real gpt2 tokenizer** (decodable output); writes `runs/model.pt` + `runs/metrics.json`. |
 | `plot_metrics.py` | — | Renders `runs/metrics.json` to `runs/loss_curves.png` (val loss, train NLL/SSL, and the latent-std collapse monitor, with stage bands). |
-| `generate.py` | §1.3, §2.1 | Use a checkpoint: tokenize a prompt → read it through the HRM loop → predict the next latent in encoder space via the **HRM loop + `pred_head`** (`predict_next_latent`, the same map the on-loop SSL trains, notes §26) → decode with the Talker → detokenize. `--score` reports perplexity. Loads pre-§26 checkpoints with a warning (their predictor head can't drive the loop predictor). |
+| `generate.py` | §1.3 (notes §27) | Use a checkpoint: read the prompt through the HRM loop (building its gestalt memory) → the loop predicts the next encoder-space latent (`predict_next_latent`) → the **codec Talker** decodes that latent → detokenize. `--score` reports **autoencoder reconstruction** perplexity (no loop). Pre-§26 checkpoints load with a warning. |
 | `data_prep.py` | scaling | Offline pre-chunking: run chunking + tokenization once, write sharded chunk tensors + manifest to a cache dir. |
-| `trainer.py` | scaling | `Trainer`: AMP autocast, gradient accumulation, warmup→cosine LR schedule, atomic checkpoint/resume (schedule-exact since notes §15.3), fixed-budget curriculum gating, collapse monitor, `gen` head loss from Stage D. |
+| `trainer.py` | scaling | `Trainer`: AMP autocast, gradient accumulation, warmup→cosine LR schedule, atomic checkpoint/resume (schedule-exact since notes §15.3), fixed-budget curriculum gating, collapse monitor. Loss per step: autoencoder anchor (always) + on-loop SSL from Stage B. |
 | `train_scaled.py` | scaling | Scale-oriented entry point: trains from the pre-chunked cache via `Trainer`, using a `MODEL_PRESETS` size preset. `--lr-schedule per-stage` (default) gives each stage its own warmup→cosine (the notes §12 curriculum fix); `global` reverts. |
 | `baseline_gpt.py` | comparison | Standard decoder-only GPT baseline (two presets: `same-params` / `same-compute`) for a fair-scale memorization comparison vs the latent model. See notes §13.3. |
 | `rocm_smoke.py` | scaling | Validate the training path stays finite under bf16 on an AMD ROCm GPU (Strix Halo, gfx1151) — synthetic tensors, no data. First real execution of the AMP path. See `STRIX_HALO.md`. |
@@ -95,35 +106,35 @@ scale** (perplexity ~3k vs. random 50k; output is real subword text but
 incoherent). Its purpose is to exercise the full architecture end-to-end and
 feed `generate.py`. See `notes.md` for the numbers and the honest read.
 
-## The self-supervised loss runs ON the HRM loop (notes §25/§26)
+## The two losses, split by role (notes §27)
 
-The self-supervised (SSL) loss is the design's forward-prediction signal, and it
-runs **on the HRM loop** — the loop is the reasoner that predicts the next chunk's
-latent (`model.forward_self_supervised`: `pred_head(loop(encode(chunk_t)))`
-predicts chunk *t+1*'s EMA-target latent), exactly as JEPA-Reasoner runs SSL on
-its reasoner transformer (design §2.1). Parallel across chunks (each chunk's loop
-is independent — empty memory, fresh state), gradients via the inner-loop 2→5
-truncation. This is what trains the loop to reason forward, not only to
-reconstruct.
+- **Reconstruction = a pure autoencoder codec.** `forward_grounded`: encode chunk
+  *t* → the Talker decodes chunk *t*, parallel over chunks, **no HRM loop, no
+  memory**. Trains encoder + Talker. Because a constant latent can't reconstruct
+  varied chunks, this is the always-on **anti-collapse anchor**, and it's what
+  `val_loss` / `--score` measure.
+- **Prediction = the HRM loop, run sequentially with memory.** `forward_self_
+  supervised`: per chunk *t*, `h_t = loop(z_t, memory)` reads the *accumulating*
+  gestalt memory (Thought Gestalt cross-thought reasoning), writes `h_t` back,
+  and `pred_head(h_t)` predicts chunk *t+1*'s EMA-target latent (scaled cosine, k
+  =4). Trains the loop + encoder + `pred_head` + the memory readers/writers to
+  reason forward. Gradients via the inner-loop 2→5 truncation; memory credit
+  bounded by the memory window.
 
-The collapse defenses (a shared encoder + SSL can collapse the latent — the first
-real run hit cosine → 0.996; notes §5):
-- **Reconstruction (grounded) loss is the always-on anchor** — an autoencoder
-  (encode chunk → HRM → decode same chunk), which cannot be satisfied by a
-  constant latent. Runs every step.
-- **Variance floor** (`losses.variance_regularization`) on the shared latent — a
-  dormant safety net that activates only as the latent nears collapse.
-- **Slow EMA target** (momentum 0.996) — a harder target to chase into a constant.
-- **`latent_std` collapse monitor** logged every eval; validation is measured
-  **reconstruction-only** so it stays comparable across the Stage-D boundary.
+Collapse defenses (a shared encoder under a predictive loss can collapse — the
+first real run hit cosine → 0.996; notes §5): the always-on autoencoder anchor,
+the **variance floor** (`losses.variance_regularization`) on the shared latent,
+and the **slow EMA target** (momentum 0.996). The `latent_std` monitor is logged
+every eval; `val_loss` is reconstruction-only so it stays comparable across
+stages. The primary collapse signal is a **`val_loss` regression when SSL turns on
+at Stage B** (see below); `latent_std` is width-dependent (§ TRAINING.md).
 
-The earlier fix (a **separate `ssl_proj` projection head** to isolate a linear,
-loop-free SSL, cosine weight ≈0.1) was **removed** (notes §26): the §25.1 A/B
-showed the on-loop loss is *more* collapse-robust than that linear SSL and the
-projection head is not load-bearing. On-loop SSL now runs co-equal with
-reconstruction (`ssl_loss_weight=1.0`). Verified no collapse at smoke scale;
-**re-validate at `small`+ before the big run** (the §2.4 collapse history means
-smoke health is necessary, not sufficient).
+History (notes §24–§27): the SSL was once a separate linear `ssl_proj` head
+(removed §26 — the on-loop loss is more collapse-robust and the projection head
+isn't load-bearing), then briefly an on-loop-but-*parallel* predictor sharing the
+loop with reconstruction (restructured §27 — the loop was fighting itself, and
+the parallel/empty-memory SSL never trained the gestalt memory). Verified no
+collapse at smoke scale; **re-validate at `small`+ before the big run.**
 
 ## Scaling up
 

@@ -32,7 +32,8 @@ from curriculum import Curriculum, Stage
 
 class Trainer:
     def __init__(self, model, ema, optimizer, curriculum: Curriculum,
-                 model_cfg, train_cfg, train_loader, val_loader, ckpt_dir):
+                 model_cfg, train_cfg, train_loader, val_loader, ckpt_dir,
+                 data_fingerprint: dict = None):
         self.model = model
         self.ema = ema
         self.optimizer = optimizer
@@ -43,6 +44,13 @@ class Trainer:
         self.val_loader = val_loader
         self.ckpt_dir = ckpt_dir
         self.device = next(model.parameters()).device
+        # Identity of the dataset this run was launched against (train_scaled
+        # passes the cache's example/token counts). Stored in every checkpoint
+        # and compared on resume: the val/train split is a seeded randperm over
+        # len(dataset), so a cache that changed size between launch and resume
+        # silently reshuffles the split and leaks val docs into train --
+        # poisoning val_loss, the run's collapse signal.
+        self.data_fingerprint = data_fingerprint
 
         self.global_step = 0
         self.metrics = []
@@ -162,7 +170,6 @@ class Trainer:
 
     # ------------------------------------------------------------------
     def train(self, max_steps: int):
-        import random
         accum = max(1, self.train_cfg.grad_accum_steps)
         while self.curriculum.stage.value <= Stage.E.value and self.global_step < max_steps:
             flags = self.curriculum.stage_flags()
@@ -175,12 +182,14 @@ class Trainer:
             step_logs, last_cc = {}, None
             for _ in range(accum):
                 batch = self._next_batch()
-                run_grounded = (not plan.use_self_supervised_loss
-                                or random.random() < self.train_cfg.grounded_loss_min_frequency)
                 with self._autocast():
-                    loss, logs, cc = self._loss_on(batch, flags, plan, run_grounded)
+                    loss, logs, cc = self._loss_on(batch, flags, plan, True)
                 last_cc = cc
-                if loss is None:
+                # A batch with zero valid chunks returns a grad-free zero
+                # (model.forward_grounded's empty guard); backward() on it
+                # would raise. min_chunks filtering makes this near-impossible,
+                # but a multi-day run shouldn't die on one degenerate batch.
+                if loss is None or not loss.requires_grad:
                     continue
                 loss = loss / accum
                 (self.scaler.scale(loss).backward() if self.scaler is not None else loss.backward())
@@ -214,12 +223,15 @@ class Trainer:
 
             if self.train_cfg.checkpoint_every and self.global_step % self.train_cfg.checkpoint_every == 0:
                 self.save("checkpoint.pt")
-                # Numbered snapshots (rollback depth): the rolling checkpoint
-                # alone can't rewind past a slow pathology (drift/late collapse)
-                # noticed hours after onset.
-                arch = getattr(self.train_cfg, "checkpoint_archive_every", 0)
-                if arch and self.global_step % arch == 0:
-                    self.save(f"checkpoint_{self.global_step:07d}.pt")
+            # Numbered snapshots (rollback depth): the rolling checkpoint
+            # alone can't rewind past a slow pathology (drift/late collapse)
+            # noticed hours after onset. Checked independently of
+            # checkpoint_every -- nesting it above silently degraded any
+            # --archive-every that wasn't a multiple of --checkpoint-every
+            # to their LCM (e.g. 800/500 -> archives only every 4000).
+            arch = getattr(self.train_cfg, "checkpoint_archive_every", 0)
+            if arch and self.global_step % arch == 0:
+                self.save(f"checkpoint_{self.global_step:07d}.pt")
 
             if self.curriculum.stage == Stage.F:
                 break
@@ -237,22 +249,28 @@ class Trainer:
             "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         }
         # Atomic write: a crash/power-loss mid-save must never destroy the only
-        # checkpoint of a multi-day run. Write to a temp file, then rename.
+        # checkpoint of a multi-day run. Write to a temp file, fsync so the
+        # bytes are on disk (rename-over alone can leave a truncated file after
+        # power loss on some filesystems), then rename.
         tmp = path + ".tmp"
-        torch.save({
-            "rng": rng,
-            "model_state": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "ema": self.ema.state_dict(),
-            "scaler": self.scaler.state_dict() if self.scaler is not None else None,
-            "curriculum": self.curriculum.state_dict(),
-            "train_schedule": self._schedule_snapshot(),
-            "global_step": self.global_step,
-            "metrics": self.metrics,
-            "model_cfg": asdict(self.model_cfg),
-            "vocab_size": self.model_cfg.vocab_size,
-            "tokenizer_name": "gpt2", "chunker": "regex_gpt2",
-        }, tmp)
+        with open(tmp, "wb") as f:
+            torch.save({
+                "rng": rng,
+                "model_state": self.model.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "ema": self.ema.state_dict(),
+                "scaler": self.scaler.state_dict() if self.scaler is not None else None,
+                "curriculum": self.curriculum.state_dict(),
+                "train_schedule": self._schedule_snapshot(),
+                "data_fingerprint": self.data_fingerprint,
+                "global_step": self.global_step,
+                "metrics": self.metrics,
+                "model_cfg": asdict(self.model_cfg),
+                "vocab_size": self.model_cfg.vocab_size,
+                "tokenizer_name": "gpt2", "chunker": "regex_gpt2",
+            }, f)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
         mtmp = os.path.join(self.ckpt_dir, "metrics.json.tmp")
         with open(mtmp, "w") as f:
@@ -289,6 +307,28 @@ class Trainer:
                 print("[trainer] LR curve / stage boundaries will NOT match the "
                       "original run. Continue only if this is intentional.", flush=True)
                 print("[trainer] " + "!" * 60, flush=True)
+        # Hard-stop on a changed dataset: the val/train split is a seeded
+        # randperm over len(dataset), so if the cache grew/shrank since launch,
+        # most of the old val docs land in the new train set -- val_loss (the
+        # collapse signal) becomes silently optimistic. Never re-prep a cache
+        # mid-run; resume against the original cache, or start a fresh run.
+        saved_fp = ckpt.get("data_fingerprint")
+        if saved_fp and self.data_fingerprint and saved_fp != self.data_fingerprint:
+            msg = (f"resume dataset differs from checkpoint: "
+                   f"checkpoint={saved_fp} now={self.data_fingerprint}. "
+                   f"The seeded val/train split depends on dataset size, so val docs "
+                   f"leak into train and val_loss becomes meaningless. Resume with the "
+                   f"ORIGINAL cache (set LATENT_ALLOW_DATA_CHANGE=1 to override).")
+            if os.environ.get("LATENT_ALLOW_DATA_CHANGE") != "1":
+                raise RuntimeError(msg)
+            print(f"[trainer] WARNING (override): {msg}", flush=True)
+        # Honest-resume note: the DataLoader iterator position is not part of
+        # the checkpoint, so resuming rebuilds the iterator and re-shuffles --
+        # the continuation is statistically equivalent but not sample-exact
+        # (the interrupted epoch's unseen tail is partly skipped).
+        print("[trainer] note: resume re-shuffles the data order (iterator position "
+              "is not checkpointed); continuation is statistically equivalent, not "
+              "sample-exact.", flush=True)
         self.global_step = ckpt["global_step"]
         self.metrics = ckpt.get("metrics", [])
         rng = ckpt.get("rng")

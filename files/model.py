@@ -61,11 +61,14 @@ class StageFlags:
     opposed to just loss weighting, which train.py handles). See
     curriculum.py for the full per-stage settings.
     """
+    # INFORMATIONAL: nothing reads this flag. The loop lives only in
+    # forward_self_supervised, which Stage A (the only no-loop stage) never
+    # calls -- so "loop off" is enforced by the loss plan, not this flag.
     use_hrm_loop: bool = True          # False only in Stage A (shallow, fixed Reasoner)
     detach_memory: bool = True         # True in Stage B: memory writes exist but no grad back
     inner_loop_grad_window: int = 5
     memory_grad_window: int = 5
-    use_act: bool = False              # Stage E+
+    use_act: bool = False              # Stage D+
     use_input_lanes: bool = False       # Stage F: role-tagged two-lane separation
 
 
@@ -138,6 +141,26 @@ class LatentThoughtModel(nn.Module):
         self.pred_head = nn.Linear(cfg.d_model, cfg.d_model)
 
     # ------------------------------------------------------------------
+    def _encode_real_rows(self, flat_ids: torch.Tensor, encode_fn) -> torch.Tensor:
+        """
+        Run `encode_fn(ids, mask)` only on rows that contain at least one real
+        token; padded (absent) chunk rows get an exact zero latent. Documents
+        rarely fill max_chunks_per_doc, so this skips ~35-50% of encoder rows
+        on a real cache. Loss-invariant: pad-row latents feed only dead paths
+        (forward_grounded/variance/SSL pairs all select valid chunks; the
+        sequential loop's inactive rows contribute to no loss -- their ponder/
+        halt-vote exclusion is enforced by active_mask in hrm_loop).
+        """
+        has_tok = (flat_ids != 0).any(dim=1)
+        if bool(has_tok.all()):
+            return encode_fn(flat_ids, flat_ids != 0)
+        if not bool(has_tok.any()):
+            return encode_fn(flat_ids, flat_ids != 0)  # degenerate; guards handle it
+        real = encode_fn(flat_ids[has_tok], flat_ids[has_tok] != 0)
+        out = real.new_zeros(flat_ids.shape[0], real.shape[-1])
+        out[has_tok] = real
+        return out
+
     def encode_chunks(self, chunk_tensor: torch.Tensor) -> torch.Tensor:
         """
         Shared order-aware chunk latents, (batch, n_chunks, d_model), WITH grad.
@@ -149,7 +172,7 @@ class LatentThoughtModel(nn.Module):
         """
         batch, n_chunks, chunk_len = chunk_tensor.shape
         flat_ids = chunk_tensor.reshape(batch * n_chunks, chunk_len)
-        return self.chunk_encoder(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
+        return self._encode_real_rows(flat_ids, self.chunk_encoder).reshape(batch, n_chunks, -1)
 
     # ------------------------------------------------------------------
     # Reconstruction anchor: a PURE autoencoder (encoder -> Talker). No HRM loop.
@@ -171,7 +194,7 @@ class LatentThoughtModel(nn.Module):
         device = chunk_tensor.device
         flat_ids = chunk_tensor.reshape(batch * n_chunks, chunk_len)
         if chunk_vecs is None:
-            chunk_vecs = self.chunk_encoder(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
+            chunk_vecs = self._encode_real_rows(flat_ids, self.chunk_encoder).reshape(batch, n_chunks, -1)
         flat_valid = chunk_mask.reshape(batch * n_chunks)
         if not bool(flat_valid.any()):
             return torch.zeros((), device=device)
@@ -229,9 +252,9 @@ class LatentThoughtModel(nn.Module):
 
         flat_ids = chunk_tensor.reshape(batch * n_chunks, chunk_len)
         if chunk_vecs is None:
-            chunk_vecs = self.chunk_encoder(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
+            chunk_vecs = self._encode_real_rows(flat_ids, self.chunk_encoder).reshape(batch, n_chunks, -1)
         with torch.no_grad():
-            tgt = ema.encode(flat_ids, flat_ids != 0).reshape(batch, n_chunks, -1)
+            tgt = self._encode_real_rows(flat_ids, ema.encode).reshape(batch, n_chunks, -1)
 
         h_state = l_state = None
         total_ponder = torch.zeros((), device=device)
@@ -246,6 +269,7 @@ class LatentThoughtModel(nn.Module):
                 h_state=h_state, l_state=l_state,
                 grad_window=stage.inner_loop_grad_window, use_act=stage.use_act,
                 input_lane_mask=input_lane_mask,
+                active_mask=active,   # ended docs neither pay ponder nor vote on depth
             )
             l_state = h_state
             total_ponder = total_ponder + ponder

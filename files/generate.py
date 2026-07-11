@@ -37,7 +37,6 @@ from config import ModelConfig
 from model import LatentThoughtModel, SELF
 from gestalt_memory import GestaltMemoryBank
 from data import build_regex_gpt2_chunker, PAD
-from losses import grounded_nll_loss
 
 CKPT = os.path.join(PROJECT, "runs", "model.pt")
 
@@ -170,23 +169,13 @@ def generate(model, chunker, cfg, prompt, n_chunks=3, temperature=0.9, greedy=Fa
 
 @torch.no_grad()
 def score(model, chunker, cfg, text):
-    """Teacher-forced RECONSTRUCTION (autoencoder) perplexity of `text`: encode
-    each chunk, decode it with the codec Talker (empty memory), token-weighted
-    NLL. This is the model's decodability signal -- matches training's val_loss
-    (notes §27); no HRM loop is involved."""
+    """Teacher-forced RECONSTRUCTION (autoencoder) perplexity of `text`. Runs
+    model.forward_grounded itself -- the exact computation behind training's
+    val_loss (incl. the end-of-chunk PAD supervision position on short chunks;
+    a hand-rolled loop that masked only `id != 0` under-counted by ~0.4 nats and
+    was NOT val_loss-comparable). No HRM loop is involved."""
     ct, cm = chunker.chunk_batch([text])
-    empty_mem = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
-    total_nll, n = 0.0, 0
-    for t in range(ct.shape[1]):
-        if not bool(cm[0, t]):
-            continue
-        chunk_ids = ct[:, t, :]
-        latent = model.chunk_encoder(chunk_ids, chunk_ids != 0)
-        logits = model.talker(chunk_ids, latent, empty_mem)
-        n_tok = int((chunk_ids != 0).sum())
-        total_nll += grounded_nll_loss(logits, chunk_ids, chunk_ids != 0).item() * n_tok
-        n += n_tok
-    avg = total_nll / max(n, 1)
+    avg = float(model.forward_grounded(ct, cm))
     return avg, math.exp(min(avg, 20))
 
 

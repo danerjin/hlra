@@ -32,7 +32,8 @@ gpt2 quality at this scale — that's expected; the goal is a healthy, non-colla
 
 Follow [`STRIX_HALO.md`](STRIX_HALO.md) first for the ROCm/GPU PyTorch install. Then you need: the GPU
 box (AMD ROCm shows up as "cuda", which is normal) with a GPU PyTorch build + `datasets transformers
-matplotlib`; the local gpt2 tokenizer at `gpt2_tok/`; ~10 GB disk for the cache.
+matplotlib`; the local gpt2 tokenizer at `gpt2_tok/`; ~10-15 GB disk for the cache (it also loads fully
+into RAM at train start, with ~2x that transiently while shards concatenate).
 
 ```bash
 export PROJECT=/path/to/ucsc          # edit to your path
@@ -75,11 +76,27 @@ python bench_throughput.py --preset small --batch-size 16,32,64,128 --amp --toke
 Pick the largest batch whose `peak GB` fits with ~20% headroom; note its `budget ETA`. The expensive
 path is the **sequential predictor loop**, so this times a full step. Call your chosen batch `BATCH`.
 
+After the cache is prepped (§3), re-check the ETA with the cache's *actual* non-pad fraction —
+the 2026-07-10 chunker fix packs chunks near the cap, so fill is meaningfully higher than the
+old 0.6 guess:
+
+```bash
+python - <<'PY'
+import json, os
+m = json.load(open(os.path.join(os.path.dirname(os.getcwd()), "chunk_cache", "manifest.json")))
+c = m["config"]
+print("--fill-frac %.2f" % (m["tokens"] / (m["total"] * c["max_chunks_per_doc"] * c["max_chunk_len"])))
+PY
+```
+
 ---
 
 ## 3. Prepare the data (one-time, hours)
 
-Training reads a **pre-chunked cache**. Always prep into a **fresh, empty** directory.
+Training reads a **pre-chunked cache**. Always prep into a **fresh, empty** directory
+(`data_prep.py` now refuses a non-empty one). **Never re-prep or touch the cache dir once the
+run has started** — the val/train split is derived from the cache size, and resume hard-fails
+if it changed (see §7).
 
 ```bash
 # tiny timed dry-run first (do NOT skip) -- confirms streaming + chunking work:
@@ -167,7 +184,11 @@ Stage-A band, all together. A low `ssl` alone is normal (the loop is just predic
 pgrep -af train_scaled.py ; kill <PID>          # stop
 ```
 
-Resume with the **exact same flags** plus `--resume`:
+Resume with the **exact same flags**, the **same untouched cache**, plus `--resume`
+(project-relative paths are OK). Two guards fire on resume: a hard error if the cache changed
+size since launch (val/train split reshuffle → val leakage; `LATENT_ALLOW_DATA_CHANGE=1`
+overrides), and a printed note that the data order re-shuffles (iterator position isn't
+checkpointed — the continuation is statistically equivalent, not sample-exact):
 
 ```bash
 nohup python train_scaled.py --preset small --cache chunk_cache --device cuda --amp --amp-dtype bf16 \

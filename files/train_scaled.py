@@ -75,6 +75,9 @@ def main():
     device = pick_device(args.device)
     stage_steps = (tuple(int(x) for x in args.stage_steps.split(","))
                    if args.stage_steps else DEFAULT_STAGE_STEPS)
+    if len(stage_steps) != 6:
+        raise SystemExit(f"--stage-steps needs 6 comma-separated values (A,B,C,D,E,F), "
+                         f"got {len(stage_steps)}: {stage_steps}")
     total_steps = sum(stage_steps)
     max_steps = args.max_steps if args.max_steps is not None else total_steps
 
@@ -115,6 +118,10 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=train_cfg.batch_size, shuffle=True,
                               num_workers=train_cfg.num_workers, collate_fn=collate_chunked,
                               drop_last=True, persistent_workers=train_cfg.num_workers > 0)
+    if len(train_loader) == 0:
+        raise SystemExit(f"train split ({len(train_ds)} examples) yields zero batches at "
+                         f"--batch-size {train_cfg.batch_size} (drop_last). Use a bigger "
+                         f"cache or a smaller batch.")
     val_loader = DataLoader(val_ds, batch_size=train_cfg.batch_size, shuffle=False,
                             num_workers=0, collate_fn=collate_chunked)
 
@@ -125,9 +132,13 @@ def main():
     curriculum = Curriculum(model_cfg, train_cfg)
 
     trainer = Trainer(model, ema, optimizer, curriculum, model_cfg, train_cfg,
-                      train_loader, val_loader, ckpt_dir=os.path.join(PROJECT, args.out))
+                      train_loader, val_loader, ckpt_dir=os.path.join(PROJECT, args.out),
+                      data_fingerprint={"examples": len(ds),
+                                        "tokens": ds.manifest.get("tokens"),
+                                        "shards": len(ds.manifest.get("shards", []))})
     if args.resume:
-        trainer.load(args.resume)
+        resume = args.resume if os.path.isabs(args.resume) else os.path.join(PROJECT, args.resume)
+        trainer.load(resume)
 
     trainer.train(max_steps=max_steps)
     trainer.save("model.pt")

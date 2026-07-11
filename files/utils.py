@@ -40,6 +40,14 @@ def truncate_gradient_window(history: Sequence[torch.Tensor], window: int) -> Li
     treated as fixed context -- the asymmetric "unbounded forward reads,
     bounded backward credit assignment" pattern of §3.6.
 
+    NOTE the window bounds the DIRECT read, not total backward depth: an
+    in-window slot was written by a thought whose own graph contains ITS
+    in-window memory reads, so credit chains transitively (attenuated per
+    hop) back through the whole document, exactly as the design doc states
+    ("distant credit still reaches back transitively through memory ...
+    the activation graph spans the document"). Budget backward compute and
+    activation memory for full-document depth from Stage C onward.
+
     NOTE: this post-hoc detach is NOT valid for truncating an already-executed
     recurrence (e.g. the inner HRM loop): detaching recorded step states does
     not cut the final state's graph, which still reaches back through every

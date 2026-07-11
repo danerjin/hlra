@@ -99,6 +99,62 @@ Flagged, deliberately not changed:
   runs trained this way, and re-grouping the optimizer right before the big
   run would invalidate that validation. Optional experiment for later.
 
+## Second pre-flight review (2026-07-10, comprehensive: spec + full code + 3 adversarial audits)
+
+A second full review (gradient-routing re-audit, trainer/resume/AMP audit, data-pipeline +
+inference audit, all invariants re-verified empirically) before the big run. The training-loss
+semantics again came through clean (reconstruction trains encoder+Talker only; SSL trains
+loop+encoder+pred_head+memory reader, never the Talker; EMA grad-free; inner-loop truncation
+exact in fixed and ACT modes). Fixes landed, each verified:
+
+- **Chunker `_cap_span` rewrite (the important one — affects the data you're about to prep).**
+  The old cap split at the finest delimiter present and emitted every fragment as a chunk,
+  deleting the delimiters: on the real pile-10k shakedown cache 9.1% of chunks were single-token
+  (17.2% ≤3 tokens), long comma sentences lost every comma, and unpunctuated sentences became
+  one word per chunk with token inflation. Now pieces keep their delimiter and are greedily
+  re-packed up to `max_chunk_len` (recursing to finer delimiters only for oversize pieces), so
+  emitted chunks concatenate back to the original text verbatim and pack near the cap.
+  **Re-prep any existing cache; do not train the big run on a pre-fix cache.**
+- **ACT ponder cost + halt vote now mask ended documents** (`active_mask` threaded from
+  `forward_self_supervised` into the loop). Before, rows whose doc had ended kept evolving on
+  pad-chunk latents and (a) polluted the ponder gradient into the halting head/h_transition and
+  (b) voted on the whole batch's depth. SSL was verified exactly invariant; ponder was not.
+  All-rows-active batches are bit-identical to the old behavior.
+- **Pad-row encoder skip** (`model._encode_real_rows`): the online encoder and the EMA target
+  only encode chunk rows containing a real token (absent chunks get exact-zero latents).
+  Verified bit-exact on every loss, grads intact; saves ~30-45% of both encoder passes at
+  realistic fill.
+- **Trainer/tooling:** numbered archive checkpoints no longer require `--archive-every` to be a
+  multiple of `--checkpoint-every`; checkpoints fsync before the atomic rename; a **dataset
+  fingerprint** (examples/tokens/shards) is saved and resume **hard-fails if the cache changed
+  size** (the seeded val/train split reshuffles → val leaks into train and val_loss goes
+  optimistic; `LATENT_ALLOW_DATA_CHANGE=1` overrides); resume prints that data order re-shuffles
+  (iterator position is not checkpointed — statistically equivalent, not sample-exact);
+  `--resume` accepts project-relative paths; empty-train-loader and wrong-length
+  `--stage-steps` now fail fast; `data_prep` refuses a non-empty output dir; the dead
+  `run_grounded` RNG burn was removed; `grad_window<=0` now detaches the ponder cost too
+  (latent contract bug, unreachable in the shipped curriculum).
+- **`generate --score` now calls `forward_grounded` directly**, so it includes the end-of-chunk
+  PAD supervision and is literally val_loss-comparable (the old hand-rolled mask under-counted
+  by ~0.4 nats).
+
+Flagged, deliberately not changed:
+
+- **Decay-gate clamp zeroes `theta`/`log_dt` gradient while a channel is clamped** (comment now
+  says so honestly). Carry-path gradient w.r.t. h still flows; AdamW decay is the escape.
+  Validated runs trained this way — revisit with the optimizer-grouping experiment, not now.
+- **`hard_normalize` gradient spikes (~1e6) if a state ever lands within 1e-6 of the origin** —
+  never observed; grad-clip bounds the blast radius; bf16 has fp32 range.
+- **Memory credit chains transitively past `memory_grad_window`** (in-window slots carry their
+  own reads' graphs) — this is the *documented* §3.6 design ("activation graph spans the
+  document"), not a bug; utils.py's docstring now states it plainly.
+- **`CachedChunkDataset` RAM:** ~2x transient at init (shard list + concat); with the post-fix
+  chunker expect roughly 10-15 GB disk/resident at 1.2B tokens. Fine on the 128 GB box.
+- ACT at inference uses fixed depth (2 cycles) while D/E trained adaptive — degenerate halting's
+  minimum equals the fixed depth, so identical in practice.
+- The `LATENT_USE_HF=1 train.py` mixture path likely needs `trust_remote_code` for pg19/
+  RedPajama with modern `datasets` — not on the big-run path (data_prep uses `iter_hf_single`).
+
 ## Open items before a large run
 
 - **Re-confirm at full scale (~1.2B tokens):** watch `val_loss` at the Stage-B predictor boundary; the

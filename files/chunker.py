@@ -101,24 +101,57 @@ class SegmentAnyTextChunker:
         self.pad_token_id = pad_token_id
         self.fallback_punctuation = fallback_punctuation
 
-    def _cap_span(self, span: str) -> List[str]:
+    def _cap_span(self, span: str, punct_idx: int = 0) -> List[str]:
         """
-        Recursively split `span` at the finest available punctuation-aware
-        fallback boundary until every resulting piece tokenizes to at most
-        `max_chunk_len` tokens ("SaT Capped"'s length-capping half).
+        Split `span` at the coarsest available punctuation-aware fallback
+        boundary and greedily RE-PACK consecutive pieces into chunks of at
+        most `max_chunk_len` tokens ("SaT Capped"'s length-capping half).
+
+        Two properties the naive split-and-recurse version lacked (it made
+        9% of real-cache chunks single-token and deleted every delimiter):
+          * delimiters stay attached to their preceding piece, so the emitted
+            chunks concatenate back to the original text verbatim (no lost
+            commas/dashes, no GPT-2 leading-space retokenization inflation);
+          * pieces are greedily merged up to the token cap, so a long comma
+            sentence becomes a few near-cap chunks -- one word/clause per
+            chunk can no longer happen unless a single piece is itself huge
+            (then it recurses to the next-finer delimiter).
         """
         ids = self.tokenizer.encode(span, add_special_tokens=False)
         if len(ids) <= self.max_chunk_len:
             return [span] if span.strip() else []
 
-        for punct in self.fallback_punctuation:
-            if punct in span:
-                pieces = [p.strip() for p in span.split(punct) if p.strip()]
-                if len(pieces) > 1:
-                    capped: List[str] = []
-                    for piece in pieces:
-                        capped.extend(self._cap_span(piece))
-                    return capped
+        for i in range(punct_idx, len(self.fallback_punctuation)):
+            punct = self.fallback_punctuation[i]
+            if punct not in span:
+                continue
+            parts = span.split(punct)
+            # Re-attach the delimiter to the piece it terminates.
+            pieces = [p + punct for p in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
+            if len(pieces) <= 1:
+                continue
+            chunks: List[str] = []
+            cur = ""
+            for piece in pieces:
+                if len(self.tokenizer.encode(piece, add_special_tokens=False)) > self.max_chunk_len:
+                    # This piece alone exceeds the cap: flush and recurse on it
+                    # with the next-finer delimiters only (this one is used up).
+                    if cur.strip():
+                        chunks.append(cur)
+                    cur = ""
+                    chunks.extend(self._cap_span(piece, i + 1))
+                    continue
+                tentative = cur + piece if cur else piece
+                # Token counts are not additive under BPE; re-encode the merge
+                # so the cap is exact.
+                if cur and len(self.tokenizer.encode(tentative, add_special_tokens=False)) > self.max_chunk_len:
+                    chunks.append(cur)
+                    cur = piece
+                else:
+                    cur = tentative
+            if cur.strip():
+                chunks.append(cur)
+            return [c for c in chunks if c.strip()]
 
         # No punctuation left to split on: hard token-count fallback so we
         # never emit a span longer than max_chunk_len, no matter what.

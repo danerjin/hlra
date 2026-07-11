@@ -104,3 +104,9 @@ Size presets (`config.MODEL_PRESETS`): `smoke` (~43M) → `small` (512-d, ~152M)
   resume equivalence) found the training path clean; see `notes.md` for the three
   inference/tooling fixes it landed and the items it flagged (notably: fix the input-lane
   target leak before ever training Stage F on generic documents).
+- A second, comprehensive 2026-07-10 review (full spec+code pass, three independent adversarial
+  audits, all invariants re-verified) landed a chunker rewrite (`_cap_span` no longer explodes
+  long sentences into one-word chunks or deletes delimiters — **re-prep any cache built before
+  it**), an ACT ponder/halt fix for ended documents, a resume dataset-fingerprint guard, and a
+  bit-exact pad-row encoder skip (~30-45% off both encoder passes); see `notes.md` for the full
+  list and the flagged-not-changed items.

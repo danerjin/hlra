@@ -100,9 +100,14 @@ class DiagonalDecayGate(nn.Module):
         """
         dt = F.softplus(self.log_dt) + 1e-4
         decay = torch.exp(-F.softplus(self.theta) * dt)
-        # Clamp softly into [min_decay, max_decay] for numerical headroom;
-        # the exp(...) construction already guarantees (0, 1), this just
-        # keeps values away from the extremes where gradients vanish.
+        # Clamp into [min_decay, max_decay]. The exp(...) construction already
+        # guarantees (0, 1); the clamp keeps the *forward* value away from the
+        # extremes. Honesty note: while a channel is clamped, theta/log_dt get
+        # ZERO gradient through this path (clamp kills it at the boundary) --
+        # gradient w.r.t. h still flows through the a*h product, so the loop
+        # keeps training; only the gate parameter freezes until AdamW's weight
+        # decay pulls theta/log_dt back inside the active range. Left as-is:
+        # the validated smoke/512-d runs trained with exactly this behavior.
         return decay.clamp(self.min_decay, self.max_decay)
 
     def forward(self, h: torch.Tensor, e: torch.Tensor) -> torch.Tensor:

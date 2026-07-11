@@ -51,6 +51,12 @@ TOKENIZER_DIR = os.path.join(PROJECT, "gpt2_tok")
 
 def prepare(text_iter, chunker, model_cfg, out_dir, shard_size, min_chunks,
             vocab_size, max_examples=None, max_tokens=None):
+    # Refuse to prep into a non-empty directory: mixing shards from two prep
+    # runs leaves a stale manifest next to a blend of old and new shards, and
+    # the load-time consistency check only catches it when the totals differ.
+    if os.path.isdir(out_dir) and os.listdir(out_dir):
+        raise SystemExit(f"cache dir {out_dir} is not empty -- data_prep must write into a "
+                         f"FRESH directory (delete it or pass a new --out).")
     os.makedirs(out_dir, exist_ok=True)
     window = model_cfg.recent_token_window
     buf, shard_files, counts = [], [], []

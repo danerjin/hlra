@@ -13,7 +13,7 @@ Both modules are diagonal-decay-gated recurrences (decay_gate.py) with
 MagicNorm's hard normalization applied at the exit of every L-step and every
 H-step (norm.py) -- that hard-norm is what bounds the state at any depth, not
 the decay gate. The L:H ratio (3:1) is an empirical HRM-Text hyperparameter,
-*not* derived (§3.2) -- once ACT is turned on (Stage E, §5.5) the model can
+*not* derived (§3.2) -- once ACT is turned on (Stage D, §5.5) the model can
 learn to spend a different number of fast/slow steps per thought; before
 that it's a fixed schedule from the config.
 
@@ -32,7 +32,7 @@ Adaptive depth / ACT (§1.1, §5.5): a small halting network looks at the
 current H-state and decides, per thought, whether to run another
 L-group-then-H-update cycle or stop. A filler word gets a shallow pass; a
 load-bearing inference step gets many inner iterations. This is only turned
-on in Stage E, once fixed-depth dynamics are already stable.
+on in Stage D, once fixed-depth dynamics are already stable.
 """
 from __future__ import annotations
 
@@ -211,6 +211,7 @@ class HRMInnerLoop(nn.Module):
         grad_window: int = 5,
         use_act: bool = False,
         input_lane_mask: Optional[torch.Tensor] = None,  # (batch, n_kv) bool, True = real slot
+        active_mask: Optional[torch.Tensor] = None,       # (batch,) bool, True = row has a real chunk
     ):
         """
         Runs the bounded recurrent deliberation for one thought.
@@ -257,11 +258,22 @@ class HRMInnerLoop(nn.Module):
                 h_state, l_state = self._one_l_group_then_h_update(
                     h_state, l_state, chunk_embed, input_lane_kv, input_lane_pad, memory, trunc)
         else:
-            # ACT-style adaptive depth (Stage E, §1.1, §5.5): keep going until
+            # ACT-style adaptive depth (Stage D+, §1.1, §5.5): keep going until
             # the halting head says stop, or a max-steps safety cap is hit.
             # Depth is unknown up front, so truncation falls back to a rolling
             # cut every `grad_window` steps (backward horizon <= grad_window).
             trunc = _TruncationSchedule(grad_window, total_steps=None)
+            # Only rows whose current chunk is real may contribute to the
+            # ponder cost and the halt vote. The sequential caller (model.
+            # forward_self_supervised) runs the loop whenever ANY row is
+            # active, so rows whose document already ended keep evolving on
+            # pad-chunk latents; without the mask their garbage halt
+            # probabilities (a) polluted the ponder gradient into the halting
+            # head + h_transition and (b) voted on the whole batch's depth.
+            # (Their SSL predictions were always excluded -- this closes the
+            # two remaining leaks. All-rows-active batches are unchanged.)
+            w = active_mask.float() if active_mask is not None else torch.ones(batch, device=device)
+            denom = w.sum().clamp_min(1.0)
             for step in range(self.act_max_ponder_steps):
                 h_state, l_state = self._one_l_group_then_h_update(
                     h_state, l_state, chunk_embed, input_lane_kv, input_lane_pad, memory, trunc)
@@ -272,18 +284,22 @@ class HRMInnerLoop(nn.Module):
                 # Each executed step also adds a term, so deeper loops cost
                 # strictly more. (Accumulating halt_prob itself would invert
                 # this and penalize the model for wanting to stop.)
-                ponder_cost = ponder_cost + (1.0 - halt_prob).mean()
+                ponder_cost = ponder_cost + ((1.0 - halt_prob) * w).sum() / denom
                 # Stochastic halting during training would need a full ACT
                 # accumulator; for clarity we use expected-value ponder cost
                 # and a soft, differentiable "continue probability" schedule
                 # rather than hard branching, so the graph stays simple.
-                if step + 1 >= n_cycles and halt_prob.mean().item() > 0.5:
+                halt_vote = float((halt_prob * w).sum() / denom)
+                if step + 1 >= n_cycles and halt_vote > 0.5:
                     break
 
         # grad_window <= 0 means "no gradient through the loop at all" (the
         # per-step cuts above leave the final step's ops in-graph, so finish
-        # the job on the returned value).
+        # the job on the returned value -- and on the ponder cost, whose
+        # halt_prob terms otherwise keep a 1-op graph into the halting head
+        # and h_transition).
         if grad_window <= 0:
             h_state = h_state.detach()
+            ponder_cost = ponder_cost.detach()
 
         return h_state, ponder_cost

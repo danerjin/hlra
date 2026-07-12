@@ -7,6 +7,7 @@
 # Pre-chunked shard caches (rebuild with data_prep.py)
 chunk_cache/
 chunk_cache_shakedown/
+chunk_cache_shakedown.STALE-pre-0711-chunker-DO-NOT-TRAIN/
 wiki_cache/
 
 # Model checkpoints / shards -- large, regenerable by training.

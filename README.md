@@ -37,7 +37,7 @@ loop to reason forward. See the design doc §2.3.
 | `chunker.py` | `SegmentAnyTextChunker` ("SaT Capped": sentence boundaries + punctuation-aware length capping). |
 | `ema_target.py` | `ChunkEncoder` (shared latent producer) + `EMATargetEncoder` (momentum copy; encoder-space target). |
 | `decay_gate.py` | `DiagonalDecayGate` — the per-channel `exp(-softplus·dt)` carry path (Parcae's diagonal case). |
-| `norm.py` | MagicNorm: Pre-LN wrapper + `hard_normalize` (the ‖h‖=√d shell that bounds the loop at any depth). |
+| `norm.py` | MagicNorm: `hard_normalize` (the ‖h‖=√d shell that bounds the loop at any depth) + an unused Pre-LN wrapper (the L/H cells rely on the loop's norm invariants instead). |
 | `hrm_loop.py` | `HRMInnerLoop`: fast L / slow H modules, decay gate, hard-norm, memory + input cross-attention, ACT halting, in-loop truncated BPTT. |
 | `gestalt_memory.py` | FIFO memory of thoughts with role tags; truncated-gradient cross-attention reader. |
 | `talker.py` | The Talker: causal decoder reconstructing a chunk from a latent (internal right-shift so it can't copy). |
@@ -148,3 +148,11 @@ Size presets (`config.MODEL_PRESETS`): `smoke` (~43M) → `small` (512-d, ~152M)
   `hrm_loop.py` (verified bit-identical losses/gradients; saves up to one sync per chunk per
   step in Stages D/E), and a clear error for an empty chunk cache. See `notes.md` for the
   full audit results and the accepted-as-is flags.
+- A fifth review (2026-07-11, three independent adversarial audits: probe-verified gradient
+  routing/SSL alignment/truncation, a bit-identical kill-and-resume trainer check, and a
+  real-tokenizer data-pipeline fuzz + prep→load round-trip) found the A→E training semantics
+  clean for the fifth time and landed **docs/process fixes only**: the spec's Pre-LN claim
+  corrected (the hard-norm carries the stability argument; `PreNormWrapper` is unused), the
+  ACT stage label fixed (D, not E+), and the stale pre-fix shakedown cache renamed with a
+  DO-NOT-TRAIN marker (its manifest is indistinguishable from a fresh cache's). The post-audit
+  chat testers and `generate.py` separator kwarg were reviewed clean. Details in `notes.md`.

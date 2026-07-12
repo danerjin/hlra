@@ -20,7 +20,8 @@ thoughts with un-detached gradient), and **Parcae** (a diagonal-decay-gated, sta
   Talker is a pure readout — it cannot produce meaningful text without good latents.
 - **HRM-Text** replaces the flat transformer with a **dual-timescale recurrence**: a fast **L-module**
   does local refinement, a slow **H-module** carries strategic context. It is stabilized with
-  **MagicNorm** (Pre-LN internally, a hard norm at each recurrent module's exit) and **warmup credit
+  **MagicNorm** (Pre-LN internally, a hard norm at each recurrent module's exit — in this
+  implementation only the hard-norm half is used; see §3) and **warmup credit
   assignment** (backprop through the last 2 steps early, expanding to 5).
 - **Thought Gestalt** generates one chunk at a time while cross-attending to a **memory of prior
   chunk vectors** ("gestalts"). Crucially, gradient from later losses flows *back through* that memory
@@ -55,7 +56,7 @@ The components:
   EMA target's input.
 - **HRM inner loop** — the reasoner. Per thought it runs a few cycles of `L-module` × `l_steps` then
   one `H-module`; each step re-projects the state onto the fixed-norm shell (MagicNorm hard-norm). It
-  reads the gestalt memory (and, in dialogue, the input lane) by cross-attention, and (Stage E+)
+  reads the gestalt memory (and, in dialogue, the input lane) by cross-attention, and (Stage D+)
   varies its depth with an **ACT** halting head. The looped update is
   `h_{n+1} = a⊙h_n + B·ê + R(h_n, e)` with `a` the diagonal decay gate.
 - **Gestalt memory** — a per-example FIFO of finished thoughts, each with a role tag (USER/SELF/
@@ -134,8 +135,10 @@ The reliable collapse *signal* is a **`val_loss` regression when prediction turn
 The decay gate `a` is contractive, but `R` is an unconstrained nonlinear term, so `a` alone does not
 bound the map. **Boundedness at any depth comes from MagicNorm's hard normalization** (re-project onto
 the ‖h‖=√d shell at every step); the decay gate is the linear carry path that *shapes* the on-shell
-dynamics toward convergence (the mechanism behind Parcae's predictable test-time-depth scaling), and
-Pre-LN keeps the truncated-BPTT gradient well-conditioned. Three complementary roles.
+dynamics toward convergence (the mechanism behind Parcae's predictable test-time-depth scaling).
+There is **no explicit Pre-LN inside the L/H cells** (`norm.PreNormWrapper` exists but is unused):
+the `R` sublayer's inputs are kept well-conditioned by the loop's invariants instead — `h` enters
+hard-normalized from the previous step's exit, and `ê` is normalized before injection.
 
 **Chunk boundaries are sentence/clause-aware, not fixed windows.** A thought should be a semantically
 complete unit; a fixed window bisects clauses and reintroduces compounding fragility at the chunk

@@ -299,6 +299,63 @@ Flagged, deliberately not changed:
   back-to-back saves, seconds wasted); per-stage warmup legitimately starts below the cosine
   floor (standard warmup, not a bug — noted so nobody "fixes" it).
 
+## Fifth pre-flight review (2026-07-11, three independent adversarial audits + post-audit-delta review)
+
+A fifth full pass, run fresh against commit bb45050f: one audit each on model/loss/gradient
+semantics (CPU probes: routing disjointness, SSL target alignment elementwise vs `EMA(z_{t+1})`,
+truncation severance at windows 0/2/5/100 incl. the ACT ponder term, ended-doc ponder masking,
+in-place-op safety), the trainer/curriculum/resume machinery (a real kill-at-step-8-and-resume
+run reproduced the uninterrupted run's LR/stage sequence exactly and final weights
+**bit-identically**; the schedule-drift and fingerprint guards fire; every TRAINING.md /
+STRIX_HALO.md command parses against current argparse), and the data pipeline (real gpt2
+tokenizer, 21 adversarial docs + 200-trial unicode fuzz + a shard-boundary prep→load round-trip:
+cap exact, verbatim, masks contiguous, no degenerate examples, no int32 overflow at 1.2B tokens).
+**The A→E training semantics came through clean for the fifth time.** The post-fourth-audit
+deltas were reviewed too: the chat testers (`chat.py`/`chat_core.py`/`web_chat.py`) and
+`generate.py`'s `separator` kwarg are inference-only and clean.
+
+Changes landed — docs/process only, **zero code changes** (deliberate: five clean audits are
+worth more than any pre-run "optimization"):
+
+- **Spec corrected on Pre-LN.** `latent-thought-architecture.md` claimed MagicNorm = "Pre-LN
+  internally" + hard-norm and that "Pre-LN keeps the truncated-BPTT gradient well-conditioned";
+  in the current L/H cells `norm.PreNormWrapper` is dead code (never instantiated — only
+  `decay_gate.py`'s comment admitted it). §0/§3 and the README file map now say the hard-norm
+  half carries the stability argument, with `R`'s inputs conditioned by the loop's invariants.
+- **Spec ACT stage label fixed:** §1 said "(Stage E+)"; the §5 table and `curriculum.py` turn
+  ACT on at Stage **D**.
+- **The stale shakedown cache is renamed** to
+  `chunk_cache_shakedown.STALE-pre-0711-chunker-DO-NOT-TRAIN/`. It was built 2026-07-09 (before
+  both chunker rewrites) yet its manifest dims (`64/32/256`, vocab 50258) are identical to what
+  a fresh cache will say — the manifest records no chunker version, so a one-word `--cache` typo
+  would have passed every guard and trained the big run on pre-fix data. Now it fails loudly.
+  Nothing referenced the old path.
+
+Flagged, deliberately not changed:
+
+- **The manifest still has no chunker-version/prep-commit stamp** — cache freshness remains
+  procedural (the rename above + TRAINING.md's fresh-prep flow). Adding a stamp to
+  `data_prep.py`/`data.py` is the right post-run hardening; not worth touching the audited
+  loader right before the run.
+- **`ema.update()` still runs on steps skipped by the non-finite guard** — the target takes an
+  extra momentum step toward *unchanged* online weights; equivalent to marginally lower
+  effective momentum on skip steps, negligible.
+- `_nonfinite_streak` is not checkpointed (resets on resume) — the hard-fail kills the process
+  anyway, so no realistic behavior change. The fp16 silent-skip flag from the fourth review
+  stands: bf16 only for unattended runs.
+- **Train-time RAM at 1.2B tokens:** measured ~9.5 KB/example → ~11-14 GiB resident,
+  ~2x transient at load (`torch.cat`). Fine on the 128 GB box with fork workers; do not point
+  `--num-workers > 0` at this cache on a spawn platform (macOS).
+- Segmentation blind spots, coherence-only: text with no ASCII spaces or `[.!?]` (newline-only
+  layouts, pure CJK) falls through to the character-boundary split — tensors stay valid; trace
+  exposure on fineweb-edu.
+- `generate.score()` raises `SystemExit` on zero-chunk text; the chat testers can't reach it
+  (both reject empty/whitespace input first) and `web_chat`'s `except Exception` wouldn't catch
+  it if they could. Inference-tooling nit only.
+- TRAINING.md §9's collapse remediation (lower `--ssl-weight`, relaunch from an archive
+  snapshot) will *intentionally* fire the "resume schedule differs" warning — expected in that
+  recovery, not a stop signal.
+
 ## Open items before a large run
 
 - **Re-confirm at full scale (~1.2B tokens):** watch `val_loss` at the Stage-B predictor boundary; the

@@ -305,8 +305,8 @@ Flagged, deliberately not changed:
   512-d check used a modest budget.
 - **Re-tune `ssl_loss_weight`** (currently 1.0, co-equal with reconstruction) once reconstruction has
   room to converge before B.
-- **ACT halting doesn't learn** (soft ponder cost, no compute-vs-quality gradient) — a real ACT
-  accumulator is needed to make adaptive depth a learned dial.
+- **ACT halting doesn't learn** (soft ponder cost, no compute-vs-quality gradient) — needs either a
+  real ACT accumulator or the simpler TRM-style supervised halt gate (see `experiments.md` #2).
 - **Stage F** (two-lane dialogue, anti-sycophancy loss) is designed but not exercised.
 - **`--amp`** validated only on synthetic tensors; run `rocm_smoke.py` on the GPU box first
   (now 6 checks — it must end `PASS`, incl. the eval-mode monitoring path added in the
@@ -316,6 +316,12 @@ Flagged, deliberately not changed:
   character-boundary fallback): any cache built earlier — including one built right after the
   2026-07-10 `_cap_span` fix — has the tiny-chunk pathology and, on unicode-heavy docs,
   corrupted fallback chunks.
+
+## Post-run experiments
+
+See [`experiments.md`](experiments.md) — TRM-inspired ablations (arXiv:2510.04871) mapped onto this
+architecture: full-thought grad window, supervised halt gate, shared L/H transition, cheap no-grad
+depth. All post-run only; nothing there touches the validated A→E training semantics.
 
 ---
 

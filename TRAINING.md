@@ -41,7 +41,7 @@ checkpoints too: each snapshot (model + AdamW moments + EMA) is ~2 GB at `small`
 export PROJECT=/path/to/ucsc          # edit to your path
 export HSA_OVERRIDE_GFX_VERSION=11.5.1 # AMD gfx1151 only; harmless otherwise
 cd "$PROJECT" && source .venv/bin/activate
-pip install datasets transformers matplotlib
+pip install datasets transformers matplotlib tqdm   # tqdm optional: interactive progress bar
 cd "$PROJECT/files"
 python - <<'PY'
 import torch, os
@@ -174,6 +174,11 @@ Watch it: `tail -f train.log`. A healthy line:
 `nll` = reconstruction; `ssl` = the predictor (starts at B, decreasing = the loop learning);
 `ponder` = ACT cost (starts at D).
 
+> The `nohup ... > train.log` run writes these plain log lines (tqdm auto-detects the redirect
+> and stays out of the file). Run it in a **foreground terminal** instead and you get a live
+> `tqdm` progress bar with `stage / lr / val / lstd` in the postfix. Force either way with
+> `--progress on|off`.
+
 ---
 
 ## 6. Monitor
@@ -192,25 +197,37 @@ Stage-A band, all together. A low `ssl` alone is normal (the loop is just predic
 
 ## 7. Stop / resume / crashes
 
+**Stop gracefully** — one `kill` (or `Ctrl-C` on a foreground run):
+
 ```bash
 pgrep -af train_scaled.py ; kill <PID>          # stop
 ```
 
-Resume with the **exact same flags**, the **same untouched cache**, plus `--resume`
-(project-relative paths are OK). Two guards fire on resume: a hard error if the cache changed
-size since launch (val/train split reshuffle → val leakage; `LATENT_ALLOW_DATA_CHANGE=1`
-overrides), and a printed note that the data order re-shuffles (iterator position isn't
-checkpointed — the continuation is statistically equivalent, not sample-exact):
+The trainer catches the signal, finishes the current step, writes `checkpoint.pt` at that
+clean boundary, prints `stopped at step NNNN; checkpoint saved`, and exits. You lose **at most
+one step**, not up to `--checkpoint-every`. (Send the signal a second time to force-quit
+without the final save.)
+
+**Resume** — just re-run the **same launch command** (same flags, same untouched cache). It
+finds `runs/scaled/checkpoint.pt` and prints `auto-resuming from ...`; no `--resume` needed:
 
 ```bash
 nohup python train_scaled.py --preset small --cache chunk_cache --device cuda --amp --amp-dtype bf16 \
   --batch-size "$BATCH" --stage-steps "$STAGE_STEPS" \
   --num-workers 8 --log-every 50 --checkpoint-every 1000 --archive-every 5000 \
-  --out runs/scaled --resume "$PROJECT/runs/scaled/checkpoint.pt" >> train.log 2>&1 &
+  --out runs/scaled >> train.log 2>&1 &
 ```
 
-If the flags differ, the trainer prints a loud `WARNING: resume schedule differs` — stop and fix
-unless you intended it. A clean resume prints `resumed from ... at step NNNN` with no warning.
+- Pass `--resume "$PROJECT/runs/scaled/checkpoint_0025000.pt"` to rewind to a specific
+  `--archive-every` snapshot instead of the latest checkpoint.
+- Pass `--fresh` to ignore an existing checkpoint and start from step 0.
+
+Two guards fire on resume: a hard error if the cache changed size since launch (val/train split
+reshuffle → val leakage; `LATENT_ALLOW_DATA_CHANGE=1` overrides), and a printed note that the
+data order re-shuffles (iterator position isn't checkpointed — the continuation is statistically
+equivalent, not sample-exact). If the **flags** differ from the checkpoint, the trainer prints a
+loud `WARNING: resume schedule differs` — stop and fix unless you intended it. A clean resume
+prints `resumed from ... at step NNNN` with no warning.
 
 ---
 

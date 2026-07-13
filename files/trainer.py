@@ -56,6 +56,10 @@ class Trainer:
         self.metrics = []
         self._train_iter = None
         self._nonfinite_streak = 0   # consecutive optimizer steps skipped on non-finite grads
+        self._stop_requested = False # set by SIGINT/SIGTERM: checkpoint + exit at next step boundary
+        self._bar = None             # tqdm progress bar (interactive only); None otherwise
+        self._last_val_loss = None   # cached for the progress-bar postfix between eval steps
+        self._last_lstd = None
 
         # Mixed precision. CUDA (incl. ROCm, which presents as cuda) only: CPU
         # gains nothing, and MPS autocast either raises outright (torch<=2.2)
@@ -175,8 +179,64 @@ class Trainer:
         return sum(losses) / max(len(losses), 1)
 
     # ------------------------------------------------------------------
-    def train(self, max_steps: int):
+    # UX helpers (progress bar + graceful stop). None of these touch the loss
+    # computation, gradient routing, or curriculum -- they only affect how the
+    # run reports progress and how it shuts down.
+    def _emit(self, msg: str):
+        # Route log lines through tqdm.write when a bar is live so they don't
+        # shred the progress bar; falls back to a plain flushed print otherwise
+        # (including the non-TTY nohup run, where the bar is auto-disabled).
+        if self._bar is not None:
+            self._bar.write(msg)
+        else:
+            print(msg, flush=True)
+
+    def _make_progress_bar(self, max_steps: int, progress: str):
+        # progress: "auto" (bar on a TTY, silent line-logs when redirected),
+        # "on" (force the bar), or "off" (never). tqdm is optional: if it isn't
+        # installed (e.g. a minimal training venv) we degrade to plain prints.
+        if progress == "off":
+            return None
+        try:
+            from tqdm.auto import tqdm
+        except Exception:
+            return None
+        disable = None if progress == "auto" else False  # None => tqdm hides itself off-TTY
+        return tqdm(total=max_steps, initial=self.global_step, disable=disable,
+                    dynamic_ncols=True, desc="train", unit="step")
+
+    def _install_signal_handlers(self):
+        # First SIGINT/SIGTERM: request a graceful stop -- the loop finishes the
+        # current step, writes checkpoint.pt, and exits, so `kill <pid>` / Ctrl-C
+        # loses at most one step and `--resume` lands exactly where it stopped.
+        # A second signal falls through to the default handler for a hard quit.
+        import signal
+
+        def _handler(signum, _frame):
+            if self._stop_requested:
+                raise KeyboardInterrupt  # second signal -> hard exit
+            self._stop_requested = True
+            self._emit(f"[trainer] stop requested (signal {signum}); will checkpoint and "
+                       f"exit after the current step. Send again to force-quit.")
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(sig, _handler)
+            except (ValueError, OSError):
+                pass  # not on the main thread (some launchers) -- skip, don't crash
+
+    def train(self, max_steps: int, progress: str = "auto"):
         accum = max(1, self.train_cfg.grad_accum_steps)
+        self._install_signal_handlers()
+        self._bar = self._make_progress_bar(max_steps, progress)
+        try:
+            self._train_loop(max_steps, accum)
+        finally:
+            if self._bar is not None:
+                self._bar.close()
+                self._bar = None
+
+    def _train_loop(self, max_steps: int, accum: int):
         while self.curriculum.stage.value <= Stage.E.value and self.global_step < max_steps:
             flags = self.curriculum.stage_flags()
             plan = self.curriculum.loss_plan()
@@ -232,13 +292,22 @@ class Trainer:
                         f"skipped), so inspect the last checkpoint and the data/LR before resuming.")
             self.ema.update(self.model.chunk_encoder)
             self.global_step += 1
+            if self._bar is not None:
+                self._bar.update(1)
+                self._bar.set_postfix(stage=self.curriculum.stage.name, lr=f"{lr:.1e}",
+                                      val=("-" if self._last_val_loss is None
+                                           else f"{self._last_val_loss:.3f}"),
+                                      lstd=("-" if self._last_lstd is None
+                                            else f"{self._last_lstd:.3f}"),
+                                      refresh=False)
 
             val_loss = None
             if self.train_cfg.log_every and self.global_step % self.train_cfg.log_every == 0:
                 val_loss = self.evaluate()
                 lstd = self.model.latent_collapse_metric(*last_cc) if last_cc else 0.0
-                print(f"[step {self.global_step}] stage={self.curriculum.stage.name} lr={lr:.2e} "
-                      f"logs={step_logs} val_loss={val_loss:.4f} lstd={lstd:.4f}", flush=True)
+                self._last_val_loss, self._last_lstd = val_loss, lstd
+                self._emit(f"[step {self.global_step}] stage={self.curriculum.stage.name} lr={lr:.2e} "
+                           f"logs={step_logs} val_loss={val_loss:.4f} lstd={lstd:.4f}")
                 self.metrics.append({"step": self.global_step, "stage": self.curriculum.stage.name,
                                      "val_loss": val_loss, "latent_std": round(lstd, 4), **step_logs})
 
@@ -247,7 +316,7 @@ class Trainer:
             # or a resume replays one extra step-in-stage and the per-stage LR
             # schedule drifts off the uninterrupted run by one step.
             if self.curriculum.advance_step(val_loss):
-                print(f">>> curriculum advanced to stage {self.curriculum.stage.name}", flush=True)
+                self._emit(f">>> curriculum advanced to stage {self.curriculum.stage.name}")
 
             if self.train_cfg.checkpoint_every and self.global_step % self.train_cfg.checkpoint_every == 0:
                 self.save("checkpoint.pt")
@@ -260,6 +329,19 @@ class Trainer:
             arch = getattr(self.train_cfg, "checkpoint_archive_every", 0)
             if arch and self.global_step % arch == 0:
                 self.save(f"checkpoint_{self.global_step:07d}.pt")
+
+            # Graceful stop: a requested SIGINT/SIGTERM checkpoints here, at a
+            # clean step boundary (after the curriculum has advanced, exactly
+            # like a periodic checkpoint), then exits. `--resume checkpoint.pt`
+            # continues from this step. Re-save only if the periodic write above
+            # didn't already land on this step.
+            if self._stop_requested:
+                if not (self.train_cfg.checkpoint_every
+                        and self.global_step % self.train_cfg.checkpoint_every == 0):
+                    self.save("checkpoint.pt")
+                self._emit(f"[trainer] stopped at step {self.global_step}; checkpoint saved. "
+                           f"Re-run the same command to resume.")
+                return
 
             if self.curriculum.stage == Stage.F:
                 break
@@ -305,7 +387,7 @@ class Trainer:
         with open(mtmp, "w") as f:
             json.dump(self.metrics, f, indent=2)
         os.replace(mtmp, os.path.join(self.ckpt_dir, "metrics.json"))
-        print(f"[trainer] checkpoint -> {path} (step {self.global_step})", flush=True)
+        self._emit(f"[trainer] checkpoint -> {path} (step {self.global_step})")
 
     def load(self, path: str):
         import random

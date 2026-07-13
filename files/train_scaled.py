@@ -68,7 +68,15 @@ def main():
                     help="override ssl_loss_weight (default 1.0, co-equal with reconstruction; "
                          "the on-loop SSL that trains the HRM loop to predict forward)")
     ap.add_argument("--out", default="runs/scaled")
-    ap.add_argument("--resume", default=None)
+    ap.add_argument("--resume", default=None,
+                    help="resume from a specific checkpoint path. If omitted and "
+                         "<out>/checkpoint.pt exists, that one is auto-resumed (see --fresh).")
+    ap.add_argument("--fresh", action="store_true",
+                    help="ignore any existing <out>/checkpoint.pt and start from step 0 "
+                         "(without this, re-running the same command resumes automatically).")
+    ap.add_argument("--progress", default="auto", choices=["auto", "on", "off"],
+                    help="tqdm progress bar: auto (bar on a terminal, plain log lines when "
+                         "redirected to a file), on (force), off (never).")
     ap.add_argument("--max-steps", type=int, default=None)
     args = ap.parse_args()
 
@@ -136,11 +144,22 @@ def main():
                       data_fingerprint={"examples": len(ds),
                                         "tokens": ds.manifest.get("tokens"),
                                         "shards": len(ds.manifest.get("shards", []))})
+    # Resume resolution: an explicit --resume wins; otherwise auto-resume from
+    # <out>/checkpoint.pt if it exists (so `stop then re-run the same command`
+    # just works), unless --fresh forces a clean start.
+    default_ckpt = os.path.join(PROJECT, args.out, "checkpoint.pt")
     if args.resume:
         resume = args.resume if os.path.isabs(args.resume) else os.path.join(PROJECT, args.resume)
+    elif not args.fresh and os.path.exists(default_ckpt):
+        resume = default_ckpt
+        print(f"[train_scaled] auto-resuming from {default_ckpt} "
+              f"(pass --fresh to start over, or --resume PATH for a specific checkpoint).")
+    else:
+        resume = None
+    if resume:
         trainer.load(resume)
 
-    trainer.train(max_steps=max_steps)
+    trainer.train(max_steps=max_steps, progress=args.progress)
     trainer.save("model.pt")
     print(f"[train_scaled] done. final stage {curriculum.stage.name}, step {trainer.global_step}")
 

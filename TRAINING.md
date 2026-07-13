@@ -30,18 +30,24 @@ gpt2 quality at this scale — that's expected; the goal is a healthy, non-colla
 
 ## 1. Prerequisites
 
-Follow [`STRIX_HALO.md`](STRIX_HALO.md) first for the ROCm/GPU PyTorch install. Then you need: the GPU
-box (AMD ROCm shows up as "cuda", which is normal) with a GPU PyTorch build + `datasets transformers
-matplotlib`; the local gpt2 tokenizer at `gpt2_tok/`; ~10-15 GB disk for the cache (it also loads fully
-into RAM at train start, with ~2x that transiently while shards concatenate). Budget disk for
-checkpoints too: each snapshot (model + AdamW moments + EMA) is ~2 GB at `small`, and
-`--archive-every 5000` keeps them all — tens of GB over a long run.
+Follow [`STRIX_HALO.md`](STRIX_HALO.md) first for the ROCm/GPU PyTorch install. Then install the rest
+of the training deps from [`training.txt`](training.txt) (`datasets`, `transformers`, **`wtpsplit`**,
+`tqdm`, `matplotlib` — `torch>=2.2` is already satisfied by the ROCm build so pip won't clobber it).
+You also need: the GPU box (AMD ROCm shows up as "cuda", which is normal); the local gpt2 tokenizer at
+`gpt2_tok/`; ~10-15 GB disk for the cache (it also loads fully into RAM at train start, with ~2x that
+transiently while shards concatenate). Budget disk for checkpoints too: each snapshot (model + AdamW
+moments + EMA) is ~2 GB at `small`, and `--archive-every 5000` keeps them all — tens of GB over a long
+run.
+
+> **SaT chunker:** `data_prep.py` segments with the real **SaT** model (`sat-3l-sm`), which `wtpsplit`
+> downloads from the HF hub on the **first** prep run (a few hundred MB, cached after). This is why
+> `wtpsplit` is required; the gpt2 tokenizer itself is read locally from `gpt2_tok/`.
 
 ```bash
 export PROJECT=/path/to/ucsc          # edit to your path
 export HSA_OVERRIDE_GFX_VERSION=11.5.1 # AMD gfx1151 only; harmless otherwise
 cd "$PROJECT" && source .venv/bin/activate
-pip install datasets transformers matplotlib tqdm   # tqdm optional: interactive progress bar
+pip install -r training.txt           # datasets/transformers/wtpsplit/tqdm/matplotlib (torch stays as installed)
 cd "$PROJECT/files"
 python - <<'PY'
 import torch, os
@@ -104,23 +110,42 @@ PY
 
 ## 3. Prepare the data (one-time, hours)
 
-Training reads a **pre-chunked cache**. Always prep into a **fresh, empty** directory
-(`data_prep.py` now refuses a non-empty one). **Never re-prep or touch the cache dir once the
-run has started** — the val/train split is derived from the cache size, and resume hard-fails
-if it changed (see §7).
+Training reads a **pre-chunked cache**, segmented with the real **SaT** chunker (§0 of the design
+doc). Always prep into a **fresh, empty** directory (`data_prep.py` refuses a non-empty one). **Never
+re-prep or touch the cache dir once the run has started** — the val/train split is derived from the
+cache size, and resume hard-fails if it changed (see §7). The **first** prep run downloads the
+`sat-3l-sm` SaT model (needs `wtpsplit`, see §1).
 
 ```bash
-# tiny timed dry-run first (do NOT skip) -- confirms streaming + chunking work:
+# tiny timed dry-run first (do NOT skip) -- confirms the SaT download, streaming + chunking work:
 python data_prep.py --dataset HuggingFaceFW/fineweb-edu --name sample-10BT --streaming \
   --preset small --docs 1000 --out chunk_cache_dryrun
 rm -rf "$PROJECT/chunk_cache_dryrun"
+```
 
-# the real prep (~1.2B tokens; --name and --streaming are REQUIRED for fineweb-edu):
+Then the real prep. **Recommended: the full Stages A-E mixture** (`--mixture` streams
+`config.DataConfig.sources` — fineweb-edu + pg19 + wikipedia + arxiv + open-web-math + code,
+interleaved by weight; it carries its own per-source `--name`s, and `--max-tokens` is required):
+
+```bash
+python data_prep.py --mixture --preset small --max-tokens 1200000000 --out chunk_cache
+```
+
+Or a **single corpus** (simpler; `--name` + `--streaming` are REQUIRED for fineweb-edu so you don't
+pull the multi-TB default config):
+
+```bash
 python data_prep.py --dataset HuggingFaceFW/fineweb-edu --name sample-10BT --streaming \
   --preset small --max-tokens 1200000000 --out chunk_cache
 ```
 
-`--preset small` here **must match** training. Note the final `wrote <EXAMPLES> examples` count.
+`--preset` here **must match** training. Note the final `wrote <EXAMPLES> examples` count.
+
+> **Wide-thought (`-w3`) run:** swap `--preset small` → `--preset small-w3` here **and** in every
+> training command below, and add `--var-weight 3.0` at launch (§5). The retuned `cosine_loss_k` rides
+> along in the preset automatically; `--var-weight` does not, so it must be passed. `small` and
+> `small-w3` share chunk dims, so one cache serves either — but a cache's `--preset` must still match
+> the model you train on it.
 
 ---
 

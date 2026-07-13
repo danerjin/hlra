@@ -55,6 +55,36 @@ def ponder_cost_loss(ponder_cost: torch.Tensor, weight: float) -> torch.Tensor:
     return weight * ponder_cost
 
 
+def anti_sycophancy_loss(pred_a: torch.Tensor, pred_b: torch.Tensor, target: torch.Tensor,
+                         k: float = 4.0, agree_weight: float = 1.0) -> torch.Tensor:
+    """
+    The Layer-3 (§4.3) contrastive signal that makes the USER/SELF role tags
+    *behaviorally* load-bearing instead of a mere representational affordance.
+
+    `pred_a`, `pred_b`: the model's predicted opening-response latent under two
+    contexts that differ ONLY in a USER-asserted premise (e.g. the user asserts
+    X vs. asserts not-X). `target`: the role-invariant correct-answer latent
+    (already detached, e.g. an EMA-target encoding of the true answer's stance).
+
+    A sycophant lets the user's assertion move its answer, so pred_a and pred_b
+    diverge and chase whichever premise the user stated. This loss penalizes
+    exactly that: each variant must match the fixed truth (the two scaled-cosine
+    terms) AND the two variants must agree with each other (the `agree` term) --
+    i.e. the model must *discount* the user's assertion, which it can only do by
+    reading the role tag. Uses the same scaled-cosine form (§3.4) as the
+    predictive objective so the magnitudes are comparable.
+
+    NOTE this is the loss the design (§4.3) calls for but had never implemented;
+    the contrastive pairs it consumes are constructed in dialogue_data.py. It is
+    a starting point, not a validated recipe -- the pair construction is where
+    the real signal lives.
+    """
+    la = scaled_cosine_loss(pred_a, target, k)
+    lb = scaled_cosine_loss(pred_b, target, k)
+    agree = (k * (1.0 - F.cosine_similarity(pred_a, pred_b, dim=-1))).mean()
+    return la + lb + agree_weight * agree
+
+
 def variance_regularization(z: torch.Tensor, target_std: float = 0.1, eps: float = 1e-4) -> torch.Tensor:
     """
     VICReg-style anti-collapse term. Collapse = the encoder outputs (nearly)

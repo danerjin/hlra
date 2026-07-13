@@ -85,6 +85,47 @@ class ModelConfig:
 
     # ---- role tags for the two-lane input/self separation (§4.2) -------
     role_tags: tuple = ("USER", "SELF", "SYSTEM")
+    # Soft, LEARNED role tags (§4.2 extension). Off (default) = the discrete
+    # nn.Embedding(n_roles, d) tag -- BYTE-IDENTICAL to the validated A-E reader,
+    # so this never perturbs a run unless explicitly enabled. On = each role's
+    # tag is a soft mixture over a shared learned codebook of `soft_role_codebook`
+    # provenance prototypes, with a learned temperature: provenance becomes a
+    # continuous, graded space instead of 3 isolated bins. The discrete role id
+    # is retained as ground-truth metadata (filtering, the anti-sycophancy label);
+    # only its VECTORIZATION becomes soft. Sharing the codebook across roles also
+    # warms the rarely-written USER/SYSTEM/RETRIEVED tags (which A-E never trains)
+    # from SELF's trained structure. Adding a new role (e.g. RETRIEVED for latent
+    # RAG) is then just one more row of role_logits sharing the same codebook.
+    soft_role_tags: bool = False
+    soft_role_codebook: int = 16    # K learned provenance prototypes (soft path only)
+    # Trust gate (§4.3, the anti-sycophancy hook). Off (default) = ungated read,
+    # BYTE-IDENTICAL to the validated reader. On = a learned scalar in (0,1) per
+    # memory slot, projected FROM the (soft or discrete) role tag, scales that
+    # slot's VALUE in the cross-attention read -- so the reader can attend to a
+    # slot (its key is untouched) yet discount how much of its content flows into
+    # the thought. "Trust by provenance": the anti-sycophancy contrastive loss
+    # drives trust(USER) down when the user's assertion sways the conclusion,
+    # while the key path still lets the model NOTICE what was said. Works with or
+    # without soft_role_tags; pairs naturally with it.
+    trust_gate: bool = False
+    trust_gate_vector: bool = False   # vector (per-dim) gate: discount a polarity subspace, keep topic
+    soft_role_content: bool = False   # content-condition the soft tag mixture (needs soft_role_tags)
+    # Gestalt-readout projection (§4 / Q2): project self-thoughts AND external
+    # content into one common memory space before writing, so the bank is
+    # homogeneous. Off = write raw (A-E behavior). Used only by the Stage-F /
+    # RAG paths (forward_dialogue, inject_source), never in forward_self_supervised.
+    gestalt_readout: bool = False
+    # Personalized / dynamic role tags (§4.2 extension). `persona_tags` adds a
+    # learned per-speaker embedding, indexed by a CONVERSATION-LOCAL speaker id
+    # (0..n_personas-1, reused across dialogues so it generalizes), on top of the
+    # coarse role tag: role = provenance (USER/SELF/SYSTEM), persona = *who*. So
+    # >3 speakers are distinguishable without a global speaker vocabulary. Zero-
+    # init => inert until trained. The DYNAMIC shift ("how a person moves during a
+    # conversation") is delivered by soft_role_content -- each turn is its own slot
+    # whose soft role mixture bends with content -- and is observable via
+    # GestaltCrossAttentionReader.tag_trajectory(). Off = byte-identical.
+    persona_tags: bool = False
+    n_personas: int = 16     # max distinct speakers per conversation (persona table size)
 
     # ---- chunk encoder (§2.1, shared latent producer) -------------------
     chunk_encoder_layers: int = 2
@@ -135,6 +176,13 @@ class ModelConfig:
         if self.d_latent % self.n_heads != 0:
             raise ValueError(
                 f"d_latent ({self.d_latent}) must be divisible by n_heads ({self.n_heads})")
+        # Surface silently-ignored tag/gate dependencies (a dependent flag set
+        # without its parent is a no-op -- warn so a misconfig isn't masked).
+        import warnings
+        if self.soft_role_content and not self.soft_role_tags:
+            warnings.warn("soft_role_content has no effect without soft_role_tags (ignored).")
+        if self.trust_gate_vector and not self.trust_gate:
+            warnings.warn("trust_gate_vector has no effect without trust_gate (ignored).")
 
 
 @dataclass
@@ -192,6 +240,48 @@ class TrainConfig:
     # transitions happen on these budgets instead of the noisy plateau gate --
     # far more predictable for long runs. None -> keep plateau gating.
     stage_steps: tuple = None
+
+
+@dataclass
+class StageFConfig:
+    """
+    Stage F (chatbot fine-tuning) hyperparameters. Kept SEPARATE from
+    TrainConfig on purpose: the A-E TrainConfig, its checkpoint schema, and the
+    trainer.py schedule-drift guard are validated, and Stage F is a distinct,
+    not-yet-validated fine-tune driven by train_dialogue.py -- mixing its knobs
+    into TrainConfig would perturb that surface.
+
+    The four loss terms (see model.forward_dialogue / forward_anti_sycophancy):
+      * grounded_weight  -- the reconstruction anchor, kept ON so the codec the
+                            Talker learned in A-E does not drift during SFT
+                            (the always-on anti-collapse anchor, §2.4).
+      * cos_weight       -- on-loop cosine: predict the assistant's next thought
+                            latent (JEPA/SSL objective, now used as latent-space
+                            SFT: masked to SELF/assistant chunks only).
+      * gen_weight       -- generative token NLL: decode the TRUE assistant
+                            tokens from the PREDICTED latent (end-to-end
+                            pred_head -> Talker SFT). This is the term A-E never
+                            trains -- reconstruction decodes from encode(chunk),
+                            generation decodes from pred_head's off-distribution
+                            latent, and only this closes that gap.
+      * syco_weight      -- the anti-sycophancy contrastive term (§4.3, Layer 3).
+    """
+    lr: float = 5e-5                  # lower than A-E: a fine-tune off a trained init
+    weight_decay: float = 0.01
+    grad_clip: float = 1.0
+    batch_size: int = 8
+    steps: int = 2000
+    grounded_weight: float = 1.0
+    cos_weight: float = 1.0
+    gen_weight: float = 1.0
+    var_weight: float = 2.0           # keep the variance floor active during SFT
+    ponder_weight: float = 0.01       # = ModelConfig.act_ponder_cost
+    syco_weight: float = 0.5
+    syco_agree_weight: float = 1.0
+    syco_every: int = 4               # run a contrastive step every N dialogue steps (0 = off)
+    log_every: int = 50
+    checkpoint_every: int = 500
+    seed: int = 0
 
 
 @dataclass

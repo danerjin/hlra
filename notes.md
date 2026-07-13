@@ -356,6 +356,58 @@ Flagged, deliberately not changed:
   snapshot) will *intentionally* fire the "resume schedule differs" warning — expected in that
   recovery, not a stop signal.
 
+## Stage F implementation + 4-agent review (2026-07-13)
+
+Stage F (chatbot fine-tuning, §4) — previously designed-only — was **implemented**,
+plus the tagging/RAG/persona extensions. All **additive and opt-in**: with every
+Stage-F flag off the model is **byte-identical to the validated A→E model**
+(confirmed against commit 261de64b), and no A→E path (`forward_grounded` /
+`forward_self_supervised` / `trainer.py`) is touched. **Smoke-only, UNVALIDATED —
+no real dialogue run.** Full map in [`STAGE_F.md`](STAGE_F.md).
+
+What landed (new files `dialogue.py`, `dialogue_data.py`, `train_dialogue.py`,
+`lm_eval_adapter.py`; additions to `model.py`, `gestalt_memory.py`, `losses.py`,
+`config.py`, `hrm_loop.py`, `talker.py`):
+- **SFT**: `forward_dialogue` (SELF-masked cosine + a NEW generative token loss —
+  decode the true assistant tokens from the *predicted* latent via `score_tokens`,
+  the gap A→E never trained — + var + ponder); learned `response_seed` in a
+  separate `DialogueAdapter` (keeps the base state_dict identical).
+- **Three-layer input/self separation**: structural (lane never writes state),
+  informational (leak-free data contract), behavioral (`anti_sycophancy_loss` +
+  the trust gate, memory-routed).
+- **Tagging**: soft learned role tags (shared codebook + learned temperature),
+  content-conditioned tags, scalar/vector **trust gate**, **gestalt-readout**
+  projection (homogenizes the bank, §Q2), per-batch role/persona ids.
+- **Personalized/dynamic tags**: per-speaker `persona_embed` (conversation-local
+  id), `tag_trajectory()` to observe a speaker's per-turn mixture shift.
+- **Latent RAG (§Q3, mechanism only)**: `RETRIEVED` role, `inject_source`,
+  `DialogueSession.add_source` + decode-time Talker grounding.
+- **Real data**: transcript parser (debate/courtroom/socratic `SPEAKER:`),
+  chat-messages + HF streamers, speaker→role map (pick who is SELF), multi-turn
+  `tensorize_dialogue_sft`; offline synthetic corpora as fallback.
+- **Eval**: `lm_eval_adapter.py` scores via the predictive chain (NOT the leaking
+  reconstruction path).
+
+**Review** — four independent adversarial audits (model/loss/gradient,
+gestalt_memory reader/bank, data pipeline/driver, serving/lm-eval/config). The
+model/loss and reader audits came through **clean of HIGH-severity defects**
+(gradient routing, teacher-forcing with no off-by-one leak, the leak-free
+contract, and A→E-byte-identical-when-off all re-verified). Fixes landed:
+- **HIGH**: the two HF turn-iterators still unpacked 2-tuples after the turn
+  format became `(role, persona, text)` — every real-data run would have crashed
+  (the offline smoke structurally couldn't catch it). Fixed to 3-tuple unpack.
+- **MED**: persona ids now clamped to `n_personas` (a transcript with more distinct
+  speakers than the table no longer index-errors); `inject_source`/`add_source`
+  raise a clear error on a &lt;4-role model instead of a far-away IndexError; the
+  serving SELF write now goes through `_gestalt` (+SELF persona) to match training;
+  the lm-eval adapter forces CPU (the shared inference path is CPU-only);
+  anti-sycophancy masks to active answer rows.
+- **LOW**: dependent-flag config warnings; a clear error in `_reconcile_role_tables`
+  for the reverse (higher→lower role) load; transcript-regex false-positive caveat
+  documented; scalar-vs-vector trust-gate limitation noted (a scalar gate can't
+  discount polarity while keeping topic — use the vector gate).
+Post-fix: all smokes + the lm-eval self-test pass; A→E smokes numerically unchanged.
+
 ## Open items before a large run
 
 - **Re-confirm at full scale (~1.2B tokens):** watch `val_loss` at the Stage-B predictor boundary; the

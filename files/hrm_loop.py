@@ -140,7 +140,11 @@ class HRMInnerLoop(nn.Module):
     def __init__(self, d_latent: int, d_ff: int, n_heads: int, dropout: float,
                  l_steps_per_h_update: int, h_updates_per_thought: int,
                  n_roles: int, min_decay: float, max_decay: float,
-                 act_max_ponder_steps: int, d_input: int | None = None):
+                 act_max_ponder_steps: int, d_input: int | None = None,
+                 soft_role_tags: bool = False, soft_role_codebook: int = 16,
+                 trust_gate: bool = False, soft_role_content: bool = False,
+                 trust_gate_vector: bool = False, persona_tags: bool = False,
+                 n_personas: int = 16):
         super().__init__()
         # The loop works entirely at the thought width d_latent: a thought is a
         # chunk-level object, so the chunk encoder already hands it in at d_latent
@@ -167,7 +171,12 @@ class HRMInnerLoop(nn.Module):
         # Cross-attention into the persistent gestalt memory (read only; the
         # write happens once per finished thought, outside this module). Memory
         # holds d_latent thoughts and the query is the d_latent state -- one width.
-        self.memory_reader = GestaltCrossAttentionReader(d_latent, n_heads, n_roles, dropout)
+        self.memory_reader = GestaltCrossAttentionReader(
+            d_latent, n_heads, n_roles, dropout,
+            soft_role_tags=soft_role_tags, soft_role_codebook=soft_role_codebook,
+            trust_gate=trust_gate, soft_role_content=soft_role_content,
+            trust_gate_vector=trust_gate_vector, persona_tags=persona_tags,
+            n_personas=n_personas)
 
         # Cross-attention into the input lane (raw tokens + aged gestalts), per
         # §4.2: the Reasoner's H/L state may only *read* the input lane, never

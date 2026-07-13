@@ -75,7 +75,11 @@ class Talker(nn.Module):
 
     def __init__(self, vocab_size: int, d_model: int, n_heads: int, d_ff: int,
                  dropout: float, n_layers: int, n_roles: int, max_chunk_len: int,
-                 d_latent: int | None = None):
+                 d_latent: int | None = None,
+                 soft_role_tags: bool = False, soft_role_codebook: int = 16,
+                 trust_gate: bool = False, soft_role_content: bool = False,
+                 trust_gate_vector: bool = False, persona_tags: bool = False,
+                 n_personas: int = 16):
         super().__init__()
         # The Talker is a word-level readout: its token embeddings, positions,
         # start vector, self-attention, FFN, and LM head are all at the token
@@ -97,7 +101,12 @@ class Talker(nn.Module):
              for _ in range(n_layers)]
         )
         # Keyed by the (d_latent) thought; reads d_latent thoughts out of memory.
-        self.memory_reader = GestaltCrossAttentionReader(d_latent, n_heads, n_roles, dropout)
+        self.memory_reader = GestaltCrossAttentionReader(
+            d_latent, n_heads, n_roles, dropout,
+            soft_role_tags=soft_role_tags, soft_role_codebook=soft_role_codebook,
+            trust_gate=trust_gate, soft_role_content=soft_role_content,
+            trust_gate_vector=trust_gate_vector, persona_tags=persona_tags,
+            n_personas=n_personas)
         self.out_norm = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 

@@ -42,16 +42,23 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from config import ModelConfig
 from input_lane import InputLaneEncoder
 from hrm_loop import HRMInnerLoop
-from gestalt_memory import GestaltMemoryBank
+from gestalt_memory import GestaltMemoryBank, GestaltReadout
 from talker import Talker
 from ema_target import ChunkEncoder, EMATargetEncoder
-from losses import scaled_cosine_loss, grounded_nll_loss, ponder_cost_loss, variance_regularization
+from losses import (scaled_cosine_loss, grounded_nll_loss, ponder_cost_loss,
+                    variance_regularization, anti_sycophancy_loss)
 
 USER, SELF, SYSTEM = 0, 1, 2  # role-tag ids, matching config.role_tags order
+# RETRIEVED (3) is the latent-RAG provenance tag (§Q3). It is only usable when
+# the model is built with a 4-entry role_tags, e.g. role_tags=("USER","SELF",
+# "SYSTEM","RETRIEVED"); A-E ships 3 roles, so RETRIEVED is opt-in and never
+# referenced on the validated path.
+RETRIEVED = 3
 
 
 @dataclass
@@ -121,6 +128,10 @@ class LatentThoughtModel(nn.Module):
             h_updates_per_thought=cfg.h_updates_per_thought,
             n_roles=len(cfg.role_tags), min_decay=cfg.decay_min,
             max_decay=cfg.decay_max, act_max_ponder_steps=cfg.act_max_ponder_steps,
+            soft_role_tags=cfg.soft_role_tags, soft_role_codebook=cfg.soft_role_codebook,
+            trust_gate=cfg.trust_gate, soft_role_content=cfg.soft_role_content,
+            trust_gate_vector=cfg.trust_gate_vector, persona_tags=cfg.persona_tags,
+            n_personas=cfg.n_personas,
         )
 
         # --- Input lane (§4.1, §4.2) -----------------------------------
@@ -139,6 +150,10 @@ class LatentThoughtModel(nn.Module):
             n_heads=cfg.n_heads, d_ff=cfg.d_ff, dropout=cfg.dropout,
             n_layers=cfg.talker_layers, n_roles=len(cfg.role_tags),
             max_chunk_len=cfg.max_chunk_len,
+            soft_role_tags=cfg.soft_role_tags, soft_role_codebook=cfg.soft_role_codebook,
+            trust_gate=cfg.trust_gate, soft_role_content=cfg.soft_role_content,
+            trust_gate_vector=cfg.trust_gate_vector, persona_tags=cfg.persona_tags,
+            n_personas=cfg.n_personas,
         )
 
         # --- Self-supervised JEPA branch (§2.1) — the HRM loop IS the predictor.
@@ -158,6 +173,13 @@ class LatentThoughtModel(nn.Module):
         # Maps a finished thought to the next chunk's EMA-target latent -- both
         # are chunk-level, so this is d_latent -> d_latent.
         self.pred_head = nn.Linear(cfg.d_latent, cfg.d_latent)
+
+        # --- Gestalt-readout projection (§4 / Q2, Stage-F/RAG only) ---------
+        # Homogenizes what gets written to memory: self-thoughts AND external
+        # content pass through one projection onto the thought shell. None (the
+        # default) writes raw, exactly as A-E does. Never used by
+        # forward_self_supervised, so the A-E path is untouched.
+        self.gestalt_readout = GestaltReadout(cfg.d_latent) if cfg.gestalt_readout else None
 
     # ------------------------------------------------------------------
     def _encode_real_rows(self, flat_ids: torch.Tensor, encode_fn) -> torch.Tensor:
@@ -378,4 +400,303 @@ class LatentThoughtModel(nn.Module):
         if z.shape[0] < 2:
             return 0.0
         return z.std(dim=0).mean().item()
+
+    # ==================================================================
+    # Stage F (chatbot fine-tuning, §4). Everything below is ADDITIVE: these
+    # are new methods (no new nn.Parameters, so the A-E state_dict is
+    # byte-identical and A-E resume is unaffected) and no A-E code path calls
+    # them. The one Stage-F-only learned parameter -- the response seed -- lives
+    # in dialogue.DialogueAdapter and is passed in, keeping it out of the base
+    # model. The A-E forwards (forward_grounded / forward_self_supervised) are
+    # untouched.
+    # ==================================================================
+    @staticmethod
+    def _talker_target_mask(ids: torch.Tensor, chunk_len: int) -> torch.Tensor:
+        """The supervised-position mask forward_grounded uses: every real token
+        plus the first PAD (end-of-chunk stop) of a shorter-than-max chunk, so
+        decoding can learn to terminate (§19.2). Duplicated from forward_grounded
+        deliberately -- that method is audited and must stay byte-identical, so
+        this shares the *logic* without editing it."""
+        tok_mask = ids != 0
+        lengths = tok_mask.sum(-1)
+        target_mask = tok_mask
+        has_end = (lengths > 0) & (lengths < chunk_len)
+        if has_end.any():
+            target_mask = tok_mask.clone()
+            target_mask[has_end, lengths[has_end]] = True
+        return target_mask
+
+    def score_tokens(self, token_ids: torch.Tensor, latent: torch.Tensor,
+                     memory: GestaltMemoryBank = None):
+        """
+        Teacher-forced token NLL of `token_ids` decoded from an EXTERNALLY
+        supplied `latent`, under the codec Talker. Returns (nll_sum, n_tokens):
+        the summed cross-entropy over supervised positions and their count, so a
+        caller aggregating over many chunks can token-weight correctly.
+
+        This is the one operation neither A-E forward exposes, and the shared
+        primitive behind BOTH the Stage-F generative loss and a future lm-eval
+        loglikelihood adapter: forward_grounded scores tokens under
+        `encode(tokens)` (the target leaks into its own conditioning -- fine for
+        an autoencoder anchor, useless for scoring a prediction), while this
+        scores given tokens under a GIVEN latent (e.g. pred_head's forecast).
+        Empty memory = the codec convention (§27) unless a bank is passed.
+        """
+        n_rows = token_ids.shape[0]
+        if n_rows == 0:
+            zero = latent.sum() * 0.0            # keep the graph/device, value 0
+            return zero, zero
+        if memory is None:
+            memory = GestaltMemoryBank(self.cfg.memory_capacity, self.cfg.d_latent)
+        logits = self.talker(token_ids, latent, memory)             # (n, L, vocab)
+        target_mask = self._talker_target_mask(token_ids, token_ids.shape[1])
+        vocab = logits.shape[-1]
+        per_tok = F.cross_entropy(
+            logits.reshape(-1, vocab), token_ids.reshape(-1), reduction="none"
+        ).reshape(token_ids.shape)
+        m = target_mask.float()
+        return (per_tok * m).sum(), m.sum()
+
+    @staticmethod
+    def _rescale_to(pred: torch.Tensor, ref_norm: torch.Tensor) -> torch.Tensor:
+        """Put `pred` on the norm shell of `ref_norm` (per row). The cosine
+        objective trains pred_head's direction, not its scale, but the Talker
+        consumes latents unnormalized -- so the generative loss (and generation,
+        predict_next_latent) must rescale the prediction onto the encoder-latent
+        norm the Talker was trained on before decoding."""
+        ref_norm = ref_norm.clamp_min(1e-3)
+        return pred / pred.norm(dim=-1, keepdim=True).clamp_min(1e-6) * ref_norm
+
+    def _open_response(self, response_seed: torch.Tensor, memory: GestaltMemoryBank,
+                       input_lane_kv, input_lane_mask, stage, n: int, active=None):
+        """The response-initiation thought (§4): the loop reads the user turn
+        (only via the input lane -- never compressed into a thought, per §4.1)
+        with a learned seed injection, producing the thought whose pred_head is
+        the model's opening stance for the reply's first chunk. Returns
+        (h, ponder)."""
+        seed = response_seed.unsqueeze(0).expand(n, -1)
+        return self.hrm_loop(
+            seed, memory, input_lane_kv, h_state=None, l_state=None,
+            grad_window=stage.inner_loop_grad_window, use_act=stage.use_act,
+            input_lane_mask=input_lane_mask, active_mask=active)
+
+    def _gestalt(self, x: torch.Tensor) -> torch.Tensor:
+        """Map content into the shared memory space before writing (§4/Q2).
+        Identity when the gestalt-readout is disabled (raw write, A-E behavior)."""
+        return self.gestalt_readout(x) if self.gestalt_readout is not None else x
+
+    def _write_context(self, memory: GestaltMemoryBank, context_chunks, context_mask,
+                       context_roles, context_personas=None):
+        """Write prior-turn chunks into memory as role-tagged aged gestalts (§4.1,
+        §4.2) BEFORE the response loop, giving it cross-turn memory. Each context
+        chunk -> encoder latent -> gestalt-readout -> one slot, tagged with that
+        chunk's SPEAKER role (and, if given, conversation-local persona id). Roles/
+        personas differ per example, so they are written as per-batch tensors.
+        Detached (fixed context). No-op if context_chunks is None/empty."""
+        if context_chunks is None or context_chunks.shape[1] == 0:
+            return
+        B, A, L = context_chunks.shape
+        flat = context_chunks.reshape(B * A, L)
+        z = self._encode_real_rows(flat, self.chunk_encoder).reshape(B, A, -1)
+        for j in range(A):
+            if not bool(context_mask[:, j].any()):
+                continue
+            role = context_roles[:, j] if context_roles.dim() == 2 else int(context_roles[j])
+            persona = None
+            if context_personas is not None:
+                persona = (context_personas[:, j] if context_personas.dim() == 2
+                           else int(context_personas[j]))
+            memory.write(self._gestalt(z[:, j]).detach(), role, persona)
+
+    @torch.no_grad()
+    def inject_source(self, memory: GestaltMemoryBank, source_chunks: torch.Tensor,
+                      source_mask: torch.Tensor, role: int = RETRIEVED) -> int:
+        """Latent RAG (§Q3): encode a retrieved source into per-chunk gestalts and
+        write them to `memory` tagged RETRIEVED -- provenance-distinct from
+        USER/SELF/SYSTEM -- so the loop cross-attends the source's GIST at
+        O(#chunks) instead of O(#tokens) in a context window. Fidelity caveat
+        (§4.1): a chunk latent is lossy, so for verbatim quotes/numbers ALSO
+        ground the Talker on the raw source at decode time (DialogueSession).
+        Requires a model built with a 4+-entry role_tags. Returns slots written.
+
+        MECHANISM ONLY: the loop's read of RETRIEVED slots is untrained until a
+        retrieval-augmented Stage-F dataset exists -- this wires the path, it does
+        not make the model good at RAG."""
+        if role >= len(self.cfg.role_tags):
+            raise ValueError(
+                f"inject_source got role id {role}, but the model has only "
+                f"{len(self.cfg.role_tags)} role tags {self.cfg.role_tags}. Build the model "
+                f"with a 4+-entry role_tags (e.g. append 'RETRIEVED') to use latent RAG; "
+                f"otherwise the memory reader would index its role table out of range.")
+        B, A, L = source_chunks.shape
+        flat = source_chunks.reshape(B * A, L)
+        z = self._encode_real_rows(flat, self.chunk_encoder).reshape(B, A, -1)
+        n = 0
+        for j in range(A):
+            if not bool(source_mask[:, j].any()):
+                continue
+            memory.write(self._gestalt(z[:, j]), role)
+            n += 1
+        return n
+
+    def forward_dialogue(self, resp_chunks: torch.Tensor, resp_mask: torch.Tensor,
+                         user_ids: torch.Tensor, user_mask: torch.Tensor,
+                         ema: EMATargetEncoder, response_seed: torch.Tensor, stage,
+                         context_chunks=None, context_mask=None, context_roles=None,
+                         context_personas=None, var_weight: float = 0.0, chunk_vecs=None):
+        """
+        Stage-F supervised fine-tuning in latent space (§4, §5 stage F). One
+        example is (user turn -> assistant response); the model learns to
+        produce the assistant turn conditioned on the user turn.
+
+        The input/self SEPARATION is enforced here by construction:
+          * The user turn enters ONLY as raw tokens in the input lane
+            (`user_ids`), cross-attended by the loop -- never written into the
+            recurrent state (Layer 1, structural: input_lane output has no path
+            to h_state/l_state, see input_lane.py).
+          * The assistant response (`resp_chunks`) is the prediction target and
+            is NEVER routed into the lane, so the SSL-target leak (§4, the
+            flagged pre-Stage-F bug) cannot occur in this path (Layer 2).
+          * Response thoughts are written to memory tagged SELF; aged prior
+            turns carry their own USER/SELF/SYSTEM tags -- the substrate the
+            anti-sycophancy loss (Layer 3) exploits.
+
+        Objective, per assistant chunk t (masked to valid response chunks only --
+        the latent-space analog of SFT prompt-masking; the user turn is given,
+        never a prediction target):
+          h_{t-1} = loop(prev, memory, lane)         # prev = seed for t=0, else z_{t-1}
+          cos:  pred_head(h_{t-1})  ~  EMA(z_t)        # predict the next thought
+          gen:  Talker(pred_head(h_{t-1})) -> z_t's TRUE tokens   # decode the prediction
+        Teacher-forced: the loop always ingests the TRUE previous chunk z_{t-1}.
+
+        Returns a dict of UNWEIGHTED scalar tensors {cos, gen, var, ponder}; the
+        driver (train_dialogue.py) applies the StageFConfig weights and adds the
+        always-on reconstruction anchor separately.
+        """
+        B, M, L = resp_chunks.shape
+        device = resp_chunks.device
+
+        # Current user turn -> input lane (raw tokens). Prior turns -> role-tagged
+        # aged gestalts in memory (below). The response (resp_chunks) is never in
+        # either -- the Layer-2 leak-free contract.
+        input_lane_kv, input_lane_mask = self.input_lane(user_ids, user_mask, None, None)
+
+        flat = resp_chunks.reshape(B * M, L)
+        # Reuse a shared online-encoder pass when the caller already ran one for
+        # the reconstruction anchor (matches the A-E trainer's single-encode
+        # convention -- avoids a second encoder pass over the same chunks).
+        z = (chunk_vecs if chunk_vecs is not None
+             else self._encode_real_rows(flat, self.chunk_encoder).reshape(B, M, -1))
+        with torch.no_grad():
+            tgt = self._encode_real_rows(flat, ema.encode).reshape(B, M, -1)
+
+        memory = GestaltMemoryBank(self.cfg.memory_capacity, self.cfg.d_latent)
+        self._write_context(memory, context_chunks, context_mask, context_roles, context_personas)
+        # Self-thoughts are the model's own turn -> persona 0 (reserved for SELF)
+        # when personas are in use, else None.
+        self_persona = 0 if context_personas is not None else None
+
+        any_resp = resp_mask.any(dim=1)
+        h, ponder = self._open_response(response_seed, memory, input_lane_kv,
+                                        input_lane_mask, stage, B, active=any_resp)
+        l_state = h
+        prev_thought = h
+        total_ponder = ponder
+        n_loops = 1
+
+        preds, targets = [], []
+        gen_sum = torch.zeros((), device=device)
+        gen_tok = torch.zeros((), device=device)
+        for t in range(M):
+            active = resp_mask[:, t]
+            if not active.any():          # trailing pad columns (chunks are left-packed)
+                continue
+            # Predict assistant chunk t from the PREVIOUS thought (seed for t=0).
+            pred_t = self.pred_head(prev_thought)[active]
+            preds.append(pred_t)
+            targets.append(tgt[:, t][active])
+            # Generative token loss: decode the TRUE tokens of chunk t from the
+            # PREDICTED latent, rescaled onto the encoder-latent shell (below).
+            ref_norm = tgt[:, t][active].norm(dim=-1, keepdim=True)
+            gen_latent = self._rescale_to(pred_t, ref_norm)
+            s, n = self.score_tokens(resp_chunks[:, t][active], gen_latent)
+            gen_sum = gen_sum + s
+            gen_tok = gen_tok + n
+            # Teacher forcing: ingest the TRUE chunk t to form the next thought.
+            h, ponder = self.hrm_loop(
+                z[:, t], memory, input_lane_kv, h_state=h, l_state=l_state,
+                grad_window=stage.inner_loop_grad_window, use_act=stage.use_act,
+                input_lane_mask=input_lane_mask, active_mask=active)
+            l_state = h
+            total_ponder = total_ponder + ponder
+            n_loops += 1
+            # Self-thought written through the same gestalt-readout as context, so
+            # the bank stays homogeneous (§4/Q2). Identity when readout is off.
+            write_vec = self._gestalt(h)
+            memory.write(write_vec.detach() if stage.detach_memory else write_vec, SELF, self_persona)
+            memory.apply_grad_truncation(stage.memory_grad_window)
+            prev_thought = h
+
+        cos = (scaled_cosine_loss(torch.cat(preds, 0), torch.cat(targets, 0),
+                                  k=self.cfg.cosine_loss_k)
+               if preds else torch.zeros((), device=device))
+        gen = gen_sum / gen_tok.clamp_min(1.0)
+        flat_valid = resp_mask.reshape(B * M)
+        var = (variance_regularization(z.reshape(B * M, -1)[flat_valid])
+               if var_weight > 0 else torch.zeros((), device=device))
+        # `var_weight` only GATES whether the (cheap) variance floor is computed;
+        # all four terms are returned RAW and the driver applies StageFConfig
+        # weights uniformly. `ponder` is the mean per-loop ponder cost.
+        ponder = total_ponder / max(n_loops, 1)
+        return {"cos": cos, "gen": gen, "var": var, "ponder": ponder}
+
+    def _premise_gestalt(self, premise_chunks: torch.Tensor, premise_mask: torch.Tensor):
+        """Compress a chunked premise into one gestalt vector (masked mean of the
+        chunk encoder's latents). This is the aged-input-gestalt representation
+        (§4.1) -- written to memory with a role tag so the trust gate can act on
+        it. Carries grad (trains the encoder to summarize premises)."""
+        z = self.encode_chunks(premise_chunks)                 # (B, C, d)
+        valid = premise_mask.float().unsqueeze(-1)             # (B, C, 1)
+        pooled = (z * valid).sum(1) / valid.sum(1).clamp_min(1.0)  # (B, d)
+        return self._gestalt(pooled)                           # homogeneous with other memory writes
+
+    def forward_anti_sycophancy(self, premise_a_chunks: torch.Tensor, premise_a_mask: torch.Tensor,
+                                premise_b_chunks: torch.Tensor, premise_b_mask: torch.Tensor,
+                                answer_chunks: torch.Tensor, answer_mask: torch.Tensor,
+                                ema: EMATargetEncoder, response_seed: torch.Tensor, stage,
+                                agree_weight: float = 1.0, premise_role: int = USER):
+        """
+        The Layer-3 (§4.3) contrastive step, routed through the TRUST-GATED
+        memory reader. `premise_*_a/b` are two user assertions that differ ONLY
+        in stance (asserts X vs. asserts not-X); the answer is the same either
+        way. Each premise is compressed into a role-tagged (USER) gestalt and
+        written to memory; the model opens its response reading ONLY that gestalt
+        (no input lane), so the premise's influence flows entirely through the
+        gated memory read. The opening stance must be invariant to which was
+        asserted -- achievable by driving trust(USER) down (the gate discounts
+        the slot's value) while the key path still lets the loop NOTICE it.
+
+        This is also what trains the USER memory path (the Q2 train/serve gap):
+        A-E only ever writes SELF, so without this step the USER-tagged read is
+        untrained. Returns the scalar loss.
+        """
+        B = premise_a_chunks.shape[0]
+        active = answer_mask.any(dim=1)
+        mem_a = GestaltMemoryBank(self.cfg.memory_capacity, self.cfg.d_latent)
+        mem_b = GestaltMemoryBank(self.cfg.memory_capacity, self.cfg.d_latent)
+        mem_a.write(self._premise_gestalt(premise_a_chunks, premise_a_mask), premise_role)
+        mem_b.write(self._premise_gestalt(premise_b_chunks, premise_b_mask), premise_role)
+        h_a, _ = self._open_response(response_seed, mem_a, None, None, stage, B, active=active)
+        h_b, _ = self._open_response(response_seed, mem_b, None, None, stage, B, active=active)
+        # Restrict the loss to rows with a real answer: a padded/empty-answer row
+        # has tgt0=0 (pad-row zero latent) and would inject a spurious gradient
+        # pulling pred toward the zero vector. (The shipped ContrastiveDataset
+        # drops empty answers, so this is a robustness guard, not a live bug.)
+        if not bool(active.any()):
+            return torch.zeros((), device=answer_chunks.device)
+        pred_a, pred_b = self.pred_head(h_a)[active], self.pred_head(h_b)[active]
+        with torch.no_grad():
+            tgt0 = self._encode_real_rows(answer_chunks[:, 0], ema.encode)[active]  # role-invariant truth
+        return anti_sycophancy_loss(pred_a, pred_b, tgt0,
+                                    k=self.cfg.cosine_loss_k, agree_weight=agree_weight)
 

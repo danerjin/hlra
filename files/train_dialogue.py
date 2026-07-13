@@ -1,0 +1,339 @@
+"""
+train_dialogue.py
+=================
+Stage F (chatbot fine-tuning, §4) driver. STANDALONE on purpose: the A-E
+trainer.Trainer is validated and A-E-shaped (4-tuple document batches, breaks at
+Stage F), and this is a distinct, not-yet-validated fine-tune. It reuses the
+model and the offline data path but does not touch trainer.py, forward_grounded,
+or forward_self_supervised.
+
+What it does, per step (see model.forward_dialogue for the objective and the
+three-layer separation it enforces):
+
+  reconstruction anchor  (forward_grounded on the assistant chunks)   -- keep the
+                          codec from drifting during SFT (always-on anchor, §2.4)
+  + cosine SSL           (forward_dialogue['cos'])  -- predict the assistant's
+                          next thought latent, masked to SELF chunks (latent SFT)
+  + generative NLL        (forward_dialogue['gen'])  -- decode the TRUE assistant
+                          tokens from the PREDICTED latent (end-to-end SFT)
+  + variance floor        (forward_dialogue['var'])
+  + ACT ponder            (forward_dialogue['ponder'])
+  + anti-sycophancy       (forward_anti_sycophancy, every syco_every steps) --
+                          make the USER/SELF role tags behaviorally load-bearing
+
+Everything runs offline (synthetic dialogues + contrastive pairs) so the path is
+exercisable with no downloads and no A-E checkpoint. Point --ckpt at the final
+A-E run's model.pt for a real fine-tune.
+
+    python train_dialogue.py --ckpt runs/scaled/model.pt --preset small
+    python train_dialogue.py --preset smoke --offline --steps 20   # tiny smoke
+
+THIS SCRIPT IS NOT VALIDATED and has never been run on real dialogue data. It is
+the implementation of the Stage-F design, ready for a run -- not a run itself.
+"""
+from __future__ import annotations
+
+import os
+PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.environ.setdefault("HF_HOME", os.path.join(PROJECT, ".hf_cache"))
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+import argparse
+import dataclasses
+
+import torch
+from torch.utils.data import DataLoader
+
+from config import ModelConfig, StageFConfig, model_config, MODEL_PRESETS
+from model import LatentThoughtModel, StageFlags
+from ema_target import EMATargetEncoder
+from dialogue import DialogueAdapter
+from dialogue_data import (DialogueSFTCorpus, ContrastiveCorpus, DialogueSFTDataset,
+                           ContrastiveDataset, collate_sft, collate_contrastive,
+                           DialogueTurnsDataset, MultiTurnDialogueCorpus, collate_dialogue_sft)
+from utils import set_seed
+
+_LEGACY_CFG_FIELDS = {"parcae_min_decay": "decay_min", "parcae_max_decay": "decay_max"}
+
+
+def build_chunker(cfg: ModelConfig, offline: bool):
+    """gpt2 chunker for a real fine-tune; offline stub chunker for a smoke with
+    no downloads. Returns a chunker whose .tokenizer/.chunk_batch the data
+    pipeline uses."""
+    if offline:
+        from data import build_offline_chunker
+        return build_offline_chunker(cfg)
+    from data import build_regex_gpt2_chunker
+    tok_dir = os.path.join(PROJECT, "gpt2_tok")
+    chunker, _ = build_regex_gpt2_chunker(cfg, tok_dir if os.path.isdir(tok_dir) else "gpt2")
+    return chunker
+
+
+def _reconcile_role_tables(model, state):
+    """Loading a checkpoint with FEWER roles than the model (e.g. enabling RAG:
+    3 -> 4 roles adds RETRIEVED) makes role_embed/role_logits mismatch on dim 0,
+    which load_state_dict rejects even with strict=False. Pad those tensors:
+    copy the trained rows, leave the new role at fresh init."""
+    msd = model.state_dict()
+    for k, v in list(state.items()):
+        if k in msd and v.shape != msd[k].shape:
+            mv = msd[k]
+            if v.dim() == mv.dim() and v.shape[1:] == mv.shape[1:] and v.shape[0] < mv.shape[0]:
+                new = mv.clone()
+                new[: v.shape[0]] = v
+                state[k] = new
+            elif v.dim() == mv.dim() and v.shape[1:] == mv.shape[1:] and v.shape[0] > mv.shape[0]:
+                raise ValueError(
+                    f"checkpoint '{k}' has {v.shape[0]} roles but the model has {mv.shape[0]} "
+                    f"-- loading a higher-role checkpoint into a lower-role model is not "
+                    f"supported (drop the extra role or rebuild the model with matching roles).")
+    return state
+
+
+def _apply_feature_flags(cfg, soft_tags, trust_gate, gestalt_readout, vector_gate,
+                         content_tags, rag, persona):
+    """Turn on the opt-in §4.2/§4.3/§Q2/§Q3 mechanisms for the fine-tune (additive
+    to whatever the checkpoint had). content-tags implies soft-tags; rag appends
+    the RETRIEVED role; persona adds the per-speaker embedding."""
+    cfg.soft_role_tags = cfg.soft_role_tags or soft_tags or content_tags
+    cfg.trust_gate = cfg.trust_gate or trust_gate
+    cfg.trust_gate_vector = cfg.trust_gate_vector or vector_gate
+    cfg.soft_role_content = cfg.soft_role_content or content_tags
+    cfg.gestalt_readout = cfg.gestalt_readout or gestalt_readout
+    cfg.persona_tags = cfg.persona_tags or persona
+    if rag and len(cfg.role_tags) < 4:
+        cfg.role_tags = tuple(cfg.role_tags) + ("RETRIEVED",)
+    return cfg
+
+
+def load_base_model(ckpt_path, preset, device, soft_tags=False, trust_gate=False,
+                    gestalt_readout=False, vector_gate=False, content_tags=False,
+                    rag=False, persona=False):
+    """Load an A-E checkpoint's config + weights, or (no ckpt) a fresh model for
+    a smoke. Returns (model, cfg). Uses strict=False so legacy/removed modules
+    (ssl_proj etc.) are tolerated, exactly like generate.load. `soft_tags` /
+    `trust_gate` turn on the §4.2/§4.3 memory mechanisms for the fine-tune: since
+    A-E checkpoints have them off, the new tag/gate params are simply absent from
+    the state_dict and initialize fresh (reported as 'missing')."""
+    if ckpt_path and os.path.exists(ckpt_path):
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        raw = dict(ckpt["model_cfg"])
+        for old, new in _LEGACY_CFG_FIELDS.items():
+            if old in raw and new not in raw:
+                raw[new] = raw.pop(old)
+        known = {f.name for f in dataclasses.fields(ModelConfig)}
+        cfg = ModelConfig(**{k: v for k, v in raw.items() if k in known})
+        cfg = _apply_feature_flags(cfg, soft_tags, trust_gate, gestalt_readout,
+                                   vector_gate, content_tags, rag, persona)
+        model = LatentThoughtModel(cfg, chunker=None)
+        state = _reconcile_role_tables(model, dict(ckpt["model_state"]))
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        base_missing = sorted({k.split(".")[0] for k in missing})
+        if base_missing:
+            print(f"[train_dialogue] WARNING: checkpoint missing modules {base_missing} "
+                  f"(randomly initialized).")
+        print(f"[train_dialogue] loaded base checkpoint {ckpt_path} "
+              f"(stage_reached={ckpt.get('stage_reached')}).")
+        return model, cfg
+    print("[train_dialogue] NO --ckpt given: initializing a FRESH model (smoke only; "
+          "a real Stage-F fine-tune must start from a trained A-E checkpoint).")
+    cfg = model_config(preset)
+    cfg = _apply_feature_flags(cfg, soft_tags, trust_gate, gestalt_readout,
+                               vector_gate, content_tags, rag, persona)
+    return LatentThoughtModel(cfg, chunker=None), cfg
+
+
+def stage_f_flags(cfg: ModelConfig) -> StageFlags:
+    """Stage F: input lanes on, memory un-detached, windows fully warmed, ACT on
+    (curriculum.py's Stage-F flags, reconstructed here since this driver does not
+    use the A-E Curriculum)."""
+    return StageFlags(
+        use_hrm_loop=True, detach_memory=False,
+        inner_loop_grad_window=cfg.inner_loop_grad_window_end,
+        memory_grad_window=cfg.memory_grad_window_end,
+        use_act=True, use_input_lanes=True)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", default=None, help="A-E checkpoint (model.pt) to fine-tune from")
+    ap.add_argument("--preset", default="small", choices=list(MODEL_PRESETS),
+                    help="only used to size a FRESH model when --ckpt is omitted")
+    ap.add_argument("--device", default="auto")
+    ap.add_argument("--offline", action="store_true", help="stub chunker, no downloads (smoke)")
+    ap.add_argument("--soft-tags", action="store_true",
+                    help="enable soft learned role tags (§4.2); off = discrete tags")
+    ap.add_argument("--trust-gate", action="store_true",
+                    help="enable the anti-sycophancy trust gate (§4.3) on the memory reader")
+    ap.add_argument("--vector-gate", action="store_true",
+                    help="make the trust gate per-dimension (discount a polarity subspace)")
+    ap.add_argument("--content-tags", action="store_true",
+                    help="content-condition the soft tags (implies --soft-tags)")
+    ap.add_argument("--gestalt-readout", action="store_true",
+                    help="homogenize memory writes through a shared readout projection (§Q2)")
+    ap.add_argument("--rag", action="store_true",
+                    help="add the RETRIEVED role so sources can be injected (§Q3)")
+    ap.add_argument("--multi-turn", action="store_true",
+                    help="use multi-turn dialogues with role-tagged aged context in memory")
+    ap.add_argument("--persona", action="store_true",
+                    help="personalized tags: per-speaker embedding (needs --multi-turn for data)")
+    ap.add_argument("--steps", type=int, default=None)
+    ap.add_argument("--batch-size", type=int, default=None)
+    ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--n-dialogues", type=int, default=4096)
+    ap.add_argument("--out", default="runs/dialogue")
+    ap.add_argument("--progress", default="auto", choices=["auto", "on", "off"])
+    args = ap.parse_args()
+
+    device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
+    sf = StageFConfig()
+    if args.steps is not None: sf.steps = args.steps
+    if args.batch_size is not None: sf.batch_size = args.batch_size
+    if args.lr is not None: sf.lr = args.lr
+    set_seed(sf.seed)
+
+    model, cfg = load_base_model(args.ckpt, args.preset, device,
+                                 soft_tags=args.soft_tags, trust_gate=args.trust_gate,
+                                 gestalt_readout=args.gestalt_readout, vector_gate=args.vector_gate,
+                                 content_tags=args.content_tags, rag=args.rag, persona=args.persona)
+    model = model.to(device)
+    adapter = DialogueAdapter(cfg.d_latent).to(device)
+    ema = EMATargetEncoder(model.chunk_encoder, momentum=cfg.ema_momentum).to(device)
+    flags = stage_f_flags(cfg)
+
+    chunker = build_chunker(cfg, args.offline)
+    if args.multi_turn:
+        sft_ds = DialogueTurnsDataset(lambda: iter(MultiTurnDialogueCorpus(args.n_dialogues, seed=sf.seed)),
+                                      chunker, cfg)
+        sft_collate = collate_dialogue_sft
+    else:
+        sft_ds = DialogueSFTDataset(lambda: iter(DialogueSFTCorpus(args.n_dialogues, seed=sf.seed)),
+                                    chunker, cfg)
+        sft_collate = collate_sft
+    con_ds = ContrastiveDataset(lambda: iter(ContrastiveCorpus(args.n_dialogues, seed=sf.seed)),
+                                chunker, cfg)
+    sft_loader = DataLoader(sft_ds, batch_size=sf.batch_size, collate_fn=sft_collate)
+    con_loader = DataLoader(con_ds, batch_size=sf.batch_size, collate_fn=collate_contrastive)
+    con_iter = iter(con_loader)
+
+    # One optimizer over the base model AND the adapter's response seed.
+    optimizer = torch.optim.AdamW(list(model.parameters()) + list(adapter.parameters()),
+                                  lr=sf.lr, weight_decay=sf.weight_decay)
+
+    model.train()
+    step, nonfinite_streak = 0, 0
+    out_dir = os.path.join(PROJECT, args.out)
+    print(f"[train_dialogue] device={device} d_latent={cfg.d_latent} steps={sf.steps} "
+          f"batch={sf.batch_size} lr={sf.lr}  (offline={args.offline})")
+
+    try:
+        from tqdm.auto import tqdm
+        bar = tqdm(total=sf.steps, disable=(None if args.progress == "auto" else args.progress == "off"),
+                   desc="stage-F", unit="step")
+    except Exception:
+        bar = None
+
+    while step < sf.steps:
+        for batch in sft_loader:
+            if step >= sf.steps:
+                break
+            batch = [t.to(device) for t in batch]
+            if len(batch) == 8:     # multi-turn: role+persona-tagged aged context in memory
+                (context_chunks, context_mask, context_roles, context_personas,
+                 user_ids, user_mask, resp_chunks, resp_mask) = batch
+            else:                   # single-turn
+                resp_chunks, resp_mask, user_ids, user_mask = batch
+                context_chunks = context_mask = context_roles = context_personas = None
+            optimizer.zero_grad(set_to_none=True)
+
+            # One shared online-encoder pass, reused by the anchor and the
+            # dialogue branch (the A-E trainer's single-encode convention).
+            chunk_vecs = model.encode_chunks(resp_chunks)
+            # Reconstruction anchor (encoder + Talker codec) on the assistant chunks.
+            nll = model.forward_grounded(resp_chunks, resp_mask, chunk_vecs=chunk_vecs)
+            dlg = model.forward_dialogue(resp_chunks, resp_mask, user_ids, user_mask,
+                                         ema, adapter.response_seed, flags,
+                                         context_chunks=context_chunks, context_mask=context_mask,
+                                         context_roles=context_roles, context_personas=context_personas,
+                                         var_weight=sf.var_weight, chunk_vecs=chunk_vecs)
+            loss = (sf.grounded_weight * nll
+                    + sf.cos_weight * dlg["cos"]
+                    + sf.gen_weight * dlg["gen"]
+                    + sf.var_weight * dlg["var"]
+                    + sf.ponder_weight * dlg["ponder"])
+
+            syco_val = None
+            if sf.syco_every and (step % sf.syco_every == 0):
+                try:
+                    cb = next(con_iter)
+                except StopIteration:
+                    con_iter = iter(con_loader); cb = next(con_iter)
+                pa, pam, pb, pbm, ac, am = (t.to(device) for t in cb)
+                syco = model.forward_anti_sycophancy(pa, pam, pb, pbm, ac, am, ema,
+                                                     adapter.response_seed, flags,
+                                                     agree_weight=sf.syco_agree_weight)
+                loss = loss + sf.syco_weight * syco
+                syco_val = float(syco)
+
+            loss.backward()
+            total_norm = torch.nn.utils.clip_grad_norm_(
+                list(model.parameters()) + list(adapter.parameters()), sf.grad_clip)
+            # Same non-finite guard as trainer.py: a single NaN grad makes the
+            # global clip coefficient NaN and one step would destroy all weights.
+            if bool(torch.isfinite(total_norm)):
+                optimizer.step()
+                nonfinite_streak = 0
+            else:
+                nonfinite_streak += 1
+                print(f"[train_dialogue] WARNING: non-finite grad norm at step {step+1}; "
+                      f"skipping ({nonfinite_streak} consecutive).", flush=True)
+                if nonfinite_streak >= 25:
+                    raise RuntimeError("25 consecutive non-finite gradient steps -- run is dead.")
+            ema.update(model.chunk_encoder)
+            step += 1
+            if bar is not None:
+                bar.update(1)
+
+            if sf.log_every and step % sf.log_every == 0:
+                msg = (f"[step {step}] nll={float(nll):.4f} cos={float(dlg['cos']):.4f} "
+                       f"gen={float(dlg['gen']):.4f} var={float(dlg['var']):.4f} "
+                       f"ponder={float(dlg['ponder']):.4f}"
+                       + (f" syco={syco_val:.4f}" if syco_val is not None else ""))
+                # Watch trust(USER) fall relative to trust(SELF) as anti-sycophancy trains.
+                trust = model.hrm_loop.memory_reader.trust_by_role(len(cfg.role_tags), device)
+                if trust is not None:
+                    msg += " trust=" + "/".join(f"{r}:{float(t):.2f}"
+                                                for r, t in zip(cfg.role_tags, trust))
+                (bar.write(msg) if bar is not None else print(msg, flush=True))
+            if sf.checkpoint_every and step % sf.checkpoint_every == 0:
+                save(out_dir, "checkpoint.pt", model, adapter, ema, optimizer, cfg, step)
+
+    if bar is not None:
+        bar.close()
+    save(out_dir, "model.pt", model, adapter, ema, optimizer, cfg, step)
+    print(f"[train_dialogue] done. {step} steps -> {os.path.join(out_dir, 'model.pt')}")
+
+
+def save(out_dir, name, model, adapter, ema, optimizer, cfg, step):
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, name)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        torch.save({
+            "model_state": model.state_dict(),
+            "adapter_state": adapter.state_dict(),   # Stage-F params (response seed)
+            "ema": ema.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "model_cfg": dataclasses.asdict(cfg),
+            "vocab_size": cfg.vocab_size,
+            "stage_reached": "F",
+            "step": step,
+            "tokenizer_name": "gpt2", "chunker": "regex_gpt2",
+        }, f)
+        f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, path)
+    print(f"[train_dialogue] checkpoint -> {path} (step {step})", flush=True)
+
+
+if __name__ == "__main__":
+    main()

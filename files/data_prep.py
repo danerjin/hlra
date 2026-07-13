@@ -49,7 +49,7 @@ import torch
 from config import model_config, MODEL_PRESETS, DataConfig
 from data import (
     MANIFEST, build_offline_chunker, chunk_text_example,
-    iter_hf_single, iter_hf_mixture, SyntheticTextCorpus,
+    iter_hf_single, iter_hf_mixture, iter_local_parquet, SyntheticTextCorpus,
 )
 
 TOKENIZER_DIR = os.path.join(PROJECT, "gpt2_tok")
@@ -133,6 +133,10 @@ def main():
                          "REQUIRED for multi-config datasets. The mixture carries its own per-source names.")
     ap.add_argument("--streaming", action="store_true",
                     help="stream the single dataset instead of a full download (the mixture always streams)")
+    ap.add_argument("--local-glob", default=None,
+                    help="prep from LOCAL parquet file(s) (path/glob) instead of streaming from the Hub -- "
+                         "the escape hatch when HF's Xet streaming CDN 403s (see STRIX_HALO.md). Download "
+                         "shards first with `HF_HUB_DISABLE_XET=1 huggingface-cli download ... --local-dir`.")
     ap.add_argument("--text-field", default="text")
     ap.add_argument("--out", default=None, help="cache dir (default DataConfig.cache_dir)")
     ap.add_argument("--docs", type=int, default=None, help="cap #documents (single-dataset path)")
@@ -168,7 +172,10 @@ def main():
         chunker, vocab_size = build_sat_chunker(model_cfg, data_cfg)
         model_cfg.vocab_size = vocab_size
         chunker_name = f"SaT({data_cfg.sat_model_name})"
-        if args.mixture:
+        if args.local_glob:
+            text_iter = iter_local_parquet(args.local_glob, args.text_field, max_docs=args.docs)
+            src = f"local-parquet[{args.local_glob}]"
+        elif args.mixture:
             text_iter = iter_hf_mixture(data_cfg)   # streams config.DataConfig.sources by weight
             src = "mixture[" + ", ".join(
                 s.hf_id + (f":{s.name}" if s.name else "") + f"@{s.weight}"

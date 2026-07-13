@@ -141,6 +141,20 @@ python data_prep.py --dataset HuggingFaceFW/fineweb-edu --name sample-10BT --str
 
 `--preset` here **must match** training. Note the final `wrote <EXAMPLES> examples` count.
 
+> **Xet-CDN 403 on streaming?** Some Hub datasets (e.g. fineweb-edu) serve parquet
+> through HF's **Xet** storage, and `datasets` *streaming* range-reads can `403
+> Forbidden` from `cas-bridge.xethub.hf.co` even with a valid token (streaming
+> ignores `HF_HUB_DISABLE_XET`). Escape hatch — download shards via the classic
+> (non-Xet) path and prep from local parquet:
+> ```bash
+> HF_HUB_DISABLE_XET=1 huggingface-cli download HuggingFaceFW/fineweb-edu \
+>   --repo-type dataset --include "sample/10BT/*.parquet" --local-dir fineweb_local
+> python data_prep.py --local-glob "fineweb_local/**/*.parquet" --preset small-w3 \
+>   --max-tokens 1200000000 --out chunk_cache
+> ```
+> Grab a subset first (e.g. `--include "sample/10BT/00[0-2]_*.parquet"`) — a few
+> shards is plenty for a 1.2B-token cache; `--max-tokens` stops prep early.
+
 > **Wide-thought (`-w3`) run:** swap `--preset small` → `--preset small-w3` here **and** in every
 > training command below, and add `--var-weight 3.0` at launch (§5). The retuned `cosine_loss_k` rides
 > along in the preset automatically; `--var-weight` does not, so it must be passed. `small` and

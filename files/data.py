@@ -190,6 +190,36 @@ def iter_hf_single(hf_id: str, text_field: str = "text", name: Optional[str] = N
             yield text
 
 
+def iter_local_parquet(files, text_field: str = "text",
+                       max_docs: Optional[int] = None) -> Iterator[str]:
+    """
+    Yield document strings from LOCAL parquet file(s) -- the no-network escape
+    hatch when HF's Xet streaming CDN 403s on a dataset (e.g. fineweb-edu).
+    `files` is a path, a recursive glob, or a list of paths. Download the shards
+    first with the CLASSIC (non-Xet) path, which does honor HF_HUB_DISABLE_XET:
+        HF_HUB_DISABLE_XET=1 huggingface-cli download HuggingFaceFW/fineweb-edu \\
+            --repo-type dataset --include "sample/10BT/*.parquet" --local-dir DIR
+    then prep with `data_prep.py --local-glob "DIR/**/*.parquet"`. Reads with the
+    'parquet' builder in streaming mode so it never loads a whole shard into RAM
+    and hits no network.
+    """
+    import glob as _glob
+    from datasets import load_dataset
+
+    if isinstance(files, str):
+        files = sorted(_glob.glob(os.path.expanduser(files), recursive=True))
+    if not files:
+        raise SystemExit("iter_local_parquet: no parquet files matched -- download shards first "
+                         "(see the docstring / STRIX_HALO.md).")
+    ds = load_dataset("parquet", data_files=files, split="train", streaming=True)
+    for i, ex in enumerate(ds):
+        if max_docs is not None and i >= max_docs:
+            return
+        text = ex.get(text_field)
+        if text:
+            yield text
+
+
 class SyntheticTextCorpus:
     """
     Offline stand-in for real prose: emits documents of several sentences of

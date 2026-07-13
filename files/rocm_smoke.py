@@ -41,6 +41,7 @@ from config import model_config
 from model import LatentThoughtModel, StageFlags, SELF
 from gestalt_memory import GestaltMemoryBank
 from ema_target import EMATargetEncoder
+from rocm_compat import maybe_apply_rocm_workarounds
 
 
 def finite(t) -> bool:
@@ -75,6 +76,7 @@ def main():
     ap.add_argument("--vocab", type=int, default=50258, help="gpt2(+1); only the size matters here")
     ap.add_argument("--amp-dtype", default="bf16", choices=["bf16", "fp16"])
     args = ap.parse_args()
+    maybe_apply_rocm_workarounds()   # opt-in gfx1151 kernel workarounds (LATENT_MANUAL_LAYERNORM=1)
 
     dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     device = pick_device()

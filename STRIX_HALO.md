@@ -17,28 +17,66 @@ GPU. The 128 GB is the lever — it lets you run a large batch to amortize that
 overhead. Measure it before committing.
 
 ## 1. Environment (fresh Linux venv — NOT the Mac torch-2.2.2 venv)
+
+> This section is the **verified** gfx1151 bring-up (mapped 2026-07 on a Radeon
+> 8060S). The important correction to earlier guidance: **the stock
+> `download.pytorch.org/whl/rocm*` wheels do NOT contain gfx1151 kernels** (their
+> `get_arch_list()` has gfx1100/1101/1102 and gfx1200/1201 but no gfx1151), and
+> masquerading via `HSA_OVERRIDE_GFX_VERSION` fails with `invalid device
+> function` / `no kernel image`. You need an **AMD gfx1151-native wheel**, and it
+> runs with **no override at all**.
+
+**a. GPU access (needs the box admin if you lack sudo).** ROCm device nodes are
+gated to the `render`/`video` groups. If `groups` shows neither, `torch.cuda`
+enumerates zero devices (`hipErrorNoDevice`). Have an admin run
+`sudo usermod -aG render,video $USER`, then **fully log out and back in**.
+
+**b. Install torch from AMD's gfx1151 index** (native gfx1151; `--no-cache-dir`
+is REQUIRED — pip's HTTP cache uses msgpack, which crashes with
+`ValueError: Memoryview is too large` on the >4 GB torch wheel):
 ```bash
 python3.10 -m venv .venv-rocm && source .venv-rocm/bin/activate
-# Install a torch ROCm wheel matching your ROCm install (6.4+/7.0 for gfx1151):
-pip install --index-url https://download.pytorch.org/whl/rocm6.x torch
-# Train-time deps (not needed for the two smoke/bench scripts below):
-pip install transformers datasets            # tokenizer + corpus for data_prep
+pip install --pre --no-cache-dir torch --index-url https://rocm.nightlies.amd.com/v2/gfx1151/
+pip install --no-cache-dir transformers datasets wtpsplit tqdm matplotlib "numpy<2"
 ```
-gfx1151 is newer than ROCm's historically-blessed targets; if torch doesn't see
-the GPU, the usual fix is an ISA override:
+(If AMD's index is flaky or its `rocm_sdk` preloads a missing `hipsparselt`, the
+fallback is **scottt's self-contained gfx1151 wheels** — <https://github.com/scottt/rocm-TheRock/releases>
+— but those are cp311/cp312, so make a Python 3.11 venv via `uv` first:
+`uv python install 3.11 && uv venv --python 3.11 .venv-gfx1151`.)
+
+**c. Verify it sees the GPU and can compute** (no override needed):
 ```bash
-export HSA_OVERRIDE_GFX_VERSION=11.5.1       # or 11.0.0, per your ROCm build
-export HIP_VISIBLE_DEVICES=0
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0)); \
+print(torch.cuda.get_arch_list()); x=torch.randn(2048,2048,device='cuda'); print(float((x@x).sum()))"
 ```
-Unified memory: on Linux the amdgpu **GTT** pool lets the GPU allocate most of
-the 128 GB; confirm your GTT size is large (kernel `amdgpu.gttsize`, or recent
-defaults). This is what makes large batches possible.
+Want `True`, `Radeon 8060S Graphics`, `gfx1151` in the arch list, and a finite
+matmul. **Do NOT set `HSA_OVERRIDE_GFX_VERSION`** with a native wheel — it forces
+an ISA mismatch and breaks kernel launches.
+
+**Harmless noise you can ignore:** `/opt/amdgpu/share/libdrm/amdgpu.ids: No such
+file or directory` (just the PCI→name table; cosmetic) and `Mem/Flash Efficient
+attention … experimental` (SDPA warnings; the run works).
+
+**Broken LayerNorm-backward kernel (as of the 2026-04 `rocm7.13` alpha wheel):**
+`rocm_smoke.py` check `[3]` fails with `grads finite: False` — the fused
+`native_layer_norm_backward` writes NONDETERMINISTIC NaN/Inf into LayerNorm
+weight/bias grads (a different LN param each run; both bf16 and fp32; kernel
+serialization doesn't help). Workaround: **`export LATENT_MANUAL_LAYERNORM=1`** —
+the entry points then route LayerNorm through a manual primitive-op implementation
+(the model's own `hard_normalize` proves manual norms work on this GPU). Off by
+default; drop it once AMD ships a wheel with a fixed kernel.
+
+**Memory:** the GPU allocates from the amdgpu **GTT** pool, which is *not* the full
+128 GB — `rocm_smoke.py` printed **~68 GB total/free** on this box. Size batches
+against the number it prints (`torch.cuda.mem_get_info()`), not 128.
 
 ## 2. Step 1 — does it run? (`rocm_smoke.py`)
 ```bash
-cd files && python rocm_smoke.py --preset small     # add HSA_OVERRIDE if needed
+cd files && LATENT_MANUAL_LAYERNORM=1 python rocm_smoke.py --preset small   # no HSA_OVERRIDE with a native wheel
 ```
-Runs on synthetic tensors (no data). Verifies torch sees the GPU, a bf16 matmul
+(`LATENT_MANUAL_LAYERNORM=1` is the §1 LayerNorm-kernel workaround; drop it if a
+future wheel passes check `[3]` without it.) Runs on synthetic tensors (no data).
+Verifies torch sees the GPU, a bf16 matmul
 is finite, and one real `forward_grounded` + `forward_self_supervised` + ACT
 step — **losses AND gradients** — stays finite under bf16 autocast, i.e. the ops
 most likely to NaN under mixed precision (hard_normalize division, decay-gate

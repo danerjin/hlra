@@ -52,6 +52,7 @@ from dialogue_data import (DialogueSFTCorpus, ContrastiveCorpus, DialogueSFTData
                            ContrastiveDataset, collate_sft, collate_contrastive,
                            DialogueTurnsDataset, MultiTurnDialogueCorpus, collate_dialogue_sft)
 from utils import set_seed
+from rocm_compat import maybe_apply_rocm_workarounds
 
 _LEGACY_CFG_FIELDS = {"parcae_min_decay": "decay_min", "parcae_max_decay": "decay_max"}
 
@@ -197,6 +198,7 @@ def main():
     ap.add_argument("--out", default="runs/dialogue")
     ap.add_argument("--progress", default="auto", choices=["auto", "on", "off"])
     args = ap.parse_args()
+    maybe_apply_rocm_workarounds()   # opt-in gfx1151 kernel workarounds (LATENT_MANUAL_LAYERNORM=1)
 
     device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
     sf = StageFConfig()

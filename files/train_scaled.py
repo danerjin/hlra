@@ -29,6 +29,7 @@ from curriculum import Curriculum
 from data import CachedChunkDataset, collate_chunked
 from trainer import Trainer
 from utils import set_seed
+from rocm_compat import maybe_apply_rocm_workarounds
 
 # Default per-stage optimizer-step budgets (A,B,C,D,E,F). Tune per compute.
 DEFAULT_STAGE_STEPS = (2000, 2000, 2000, 2000, 4000, 0)
@@ -83,6 +84,7 @@ def main():
                          "redirected to a file), on (force), off (never).")
     ap.add_argument("--max-steps", type=int, default=None)
     args = ap.parse_args()
+    maybe_apply_rocm_workarounds()   # opt-in gfx1151 kernel workarounds (LATENT_MANUAL_LAYERNORM=1)
 
     device = pick_device(args.device)
     stage_steps = (tuple(int(x) for x in args.stage_steps.split(","))

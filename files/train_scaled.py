@@ -67,6 +67,10 @@ def main():
     ap.add_argument("--ssl-weight", type=float, default=None,
                     help="override ssl_loss_weight (default 1.0, co-equal with reconstruction; "
                          "the on-loop SSL that trains the HRM loop to predict forward)")
+    ap.add_argument("--var-weight", type=float, default=None,
+                    help="override ssl_var_weight (default 2.0, the VICReg-style per-dim variance "
+                         "floor that resists latent collapse). At wider d_latent the latent starts "
+                         "closer to the floor -- recommended ~3.0 for the -w3 presets (small-w3).")
     ap.add_argument("--out", default="runs/scaled")
     ap.add_argument("--resume", default=None,
                     help="resume from a specific checkpoint path. If omitted and "
@@ -120,6 +124,7 @@ def main():
         stage_steps=stage_steps,
         per_stage_lr=(args.lr_schedule == "per-stage"),
         ssl_loss_weight=(args.ssl_weight if args.ssl_weight is not None else TrainConfig.ssl_loss_weight),
+        ssl_var_weight=(args.var_weight if args.var_weight is not None else TrainConfig.ssl_var_weight),
     )
     set_seed(train_cfg.seed)
 

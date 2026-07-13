@@ -322,10 +322,20 @@ MODEL_PRESETS = {
     # `small` by trading token width (512->320) for thought width to hold the same
     # ~150M budget -- the matched-param A/B against `small`. head_dim stays 64
     # (5 heads; d_latent 960 / 5 = 192 per head in the loop). d_ff=1280 is the
-    # token-level FFN; the encoder/loop FFN is latent_d_ff = 3*1280 = 3840. Same
-    # per-scale re-tuning caveat as the others -- and the anti-collapse machinery
-    # (cosine_loss_k, variance floor) now lives in the 960-d thought space.
-    "small-w3": dict(d_model=320, n_heads=5, d_ff=1280, latent_mult=3,
+    # token-level FFN; the encoder/loop FFN is latent_d_ff = 3*1280 = 3840.
+    #
+    # Anti-collapse re-tuned for the 960-d thought space (the terms were set at
+    # <=512-d). cosine_loss_k 4.0 -> 5.5: the scaled-cosine gradient falls as
+    # 1/sqrt(d) (measured: 0.73x weaker at 960 vs 512 == sqrt(512/960)), so k must
+    # rise ~sqrt(960/512)=1.37x to keep the predictive learning signal at the same
+    # magnitude. The variance-floor WEIGHT (train_cfg.ssl_var_weight) is a
+    # per-dim-mean hinge and so width-invariant in effect, but the natural per-dim
+    # latent std drops 0.461 -> 0.304 at init (still 3x over the 0.1 floor, but
+    # ~34% less margin), so the recommended run uses ssl_var_weight 2.0 -> 3.0 as a
+    # firmer (still-dormant-when-healthy) backstop -- pass `--var-weight 3.0` to
+    # train_scaled.py. Both remain STARTING points: watch latent_std through the
+    # Stage-B predictor boundary (the real collapse signal, §2.4) and adjust.
+    "small-w3": dict(d_model=320, n_heads=5, d_ff=1280, latent_mult=3, cosine_loss_k=5.5,
                      chunk_encoder_layers=4, talker_layers=4, input_lane_layers=3,
                      max_chunk_len=64, max_chunks_per_doc=32, recent_token_window=256,
                      memory_capacity=128),
@@ -338,7 +348,10 @@ MODEL_PRESETS = {
     # head_dim=64 (loop attends at 1344/7 = 192); it is a multiple of 64 but not
     # 128, and n_heads=7 is odd -- the price of matching the budget with a x3
     # (odd) multiple (see the powers-of-2 note in the ladder comment above).
-    "base-w3": dict(d_model=448, n_heads=7, d_ff=1792, latent_mult=3,
+    # cosine_loss_k 4.0 -> 6.5 = round(4*sqrt(1344/512)); same 1/sqrt(d) cosine-
+    # gradient law as small-w3 (see there for the derivation). --var-weight ~3.0
+    # advised (natural per-dim std ~0.27 at init, ~2.7x over the 0.1 floor).
+    "base-w3": dict(d_model=448, n_heads=7, d_ff=1792, latent_mult=3, cosine_loss_k=6.5,
                     chunk_encoder_layers=6, talker_layers=6, input_lane_layers=4,
                     max_chunk_len=64, max_chunks_per_doc=32, recent_token_window=512,
                     memory_capacity=256),
@@ -350,7 +363,9 @@ MODEL_PRESETS = {
     # rebalanced to hold large's ~560M budget (~595M). d_model=576 = 9*64 keeps
     # head_dim=64 (loop attends at 1728/9 = 192); multiple of 64 (not 128),
     # n_heads=9 odd -- same budget-vs-alignment tradeoff as base-w3.
-    "large-w3": dict(d_model=576, n_heads=9, d_ff=2304, latent_mult=3,
+    # cosine_loss_k 4.0 -> 7.5 = round(4*sqrt(1728/512)); same law as small-w3.
+    # --var-weight ~3.0 advised (natural per-dim std ~0.25, ~2.5x over the floor).
+    "large-w3": dict(d_model=576, n_heads=9, d_ff=2304, latent_mult=3, cosine_loss_k=7.5,
                      chunk_encoder_layers=8, talker_layers=8, input_lane_layers=6,
                      max_chunk_len=64, max_chunks_per_doc=48, recent_token_window=768,
                      memory_capacity=384),
@@ -364,7 +379,9 @@ MODEL_PRESETS = {
     # an EVEN head count (10), and d_latent=1920 is 128-aligned too -- so xl-w3
     # keeps head_dim=64 (loop attends at 1920/10 = 192) without the odd-head
     # compromise base-w3/large-w3 make to hit their budgets.
-    "xl-w3": dict(d_model=640, n_heads=10, d_ff=2560, latent_mult=3,
+    # cosine_loss_k 4.0 -> 8.0 = round(4*sqrt(1920/512)); same law as small-w3.
+    # --var-weight ~3.0 advised (natural per-dim std ~0.26, ~2.6x over the floor).
+    "xl-w3": dict(d_model=640, n_heads=10, d_ff=2560, latent_mult=3, cosine_loss_k=8.0,
                   chunk_encoder_layers=12, talker_layers=12, input_lane_layers=8,
                   max_chunk_len=64, max_chunks_per_doc=64, recent_token_window=1024,
                   memory_capacity=512),

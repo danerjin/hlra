@@ -177,6 +177,19 @@ def main():
                     help="use multi-turn dialogues with role-tagged aged context in memory")
     ap.add_argument("--persona", action="store_true",
                     help="personalized tags: per-speaker embedding (needs --multi-turn for data)")
+    # --- real dialogue data (else offline synthetic corpora) ---
+    ap.add_argument("--hf-chat", default=None,
+                    help="HF chat dataset id (messages format) for real multi-turn SFT")
+    ap.add_argument("--hf-transcript", default=None,
+                    help="HF dataset id whose --text-field holds a 'SPEAKER: ...' transcript")
+    ap.add_argument("--hf-name", default=None, help="HF dataset config/subset name")
+    ap.add_argument("--split", default="train")
+    ap.add_argument("--text-field", default="text", help="transcript text column (--hf-transcript)")
+    ap.add_argument("--target-speaker", default=None,
+                    help="which speaker is cast as SELF/persona-0 (--hf-transcript, required)")
+    ap.add_argument("--system-speakers", default=None,
+                    help="comma list of speakers mapped to SYSTEM (--hf-transcript)")
+    ap.add_argument("--max-docs", type=int, default=None, help="cap streamed HF documents")
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--lr", type=float, default=None)
@@ -202,7 +215,25 @@ def main():
     flags = stage_f_flags(cfg)
 
     chunker = build_chunker(cfg, args.offline)
-    if args.multi_turn:
+    if args.hf_chat or args.hf_transcript:
+        # Real dialogue data: stream turn-lists from the HF loader (dialogue_data),
+        # one multi-turn SFT example per SELF turn. Always the multi-turn 8-tuple.
+        from dialogue_data import iter_hf_chat_turns, iter_hf_transcript_turns
+        if args.hf_chat:
+            turns_factory = (lambda: iter_hf_chat_turns(
+                args.hf_chat, split=args.split, name=args.hf_name, max_docs=args.max_docs))
+            print(f"[train_dialogue] real chat data: {args.hf_chat}")
+        else:
+            if not args.target_speaker:
+                raise SystemExit("--hf-transcript requires --target-speaker (who is SELF)")
+            sys_spk = tuple(s for s in (args.system_speakers or "").split(",") if s)
+            turns_factory = (lambda: iter_hf_transcript_turns(
+                args.hf_transcript, args.text_field, args.target_speaker,
+                system_speakers=sys_spk, split=args.split, name=args.hf_name, max_docs=args.max_docs))
+            print(f"[train_dialogue] real transcript data: {args.hf_transcript} (SELF={args.target_speaker})")
+        sft_ds = DialogueTurnsDataset(turns_factory, chunker, cfg)
+        sft_collate = collate_dialogue_sft
+    elif args.multi_turn:
         sft_ds = DialogueTurnsDataset(lambda: iter(MultiTurnDialogueCorpus(args.n_dialogues, seed=sf.seed)),
                                       chunker, cfg)
         sft_collate = collate_dialogue_sft

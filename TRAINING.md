@@ -1,8 +1,8 @@
 # TRAINING.md — How to run the big training run
 
-A copy-paste guide for the **A→E scaled run** (`train_scaled.py`) — the only path meant for a real
-run. Stage F (dialogue fine-tuning) is intentionally skipped. Do the steps in order; don't skip the
-pre-flight checks.
+A copy-paste guide for the **A→E scaled run** (`train_scaled.py`) — the pretraining path. Do the steps
+in order; don't skip the pre-flight checks. **Stage F (chatbot fine-tuning) is a separate, optional,
+still-unvalidated phase that runs off the finished A→E checkpoint — see §10.**
 
 ---
 
@@ -258,7 +258,7 @@ prints `resumed from ... at step NNNN` with no warning.
 
 ## 8. When it finishes
 
-It stops after Stage E ("final stage F" just means "finished E"; F is not trained).
+It stops after Stage E ("final stage F" just means "finished E"; F is trained separately — §10).
 
 ```bash
 python plot_metrics.py runs/scaled                                   # runs/scaled/loss_curves.png
@@ -289,3 +289,86 @@ trends down with no rise at the Stage-B band, and `latent_std` holds/rises.
 
 **In doubt:** a run is healthy as long as **`val_loss` trends down with no jump when Stage B turns the
 predictor on**, and `lstd` holds its Stage-A band. Watch `val_loss` above all; keep checkpoints.
+
+---
+
+## 10. Stage F — chatbot fine-tuning (optional, **UNVALIDATED**)
+
+A **separate** phase off the finished A→E `runs/scaled/model.pt`, run by its own driver
+(`train_dialogue.py`, **not** `train_scaled.py`, which stops at E). The full design + mechanism map is
+in [`STAGE_F.md`](STAGE_F.md). Everything here is **additive and opt-in** — with no `--`feature flags
+the model is byte-identical to A→E — and **smoke-only: never trained on real dialogue data.** Treat
+this as "the path is wired and reviewed," not "this produces a good chatbot."
+
+It trains four losses on assistant (SELF) turns only: the **reconstruction anchor** (keeps the codec
+from drifting), the **cosine** predictor (predict the assistant's next thought — latent-space SFT), a
+**generative token NLL** (decode the *true* assistant tokens from the *predicted* latent — the piece
+A→E never trains), and an **anti-sycophancy** contrastive term. Weights live in `config.StageFConfig`.
+
+### 10.1 Sanity (offline, no downloads, ~1 min)
+
+```bash
+cd "$PROJECT/files"
+python train_dialogue.py --offline --preset smoke --multi-turn --persona \
+  --steps 20 --batch-size 2 --out runs/dialogue_sanity
+rm -rf "$PROJECT/runs/dialogue_sanity"
+```
+
+Confirms the path runs and the loss components aren't `nan`. (With no `--ckpt` it inits a **fresh**
+model — fine for a smoke; a real fine-tune **must** pass `--ckpt`.)
+
+### 10.2 Real fine-tune off the A→E checkpoint
+
+**Chat dataset** (a `messages`-format instruct/chat set):
+
+```bash
+python train_dialogue.py --ckpt runs/scaled/model.pt --hf-chat <HF_DATASET_ID> --hf-name <subset> \
+  --multi-turn --soft-tags --content-tags --trust-gate --persona --gestalt-readout \
+  --batch-size 8 --steps <N> --out runs/dialogue
+```
+
+**Transcript dataset** (debate / courtroom / socratic — long cross-turn deps + adversarial assertions;
+you choose **who is SELF**: the reasoner vs. an advocate — that decides what capability you train):
+
+```bash
+python train_dialogue.py --ckpt runs/scaled/model.pt --hf-transcript <HF_DATASET_ID> \
+  --text-field text --target-speaker "SOCRATES" --system-speakers "NARRATOR,MODERATOR" \
+  --multi-turn --soft-tags --trust-gate --persona --gestalt-readout \
+  --batch-size 8 --steps <N> --out runs/dialogue
+```
+
+Add `--rag` for latent RAG (adds the `RETRIEVED` role; a 3-role A→E checkpoint is auto-padded to 4).
+
+| Flag | Effect |
+|---|---|
+| `--multi-turn` | prior turns → role+persona-tagged aged gestalts in memory (cross-turn context). Implied by `--hf-chat`/`--hf-transcript`. |
+| `--soft-tags` | soft learned role tags (shared codebook + learned temperature) |
+| `--content-tags` | content-condition the soft tags (the *dynamic* per-turn shift; implies `--soft-tags`) |
+| `--trust-gate` / `--vector-gate` | anti-sycophancy trust gate; scalar / per-dimension (vector discounts a polarity subspace, keeps topic) |
+| `--persona` | per-speaker embedding (distinguishes >3 speakers) |
+| `--gestalt-readout` | homogenize self-thoughts + external content into one memory space |
+| `--rag` | add the `RETRIEVED` role for source injection |
+
+### 10.3 Watch
+
+```
+[step 500] nll=6.9 cos=3.8 gen=7.1 var=0.0 ponder=0.5 syco=6.2 trust=USER:0.71/SELF:0.95/SYSTEM:0.93
+```
+
+`nll` = reconstruction anchor (should hold, not rise); `cos`/`gen` = the SFT signals (should fall —
+`gen` is the response-quality proxy); `syco` = anti-sycophancy; `trust=…` = the learned per-role trust
+(watch **trust(USER) fall relative to SELF** as anti-sycophancy trains). Then chat with it:
+
+```bash
+python chat.py runs/dialogue/model.pt          # or: python web_chat.py runs/dialogue/model.pt
+```
+
+### 10.4 Honest caveats
+
+- **UNVALIDATED** — no real dialogue run has happened; treat outputs as a plumbing check.
+- **Anti-sycophancy uses *synthetic* contrastive pairs** by default (real minimal pairs are hard to
+  source). Swap your own in via `dialogue_data.ContrastiveDataset` for a real Layer-3 signal.
+- **RAG is mechanism-only** — the loop's read of `RETRIEVED` slots and the decode-time Talker grounding
+  are untrained until you fine-tune on retrieval-augmented dialogue.
+- The `--var-weight`/collapse watch-items from the A→E run still apply; the reconstruction anchor
+  (`nll`) is your Stage-F collapse signal.

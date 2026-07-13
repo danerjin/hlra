@@ -81,7 +81,7 @@ def main():
 
     def run_step():
         opt.zero_grad(set_to_none=True)
-        memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
+        memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_latent)
         # The L-gate runs inside the on-loop SSL (the loop is here now, not in
         # reconstruction). data = (ct, cm, ri, rm).
         ssl, ponder = model.forward_self_supervised(*data, memory, SELF, flags, ema,

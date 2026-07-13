@@ -33,7 +33,7 @@ loop to reason forward. See the design doc §2.3.
 
 | File | Contents |
 |---|---|
-| `config.py` | `ModelConfig` / `TrainConfig` / `DataConfig`, size presets (`smoke`/`small`/`base`/`large`/`xl`). |
+| `config.py` | `ModelConfig` / `TrainConfig` / `DataConfig`, size presets (`smoke`/`small`/`base`/`large`/`xl`, plus the wide-thought `*-w3` variants). |
 | `chunker.py` | `SegmentAnyTextChunker` ("SaT Capped": sentence boundaries + punctuation-aware length capping). |
 | `ema_target.py` | `ChunkEncoder` (shared latent producer) + `EMATargetEncoder` (momentum copy; encoder-space target). |
 | `decay_gate.py` | `DiagonalDecayGate` — the per-channel `exp(-softplus·dt)` carry path (Parcae's diagonal case). |
@@ -104,6 +104,18 @@ python train_scaled.py --preset small --cache chunk_cache --device cuda --amp \
 
 Size presets (`config.MODEL_PRESETS`): `smoke` (~43M) → `small` (512-d, ~152M) → `base`/`large`/`xl`.
 `data_prep.py` and `train_scaled.py` must use the **same** preset.
+
+**Token width vs. thought width.** A token is one word; a **thought** is a whole chunk of many
+tokens. So the thought/chunk-latent width can be a multiple of the token width — `d_latent =
+latent_mult · d_model` — with the chunk encoder, gestalt memory, HRM loop, `pred_head`, and EMA target
+at `d_latent`, and only the token-level pieces (token embeddings, the Talker's token stream, the input
+lane's raw tokens) at `d_model`. `latent_mult = 1` (all five baseline presets) is `d_latent == d_model`
+and an **exact no-op** — byte-identical to the pre-`latent_mult` code. The `*-w3` presets
+(`small-w3`/`base-w3`/`large-w3`/`xl-w3`) are `latent_mult = 3`, each rebalanced to its baseline tier's
+parameter budget by trading token width for thought width — a matched-param A/B for "a chunk latent
+needs more capacity than a token." Widening the thought moves the anti-collapse machinery into the
+wider space, so `cosine_loss_k` / the variance floor should be re-tuned at `d_latent`. See the design
+doc §1.1.
 
 ## Status and honest limits
 

@@ -33,21 +33,31 @@ class ChunkEncoder(nn.Module):
     encoder for the self-supervised loss."""
 
     def __init__(self, vocab_size: int, d_model: int, n_heads: int, d_ff: int,
-                 dropout: float, max_len: int, n_layers: int = 2):
+                 dropout: float, max_len: int, n_layers: int = 2,
+                 d_latent: int | None = None):
         super().__init__()
+        # Tokens are looked up at the word-level width d_model, then lifted into
+        # the (possibly wider) thought width d_latent BEFORE the transformer body,
+        # so the pooled chunk latent genuinely uses the full d_latent capacity --
+        # projecting only after a d_model mean-pool would confine the latent to a
+        # d_model subspace and defeat the point (the chunk-decode bottleneck).
+        # d_latent == d_model makes in_proj an Identity and every width below
+        # equal to d_model, i.e. the original single-width encoder exactly.
+        d_latent = d_model if d_latent is None else d_latent
         self.token_embed = nn.Embedding(vocab_size, d_model)
-        self.pos_embed = nn.Embedding(max_len, d_model)
+        self.in_proj = nn.Identity() if d_latent == d_model else nn.Linear(d_model, d_latent)
+        self.pos_embed = nn.Embedding(max_len, d_latent)
         layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
+            d_model=d_latent, nhead=n_heads, dim_feedforward=d_ff,
             dropout=dropout, batch_first=True, norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
-        self.out_norm = nn.LayerNorm(d_model)
+        self.out_norm = nn.LayerNorm(d_latent)
 
     def forward(self, chunk_ids: torch.Tensor, chunk_mask: torch.Tensor) -> torch.Tensor:
         batch, chunk_len = chunk_ids.shape
         positions = torch.arange(chunk_len, device=chunk_ids.device).unsqueeze(0)
-        x = self.token_embed(chunk_ids) + self.pos_embed(positions)
+        x = self.in_proj(self.token_embed(chunk_ids)) + self.pos_embed(positions)
 
         # Guard all-pad rows: an entirely-masked key_padding_mask row makes the
         # attention softmax divide by zero -> NaN. Such rows occur for padded

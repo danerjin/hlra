@@ -78,7 +78,7 @@ def page_ppl(model, ds, cfg, device) -> tuple[float, float]:
                 continue
             chunk_ids = ct[:, t, :]
             latent = model.chunk_encoder(chunk_ids, chunk_ids != 0)
-            empty_mem = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
+            empty_mem = GestaltMemoryBank(cfg.memory_capacity, cfg.d_latent)
             logits = model.talker(chunk_ids, latent, empty_mem)
             k = int((chunk_ids != 0).sum())
             if k == 0:

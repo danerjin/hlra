@@ -109,7 +109,7 @@ def main():
     def run_step(batch_data):
         ct, cm, ri, rm = batch_data
         opt.zero_grad(set_to_none=True)
-        memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
+        memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_latent)
         with autocast:
             # Full step, mirroring trainer._loss_on exactly: ONE shared online
             # encoder pass reused by both branches (omitting chunk_vecs= here

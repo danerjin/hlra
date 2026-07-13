@@ -28,12 +28,24 @@ from gestalt_memory import GestaltCrossAttentionReader, GestaltMemoryBank
 
 
 class TalkerDecoderLayer(nn.Module):
-    """One causal self-attention + cross-attention (to the thought) + FFN block."""
+    """One causal self-attention + cross-attention (to the thought) + FFN block.
 
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float):
+    The token stream (self-attention, FFN) runs at the token width d_model; the
+    thought it cross-attends is a chunk-level object at d_latent, so the cross-
+    attention bridges the two widths (kdim/vdim=d_latent) when they differ. This
+    is what lets a small word-level Talker read a wide chunk-level thought,
+    querying different d_model-projections of it at each token."""
+
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float,
+                 d_latent: int | None = None):
         super().__init__()
+        d_latent = d_model if d_latent is None else d_latent
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        if d_latent == d_model:
+            self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        else:
+            self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True,
+                                                    kdim=d_latent, vdim=d_latent)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_ff), nn.GELU(), nn.Dropout(dropout), nn.Linear(d_ff, d_model)
         )
@@ -62,8 +74,15 @@ class Talker(nn.Module):
     """
 
     def __init__(self, vocab_size: int, d_model: int, n_heads: int, d_ff: int,
-                 dropout: float, n_layers: int, n_roles: int, max_chunk_len: int):
+                 dropout: float, n_layers: int, n_roles: int, max_chunk_len: int,
+                 d_latent: int | None = None):
         super().__init__()
+        # The Talker is a word-level readout: its token embeddings, positions,
+        # start vector, self-attention, FFN, and LM head are all at the token
+        # width d_model. Only the thought it decodes from (and the memory readout
+        # keyed by it) live at the wider thought width d_latent. d_latent defaults
+        # to d_model (no widening), giving the original single-width Talker.
+        d_latent = d_model if d_latent is None else d_latent
         self.token_embed = nn.Embedding(vocab_size, d_model)
         self.pos_embed = nn.Embedding(max_chunk_len, d_model)
         # Learned start-of-chunk vector. The decoder input is shifted right by
@@ -74,16 +93,18 @@ class Talker(nn.Module):
         # alone, which is what forces the latent to actually carry content.
         self.start_embed = nn.Parameter(torch.zeros(d_model))
         self.layers = nn.ModuleList(
-            [TalkerDecoderLayer(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)]
+            [TalkerDecoderLayer(d_model, n_heads, d_ff, dropout, d_latent=d_latent)
+             for _ in range(n_layers)]
         )
-        self.memory_reader = GestaltCrossAttentionReader(d_model, n_heads, n_roles, dropout)
+        # Keyed by the (d_latent) thought; reads d_latent thoughts out of memory.
+        self.memory_reader = GestaltCrossAttentionReader(d_latent, n_heads, n_roles, dropout)
         self.out_norm = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
     def forward(
         self,
         target_tokens: torch.Tensor,   # (batch, chunk_len) ground-truth chunk tokens; shifted right *internally*
-        thought: torch.Tensor,         # (batch, d_model) finished latent thought
+        thought: torch.Tensor,         # (batch, d_latent) finished latent thought (chunk-level width)
         memory: GestaltMemoryBank,
     ) -> torch.Tensor:
         """Returns logits: (batch, chunk_len, vocab_size)."""

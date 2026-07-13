@@ -142,7 +142,7 @@ def train_stages_a_to_e(model, ema, curriculum: Curriculum, model_cfg, train_cfg
             # On-loop SSL (§2.1/§27): the HRM loop predicts the next latent,
             # SEQUENTIALLY, reading its accumulating gestalt memory. Trains the
             # loop + encoder + memory to reason forward; carries the ACT ponder.
-            memory = GestaltMemoryBank(model_cfg.memory_capacity, model_cfg.d_model)
+            memory = GestaltMemoryBank(model_cfg.memory_capacity, model_cfg.d_latent)
             ssl, ponder = model.forward_self_supervised(
                 chunk_tensor, chunk_mask, raw_ids, raw_mask, memory, SELF, stage_flags, ema,
                 cos_weight=train_cfg.ssl_loss_weight, var_weight=train_cfg.ssl_var_weight,
@@ -208,7 +208,7 @@ def train_stage_f(model, ema, curriculum: Curriculum, model_cfg, train_cfg, opti
     for step, dialogue in enumerate(dialogues):
         # One memory bank persists for the whole dialogue (§4.2: "the gestalt
         # memory doesn't reset per turn").
-        memory = GestaltMemoryBank(model_cfg.memory_capacity, model_cfg.d_model)
+        memory = GestaltMemoryBank(model_cfg.memory_capacity, model_cfg.d_latent)
         stage_flags = curriculum.stage_flags()
         loss_plan = curriculum.loss_plan()
 

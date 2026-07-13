@@ -130,7 +130,7 @@ def main():
     # cross-attention under autocast -- exactly the ops that can NaN in mixed precision.
     model.zero_grad(set_to_none=True)
     ema = EMATargetEncoder(model.chunk_encoder, momentum=cfg.ema_momentum).to(device)
-    memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
+    memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_latent)
     with torch.autocast(device_type="cuda", dtype=dtype):
         ssl, ponder = model.forward_self_supervised(ct, cm, ri, rm, memory, SELF, flags, ema,
                                                     cos_weight=1.0, var_weight=2.0,
@@ -152,7 +152,7 @@ def main():
     model.zero_grad(set_to_none=True)
     flags_e = StageFlags(use_hrm_loop=True, detach_memory=False, inner_loop_grad_window=5,
                          memory_grad_window=5, use_act=True, use_input_lanes=False)
-    memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
+    memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_latent)
     with torch.autocast(device_type="cuda", dtype=dtype):
         ssl_e, ponder_e = model.forward_self_supervised(ct, cm, ri, rm, memory, SELF, flags_e, ema,
                                                         cos_weight=1.0, var_weight=2.0,

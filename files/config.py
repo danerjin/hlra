@@ -20,7 +20,27 @@ class ModelConfig:
     # offset by +1 so the model's `id != 0` pad convention stays valid even for
     # tokenizers (e.g. gpt2) whose id 0 is a real token -- see data.ReservePadTokenizer.
     vocab_size: int = 32001        # gpt2 (50257) or your tokenizer + 1; small default for the dry run
-    d_model: int = 128             # shared width for tokens, thoughts, and memory slots
+    # d_model is the TOKEN width -- the word-level embedding dimension. Tokens
+    # are looked up at this width, and the token-level modules that read/emit
+    # individual tokens (the Talker's token stream, the input lane's raw-token
+    # stream) work here. It is deliberately narrow: a token carries one word's
+    # worth of meaning.
+    d_model: int = 128             # token (word-level) embedding width
+    # A THOUGHT is a whole chunk (a clause/sentence of many tokens), so it needs
+    # more capacity than a single token -- otherwise the Talker, decoding a
+    # d_model latent back into many tokens, loses information. So the thought /
+    # chunk-latent width is a multiple of the token width:
+    #     d_latent = latent_mult * d_model
+    # and EVERYTHING that carries a thought lives at d_latent: the chunk encoder's
+    # pooled output, the gestalt memory, pred_head, the EMA target, and the whole
+    # HRM loop. The encoder runs its transformer body at d_latent (not just a
+    # projection after pooling) so the pooled thought genuinely uses the width.
+    # This departs from JEPA-Reasoner's token==thought "Latent Dim" on purpose:
+    # their analyzed latents were ~token-sized, ours are multi-token chunks.
+    # latent_mult=1 (d_latent == d_model) is an exact no-op -- every widening
+    # projection is Identity and every cross-width attention is built plain -- so
+    # validated d_latent==d_model runs are byte-identical.
+    latent_mult: int = 1           # d_latent = latent_mult * d_model (thought/chunk-latent width)
     n_heads: int = 4
     d_ff: int = 512
     dropout: float = 0.1
@@ -82,6 +102,39 @@ class ModelConfig:
     # separate linear SSL head or detached gen MLP -- those were the §2.4
     # collapse-era shortcut, removed after the notes §25.1 A/B showed the on-loop
     # loss is more collapse-robust and needs no isolation head.
+
+    @property
+    def d_latent(self) -> int:
+        """The thought / chunk-latent width: a multiple of the token width
+        d_model. Everything that carries a thought lives here -- the chunk
+        encoder's pooled output and transformer body, the gestalt memory,
+        pred_head, the EMA target, and the whole HRM loop. Token-level modules
+        (Talker token stream, input-lane raw tokens) stay at d_model and
+        cross-attend into this space. latent_mult=1 -> d_latent == d_model."""
+        return self.latent_mult * self.d_model
+
+    @property
+    def latent_d_ff(self) -> int:
+        """FFN width for the modules that operate at d_latent -- the chunk
+        encoder body and the HRM loop's decay-gate sublayers. Scaled by the same
+        factor as the width: latent_d_ff = latent_mult * d_ff. Since every preset
+        sets d_ff = 4 * d_model, this is 4 * d_latent (the FFN:width ratio HRM-
+        Text/JEPA-Reasoner use), and it is exactly d_ff -- an unconditional no-op
+        -- at latent_mult=1 whatever d_ff:d_model ratio a config chose. d_ff
+        itself stays the token-level FFN width (Talker, input lane)."""
+        return self.latent_mult * self.d_ff
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.latent_mult, int) or self.latent_mult < 1:
+            raise ValueError(f"latent_mult must be an int >= 1, got {self.latent_mult!r}")
+        # The encoder body, the loop, and their memory cross-attention all run at
+        # embed_dim=d_latent, so n_heads must divide d_latent. Since d_latent =
+        # latent_mult * d_model and n_heads already divides d_model, this holds --
+        # but a hand-set preset could violate it, so check rather than fail
+        # cryptically inside MultiheadAttention.
+        if self.d_latent % self.n_heads != 0:
+            raise ValueError(
+                f"d_latent ({self.d_latent}) must be divisible by n_heads ({self.n_heads})")
 
 
 @dataclass
@@ -202,12 +255,51 @@ class DataConfig:
 # minority of the budget as d_model grows (see the emb% column). Head dim is
 # held at 64 (n_heads = d_model / 64) for every rung above smoke.
 #
-#   preset   d_model   layers (ce/talk/in)   ~total params   ~emb share
-#   smoke      192           2 / 2 / 2            43M            90%
-#   small      512           4 / 4 / 3           153M            67%
-#   base       768           6 / 6 / 4           307M            50%
-#   large     1024           8 / 8 / 6           560M            37%
-#   xl        1280          12 / 12 / 8          1.03B           25%
+# d_latent is the thought/chunk-latent width (= latent_mult * d_model); the five
+# baseline rungs are latent_mult=1 (d_latent == d_model, token==thought). The
+# `*-w3` rungs are the WIDE-THOUGHT ladder: latent_mult=3, each sized to its
+# baseline tier's budget by trading token width for thought width -- the matched-
+# param A/B for "a chunk latent needs more capacity than a token".
+#
+#   preset     d_model  d_latent  n_heads  layers (ce/talk/in)  ~total params  ~emb share
+#   smoke        192      192        6          2 / 2 / 2            43M           90%
+#   small        512      512        8          4 / 4 / 3           152M          68%
+#   small-w3     320      960        5          4 / 4 / 3           156M          41%
+#   base         768      768       12          6 / 6 / 4           305M          51%
+#   base-w3      448     1344        7          6 / 6 / 4           324M          28%
+#   large       1024     1024       16          8 / 8 / 6           560M          37%
+#   large-w3     576     1728        9          8 / 8 / 6           595M          19%
+#   xl          1280     1280       20         12 / 12 / 8          1.03B         25%
+#   xl-w3        640     1920       10         12 / 12 / 8          940M          14%
+#
+# (Note the emb share collapses at a fixed budget -- small 68% -> small-w3 41% --
+# because widening the thought spends the freed embedding params on the encoder/
+# loop/pred_head, which is the whole point.)
+#
+# On powers of 2: with an ODD multiple (x3) you cannot make BOTH d_model and
+# d_latent powers of two, and you don't need to -- the real GPU constraint is
+# divisibility by the head dim (held at 64) and, ideally, 128-alignment. The
+# small/base/large -w3 d_models (320/448/576) are budget-matched multiples of 64
+# with odd head counts (5/7/9), NOT multiples of 128 -- the price of matching the
+# tier budget with a x3 multiple. xl-w3 (640) is the exception: the xl budget
+# happens to land on a clean 128-aligned, even-head config. If you prefer
+# 128-alignment + even heads over an exact budget match on the smaller rungs, snap
+# d_model up/down to a multiple of 128 (e.g. base-w3 384 -> ~249M or 512 -> ~408M
+# straddling base's 305M) and accept the size drift. In all cases d_latent = 3*
+# d_model stays a multiple of 64 (960/1344/1728/1920), so attention is always valid.
+#
+# All presets ship latent_mult=1 (d_latent == d_model) so the validated runs are
+# unchanged. To make thoughts wider than tokens -- so a chunk latent decodes back
+# into many tokens without an information bottleneck -- pass e.g.
+# model_config("small", latent_mult=3): the chunk encoder, gestalt memory,
+# pred_head, EMA target, and the HRM loop all run at 3*d_model, while token
+# embeddings and the Talker's token stream stay word-level at d_model. The
+# encoder/loop FFN auto-scales with the thought width (cfg.latent_d_ff =
+# latent_mult * d_ff = 4*d_latent for the shipped 4x presets); d_ff itself remains
+# the d_model-proportioned FFN of the token-level modules (Talker, input lane).
+# NOTE: widening the thought moves the anti-collapse machinery (EMA target,
+# cosine SSL, per-dim variance floor) into the wider space -- re-tune
+# cosine_loss_k and the variance weight at the new width.
 #
 # The non-size hyperparameters (decay-gate min/max, ema_momentum, cosine_loss_k,
 # act_ponder_cost, the grad-truncation windows, loss weights) were tuned on the
@@ -224,18 +316,58 @@ MODEL_PRESETS = {
     "small": dict(d_model=512, n_heads=8, d_ff=2048, chunk_encoder_layers=4,
                   talker_layers=4, input_lane_layers=3, max_chunk_len=64,
                   max_chunks_per_doc=32, recent_token_window=256, memory_capacity=128),
+    # wide-thought variant of `small` (latent_mult=3): tokens stay word-level at
+    # d_model=320 but a THOUGHT is 3x wider (d_latent=960), so a chunk latent can
+    # decode into many tokens without an information bottleneck. Rebalanced from
+    # `small` by trading token width (512->320) for thought width to hold the same
+    # ~150M budget -- the matched-param A/B against `small`. head_dim stays 64
+    # (5 heads; d_latent 960 / 5 = 192 per head in the loop). d_ff=1280 is the
+    # token-level FFN; the encoder/loop FFN is latent_d_ff = 3*1280 = 3840. Same
+    # per-scale re-tuning caveat as the others -- and the anti-collapse machinery
+    # (cosine_loss_k, variance floor) now lives in the 960-d thought space.
+    "small-w3": dict(d_model=320, n_heads=5, d_ff=1280, latent_mult=3,
+                     chunk_encoder_layers=4, talker_layers=4, input_lane_layers=3,
+                     max_chunk_len=64, max_chunks_per_doc=32, recent_token_window=256,
+                     memory_capacity=128),
     # mid-range -- ~307M params
     "base": dict(d_model=768, n_heads=12, d_ff=3072, chunk_encoder_layers=6,
                  talker_layers=6, input_lane_layers=4, max_chunk_len=64,
                  max_chunks_per_doc=32, recent_token_window=512, memory_capacity=256),
+    # wide-thought `base` (latent_mult=3): tokens 448, thoughts d_latent=1344,
+    # rebalanced to hold base's ~305M budget (~324M). d_model=448 = 7*64 keeps
+    # head_dim=64 (loop attends at 1344/7 = 192); it is a multiple of 64 but not
+    # 128, and n_heads=7 is odd -- the price of matching the budget with a x3
+    # (odd) multiple (see the powers-of-2 note in the ladder comment above).
+    "base-w3": dict(d_model=448, n_heads=7, d_ff=1792, latent_mult=3,
+                    chunk_encoder_layers=6, talker_layers=6, input_lane_layers=4,
+                    max_chunk_len=64, max_chunks_per_doc=32, recent_token_window=512,
+                    memory_capacity=256),
     # ~0.5B -- first rung where transformer compute outweighs the embeddings
     "large": dict(d_model=1024, n_heads=16, d_ff=4096, chunk_encoder_layers=8,
                   talker_layers=8, input_lane_layers=6, max_chunk_len=64,
                   max_chunks_per_doc=48, recent_token_window=768, memory_capacity=384),
+    # wide-thought `large` (latent_mult=3): tokens 576, thoughts d_latent=1728,
+    # rebalanced to hold large's ~560M budget (~595M). d_model=576 = 9*64 keeps
+    # head_dim=64 (loop attends at 1728/9 = 192); multiple of 64 (not 128),
+    # n_heads=9 odd -- same budget-vs-alignment tradeoff as base-w3.
+    "large-w3": dict(d_model=576, n_heads=9, d_ff=2304, latent_mult=3,
+                     chunk_encoder_layers=8, talker_layers=8, input_lane_layers=6,
+                     max_chunk_len=64, max_chunks_per_doc=48, recent_token_window=768,
+                     memory_capacity=384),
     # ~1B -- the large-scale target (untrained; needs the scaled data + GPU path)
     "xl": dict(d_model=1280, n_heads=20, d_ff=5120, chunk_encoder_layers=12,
                talker_layers=12, input_lane_layers=8, max_chunk_len=64,
                max_chunks_per_doc=64, recent_token_window=1024, memory_capacity=512),
+    # wide-thought `xl` (latent_mult=3): tokens 640, thoughts d_latent=1920, ~940M
+    # (~9% under xl's ~1B; the tier is loose). Unlike the smaller w3 rungs, the
+    # budget here lands on a CLEAN config: d_model=640 = 5*128 is 128-aligned with
+    # an EVEN head count (10), and d_latent=1920 is 128-aligned too -- so xl-w3
+    # keeps head_dim=64 (loop attends at 1920/10 = 192) without the odd-head
+    # compromise base-w3/large-w3 make to hit their budgets.
+    "xl-w3": dict(d_model=640, n_heads=10, d_ff=2560, latent_mult=3,
+                  chunk_encoder_layers=12, talker_layers=12, input_lane_layers=8,
+                  max_chunk_len=64, max_chunks_per_doc=64, recent_token_window=1024,
+                  memory_capacity=512),
 }
 
 

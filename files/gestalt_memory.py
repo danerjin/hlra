@@ -102,6 +102,10 @@ class GestaltCrossAttentionReader(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int, n_roles: int, dropout: float = 0.1):
         super().__init__()
+        # `d_model` here is the width of a stored thought -- d_latent in the
+        # widened design (the memory holds chunk-level thoughts, not tokens). The
+        # loop and the Talker both query at that same width, so this is a plain
+        # single-width cross-attention.
         self.role_embed = nn.Embedding(n_roles, d_model)
         self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.norm_q = nn.LayerNorm(d_model)

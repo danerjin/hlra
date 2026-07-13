@@ -103,7 +103,7 @@ def read_prompt(model, chunker, cfg, prompt):
         print(f"[generate] NOTE: input filled all {cfg.max_chunks_per_doc} chunk slots "
               f"(~{cfg.max_chunks_per_doc * cfg.max_chunk_len} tokens); any text beyond "
               f"that was silently dropped (chunker keeps the head).")
-    memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
+    memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_latent)
     h_state = l_state = last_latent = None
     for t in range(ct.shape[1]):
         if not bool(cm[0, t]):
@@ -116,7 +116,7 @@ def read_prompt(model, chunker, cfg, prompt):
         memory.write(h_state.detach(), SELF)
         last_latent = latent
     if last_latent is None:                          # empty/too-short prompt
-        last_latent = torch.zeros(1, cfg.d_model)
+        last_latent = torch.zeros(1, cfg.d_latent)
     return memory, h_state, l_state, last_latent
 
 
@@ -129,7 +129,7 @@ def talker_decode(model, latent, cfg, temperature=0.9, greedy=False):
     end-of-chunk stop; banned at position 0 to rule out degenerate empty chunks.
     """
     max_len = cfg.max_chunk_len
-    empty_mem = GestaltMemoryBank(cfg.memory_capacity, cfg.d_model)
+    empty_mem = GestaltMemoryBank(cfg.memory_capacity, cfg.d_latent)
     ids = []
     for _ in range(max_len):
         inp = torch.zeros(1, max_len, dtype=torch.long)

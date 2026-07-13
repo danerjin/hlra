@@ -69,6 +69,38 @@ The components:
   attended by the loop and Talker but never written into the recurrent state (the §4 self/input
   boundary). Used only in Stage F.
 
+### 1.1 Two widths: a thought is wider than a token
+
+Tokens and thoughts do **not** share a width. A token carries one word; a thought is a whole chunk —
+a clause or sentence of many tokens — that the Talker must decode back into all of them. Forcing a
+thought through the token width would bottleneck that decode, so the thought/chunk-latent width is a
+multiple of the token width:
+
+```
+d_latent = latent_mult · d_model          # thought width = multiple · token width
+```
+
+Everything that *carries a thought* lives at **`d_latent`**: the chunk encoder's transformer body and
+its pooled output `z_t`, the gestalt memory, the whole HRM loop, `pred_head`, and the EMA target.
+Everything that *handles individual tokens* stays at the word-level **`d_model`**: the token embedding
+tables, the Talker's token stream (self-attention, FFN, LM head), and the input lane's raw tokens —
+these cross-attend *into* the thought space rather than living in it. The encoder runs its body at
+`d_latent` (not merely a projection after a `d_model` mean-pool, which would confine the latent to a
+`d_model` subspace and forfeit the capacity). The FFN of the `d_latent` modules scales with the width
+(`latent_d_ff = latent_mult · d_ff`).
+
+This is a **deliberate departure from JEPA-Reasoner**, whose token embeddings and segment latents
+share one "Latent Dim" (its analyzed latents are near-token-sized, empirically linear combinations of
+vocabulary embeddings). Our thoughts are genuinely multi-token chunks, for which that identity does
+not hold — so we decouple the two. (This is a *different* axis from JEPA-Reasoner's "Attention Dim >
+Latent Dim", which widens the reasoner's **internal** width while the latent flowing between
+components stays narrow; here it is the flowing latent itself that widens.) `latent_mult = 1` recovers
+token == thought exactly — the validated baseline and an exact no-op — and is what the five baseline
+presets ship; the `small-w3` / `base-w3` / `large-w3` / `xl-w3` rungs are `latent_mult = 3`, each
+rebalanced to its baseline tier's parameter budget by trading token width for thought width. Widening the thought
+moves the anti-collapse machinery (§2.4) into the wider space, so `cosine_loss_k` and the variance
+floor are re-tuned at `d_latent`.
+
 ---
 
 ## 2. The two losses, split by role

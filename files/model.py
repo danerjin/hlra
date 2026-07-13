@@ -97,13 +97,26 @@ class LatentThoughtModel(nn.Module):
         # Talker consume, instead of training a disconnected encoder; it also
         # gives the Reasoner an order-aware chunk vector rather than a
         # bag-of-words mean-pool.
+        # A thought is a chunk-level object, so the shared encoder runs its
+        # transformer body at the wider thought width cfg.d_latent (embedding
+        # lookup stays at the token width d_model) and its FFN scales with that
+        # width (cfg.latent_d_ff). Its pooled output -- the chunk latent that
+        # feeds the loop, the JEPA SSL loss, and (via the Talker) reconstruction
+        # -- is d_latent. At latent_mult=1 (d_latent == d_model) this is the
+        # original single-width encoder.
         self.chunk_encoder = ChunkEncoder(
-            vocab_size=cfg.vocab_size, d_model=cfg.d_model, n_heads=cfg.n_heads,
-            d_ff=cfg.d_ff, dropout=cfg.dropout, max_len=cfg.max_chunk_len,
-            n_layers=cfg.chunk_encoder_layers,
+            vocab_size=cfg.vocab_size, d_model=cfg.d_model, d_latent=cfg.d_latent,
+            n_heads=cfg.n_heads, d_ff=cfg.latent_d_ff, dropout=cfg.dropout,
+            max_len=cfg.max_chunk_len, n_layers=cfg.chunk_encoder_layers,
         )
+        # The loop works natively at the thought width cfg.d_latent -- it reads a
+        # d_latent chunk latent and emits a d_latent thought (what memory,
+        # pred_head, and the Talker consume). Its FFN scales with that width
+        # (cfg.latent_d_ff). The only other width it touches is the token-width
+        # input lane (d_input=cfg.d_model), which it cross-attends.
         self.hrm_loop = HRMInnerLoop(
-            d_model=cfg.d_model, d_ff=cfg.d_ff, n_heads=cfg.n_heads, dropout=cfg.dropout,
+            d_latent=cfg.d_latent, d_input=cfg.d_model, d_ff=cfg.latent_d_ff,
+            n_heads=cfg.n_heads, dropout=cfg.dropout,
             l_steps_per_h_update=cfg.l_steps_per_h_update,
             h_updates_per_thought=cfg.h_updates_per_thought,
             n_roles=len(cfg.role_tags), min_decay=cfg.decay_min,
@@ -111,17 +124,21 @@ class LatentThoughtModel(nn.Module):
         )
 
         # --- Input lane (§4.1, §4.2) -----------------------------------
+        # Token-level encoder at d_model; aged gestalts (d_latent thoughts) are
+        # projected down to d_model inside it.
         self.input_lane = InputLaneEncoder(
-            vocab_size=cfg.vocab_size, d_model=cfg.d_model, n_heads=cfg.n_heads,
-            d_ff=cfg.d_ff, dropout=cfg.dropout, n_layers=cfg.input_lane_layers,
-            max_len=cfg.recent_token_window,
+            vocab_size=cfg.vocab_size, d_model=cfg.d_model, d_latent=cfg.d_latent,
+            n_heads=cfg.n_heads, d_ff=cfg.d_ff, dropout=cfg.dropout,
+            n_layers=cfg.input_lane_layers, max_len=cfg.recent_token_window,
         )
 
         # --- Talker (§1.3) -----------------------------------------------
+        # Word-level readout at d_model; cross-attends the d_latent thought.
         self.talker = Talker(
-            vocab_size=cfg.vocab_size, d_model=cfg.d_model, n_heads=cfg.n_heads,
-            d_ff=cfg.d_ff, dropout=cfg.dropout, n_layers=cfg.talker_layers,
-            n_roles=len(cfg.role_tags), max_chunk_len=cfg.max_chunk_len,
+            vocab_size=cfg.vocab_size, d_model=cfg.d_model, d_latent=cfg.d_latent,
+            n_heads=cfg.n_heads, d_ff=cfg.d_ff, dropout=cfg.dropout,
+            n_layers=cfg.talker_layers, n_roles=len(cfg.role_tags),
+            max_chunk_len=cfg.max_chunk_len,
         )
 
         # --- Self-supervised JEPA branch (§2.1) — the HRM loop IS the predictor.
@@ -138,7 +155,9 @@ class LatentThoughtModel(nn.Module):
         # collapse-robust and the projection head is not load-bearing. Collapse is
         # held by the always-on reconstruction anchor + the variance floor + the
         # slow EMA target, not by an isolation head.
-        self.pred_head = nn.Linear(cfg.d_model, cfg.d_model)
+        # Maps a finished thought to the next chunk's EMA-target latent -- both
+        # are chunk-level, so this is d_latent -> d_latent.
+        self.pred_head = nn.Linear(cfg.d_latent, cfg.d_latent)
 
     # ------------------------------------------------------------------
     def _encode_real_rows(self, flat_ids: torch.Tensor, encode_fn) -> torch.Tensor:
@@ -201,7 +220,7 @@ class LatentThoughtModel(nn.Module):
         ids = flat_ids[flat_valid]                                   # (n_real, L)
         z = chunk_vecs.reshape(batch * n_chunks, -1)[flat_valid]      # (n_real, d)
         # Codec Talker: conditions purely on the chunk's own latent (empty memory).
-        empty_mem = GestaltMemoryBank(self.cfg.memory_capacity, self.cfg.d_model)
+        empty_mem = GestaltMemoryBank(self.cfg.memory_capacity, self.cfg.d_latent)
         logits = self.talker(ids, z, empty_mem)
         tok_mask = ids != 0
         # End-of-chunk (EOS/PAD) supervision on the first pad position of each
@@ -327,7 +346,7 @@ class LatentThoughtModel(nn.Module):
         pred = self.pred_head(h)
         tgt_norm = latent.norm(dim=-1, keepdim=True)
         tgt_norm = torch.where(tgt_norm > 1e-3, tgt_norm,
-                               torch.full_like(tgt_norm, self.cfg.d_model ** 0.5))
+                               torch.full_like(tgt_norm, self.cfg.d_latent ** 0.5))
         pred = pred / pred.norm(dim=-1, keepdim=True).clamp_min(1e-6) * tgt_norm
         return pred, h
 

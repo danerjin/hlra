@@ -149,7 +149,7 @@ class Trainer:
             # On-loop SSL (§2.1/§27): the HRM loop predicts the next latent,
             # SEQUENTIALLY, reading its accumulating gestalt memory. Trains the
             # loop + encoder + memory to reason forward; carries the ACT ponder.
-            memory = GestaltMemoryBank(self.model_cfg.memory_capacity, self.model_cfg.d_model)
+            memory = GestaltMemoryBank(self.model_cfg.memory_capacity, self.model_cfg.d_latent)
             ssl, ponder = self.model.forward_self_supervised(
                 ct, cm, ri, rm, memory, SELF, flags, self.ema,
                 cos_weight=self.train_cfg.ssl_loss_weight, var_weight=self.train_cfg.ssl_var_weight,

@@ -40,10 +40,18 @@ class InputLaneEncoder(nn.Module):
     """
 
     def __init__(self, vocab_size: int, d_model: int, n_heads: int, d_ff: int,
-                 dropout: float, n_layers: int, max_len: int):
+                 dropout: float, n_layers: int, max_len: int,
+                 d_latent: int | None = None):
         super().__init__()
+        # The input lane is a token-level (word-level) encoder: it runs at
+        # d_model. Aged gestalts, however, are chunk-level thoughts at d_latent,
+        # so they are projected down to d_model before entering the lane
+        # (aged_proj is Identity when d_latent == d_model). Raw tokens are native
+        # d_model.
+        d_latent = d_model if d_latent is None else d_latent
         self.token_embed = nn.Embedding(vocab_size, d_model)
         self.pos_embed = nn.Embedding(max_len, d_model)
+        self.aged_proj = nn.Identity() if d_latent == d_model else nn.Linear(d_latent, d_model)
         # A "type" embedding distinguishing raw-token slots from aged-gestalt
         # slots, since they arrive from different modalities (token id vs.
         # already-pooled vector) even though both end up at width d_model.
@@ -59,7 +67,7 @@ class InputLaneEncoder(nn.Module):
         self,
         raw_token_ids: torch.Tensor,          # (batch, n_raw) recent raw tokens
         raw_mask: torch.Tensor,               # (batch, n_raw) bool, True = real token
-        aged_gestalts: torch.Tensor | None,    # (batch, n_aged, d_model) or None
+        aged_gestalts: torch.Tensor | None,    # (batch, n_aged, d_latent) or None
         aged_mask: torch.Tensor | None,        # (batch, n_aged) bool or None
     ):
         """
@@ -85,7 +93,7 @@ class InputLaneEncoder(nn.Module):
             aged_type = self.type_embed(
                 torch.ones(batch, n_aged, dtype=torch.long, device=device)
             )
-            aged_embeds = aged_gestalts + aged_type
+            aged_embeds = self.aged_proj(aged_gestalts) + aged_type   # d_latent -> d_model
             combined = torch.cat([raw_embeds, aged_embeds], dim=1)
             combined_mask = torch.cat([raw_mask, aged_mask], dim=1)
         else:

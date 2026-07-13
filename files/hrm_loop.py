@@ -137,36 +137,57 @@ class HRMInnerLoop(nn.Module):
     and (optionally) ACT adaptive depth.
     """
 
-    def __init__(self, d_model: int, d_ff: int, n_heads: int, dropout: float,
+    def __init__(self, d_latent: int, d_ff: int, n_heads: int, dropout: float,
                  l_steps_per_h_update: int, h_updates_per_thought: int,
                  n_roles: int, min_decay: float, max_decay: float,
-                 act_max_ponder_steps: int):
+                 act_max_ponder_steps: int, d_input: int | None = None):
         super().__init__()
-        self.d_model = d_model
+        # The loop works entirely at the thought width d_latent: a thought is a
+        # chunk-level object, so the chunk encoder already hands it in at d_latent
+        # and it emits a d_latent thought that the gestalt memory, pred_head, and
+        # Talker (via cross-attention) consume. The ONLY other width the loop
+        # touches is the input lane (§4.2), which lives at the token width d_input
+        # -- the loop queries it at d_latent, so that one reader bridges the two.
+        # d_input defaults to d_latent (single-width, e.g. latent_mult=1), which
+        # builds every attention plainly and is byte-identical to the pre-widening
+        # module.
+        self.d_latent = d_latent
+        d_input = d_latent if d_input is None else d_input
+        self.d_input = d_input
+        self._bridge_input = d_input != d_latent
         self.l_steps_per_h_update = l_steps_per_h_update
         self.h_updates_per_thought = h_updates_per_thought
         self.act_max_ponder_steps = act_max_ponder_steps
 
         # Separate decay-gated recurrences for the fast and slow modules --
         # they share the primitive (decay_gate.py) but hold independent weights.
-        self.l_transition = DiagonalDecayGate(d_model, d_ff, dropout, min_decay, max_decay)
-        self.h_transition = DiagonalDecayGate(d_model, d_ff, dropout, min_decay, max_decay)
+        self.l_transition = DiagonalDecayGate(d_latent, d_ff, dropout, min_decay, max_decay)
+        self.h_transition = DiagonalDecayGate(d_latent, d_ff, dropout, min_decay, max_decay)
 
         # Cross-attention into the persistent gestalt memory (read only; the
-        # write happens once per finished thought, outside this module).
-        self.memory_reader = GestaltCrossAttentionReader(d_model, n_heads, n_roles, dropout)
+        # write happens once per finished thought, outside this module). Memory
+        # holds d_latent thoughts and the query is the d_latent state -- one width.
+        self.memory_reader = GestaltCrossAttentionReader(d_latent, n_heads, n_roles, dropout)
 
-        # Cross-attention into the input lane (raw tokens + aged gestalts),
-        # per §4.2: the Reasoner's H/L state may only *read* the input lane,
-        # never have it written directly into its recurrent state.
-        self.input_reader = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.input_norm = nn.LayerNorm(d_model)
+        # Cross-attention into the input lane (raw tokens + aged gestalts), per
+        # §4.2: the Reasoner's H/L state may only *read* the input lane, never
+        # have it written into its recurrent state. The lane runs at the token
+        # width d_input; the loop queries it at d_latent, so bridge when they
+        # differ (kdim/vdim=d_input), else build it plainly.
+        if self._bridge_input:
+            self.input_reader = nn.MultiheadAttention(
+                d_latent, n_heads, dropout=dropout, batch_first=True, kdim=d_input, vdim=d_input)
+        else:
+            self.input_reader = nn.MultiheadAttention(
+                d_latent, n_heads, dropout=dropout, batch_first=True)
+        self.input_norm = nn.LayerNorm(d_latent)
 
-        self.halting_head = HaltingHead(d_model)
+        self.halting_head = HaltingHead(d_latent)
 
-        # Normalizes the incoming (already order-aware) chunk latent before it
-        # is injected into the L/H recurrences, bounding the injection scale.
-        self.chunk_pool_norm = nn.LayerNorm(d_model)
+        # Normalizes the incoming (already order-aware, already d_latent) chunk
+        # latent before it is injected into the L/H recurrences, bounding the
+        # injection scale.
+        self.chunk_pool_norm = nn.LayerNorm(d_latent)
 
     def _one_l_group_then_h_update(
         self, h_state: torch.Tensor, l_state: torch.Tensor, chunk_embed: torch.Tensor,
@@ -217,21 +238,23 @@ class HRMInnerLoop(nn.Module):
         Runs the bounded recurrent deliberation for one thought.
 
         Returns:
-          h_state: (batch, d_model) final H-state == the thought vector.
+          h_state: (batch, d_latent) final H-state == the thought vector, in the
+                   thought space the gestalt memory, pred_head, and the Talker's
+                   cross-attention consume.
           ponder_cost: scalar tensor, ACT ponder penalty (0 if use_act=False).
         """
-        batch, d_model = chunk_embed.shape
+        batch, _ = chunk_embed.shape
         device = chunk_embed.device
 
         if h_state is None:
-            h_state = torch.zeros(batch, d_model, device=device)
+            h_state = torch.zeros(batch, self.d_latent, device=device)
         if l_state is None:
-            l_state = torch.zeros(batch, d_model, device=device)
+            l_state = torch.zeros(batch, self.d_latent, device=device)
 
         # The chunk latent is produced order-awarely by the shared ChunkEncoder
-        # (model.py) -- the same representation the JEPA self-supervised loss
-        # predicts, so that loss regularizes exactly this injection. Re-norm it
-        # here to bound the injection scale into the recurrence.
+        # (model.py) at the thought width d_latent -- the same representation the
+        # JEPA self-supervised loss predicts, so that loss regularizes exactly
+        # this injection. Re-norm it here to bound the injection scale.
         chunk_embed = self.chunk_pool_norm(chunk_embed)
 
         # Convert the input-lane validity mask into MultiheadAttention's

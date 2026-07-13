@@ -141,21 +141,33 @@ python data_prep.py --dataset HuggingFaceFW/fineweb-edu --name sample-10BT --str
 
 `--preset` here **must match** training. Note the final `wrote <EXAMPLES> examples` count.
 
-> **Xet-CDN 403 on streaming?** Some Hub datasets (e.g. fineweb-edu) serve parquet
-> through HF's **Xet** storage, and `datasets` *streaming* range-reads can `403
-> Forbidden` from `cas-bridge.xethub.hf.co` even with a valid token (streaming
-> ignores `HF_HUB_DISABLE_XET`). Escape hatch — download shards via the classic
-> (non-Xet) path and prep from local parquet:
+> **Xet-CDN 403 (fineweb-edu and other Xet-backed datasets).** HF serves many
+> datasets' parquet through **Xet** storage. On some boxes *every* request to
+> `cas-bridge.xethub.hf.co` returns `403 Forbidden` — for **both** `datasets`
+> streaming **and** `hf download` — even with a valid token (the signed URL
+> carries your real Cas-Uid, so it's not an auth problem). **`HF_HUB_DISABLE_XET=1`
+> does NOT fix it** — it's ignored, and the download still says "Reconstructing…"
+> (the Xet path). Also note the CLI is **`hf`** now (`huggingface-cli` is
+> deprecated and no-ops). Observed on the Strix Halo box 2026-07, unresolved
+> in-session; the reliable escape hatches, in order:
+>
+> 1. **Remove the Xet client to force classic LFS:** `pip uninstall -y hf_xet`, then retry. (Also `date`-check the box clock — a wrong clock breaks signed-URL auth.)
+> 2. **Download on a machine that CAN reach Xet, then transfer in** (your laptop/Mac on normal internet almost always can) — the guaranteed unblock:
+>    ```bash
+>    hf download HuggingFaceFW/fineweb-edu --repo-type dataset \
+>      --include "sample/10BT/00[0-2]_*.parquet" --local-dir fineweb_local
+>    rsync -avP fineweb_local/ USER@BOX:~/hlra/fineweb_local/
+>    ```
+> 3. **Use a non-Xet corpus** (still classic LFS): `Skylion007/openwebtext` (~9B tok) or `allenai/c4 --name en`. The architecture only needs long English prose.
+>
+> Then prep from the local parquet (no streaming, no Xet) with the `--local-glob`
+> mode (`data.iter_local_parquet`):
 > ```bash
-> # NOTE: the CLI is `hf` now (`huggingface-cli` is deprecated / no-ops on recent hub versions)
-> HF_HUB_DISABLE_XET=1 hf download HuggingFaceFW/fineweb-edu \
->   --repo-type dataset --include "sample/10BT/00[0-2]_*.parquet" --local-dir fineweb_local
 > python data_prep.py --local-glob "fineweb_local/**/*.parquet" --preset small-w3 \
->   --max-tokens 1200000000 --out chunk_cache
+>   --max-tokens 1200000000 --out chunk_cache      # a few sample/10BT shards cover 1.2B tokens
 > ```
-> Grab a subset first (a few `sample/10BT/*.parquet` shards is plenty for a
-> 1.2B-token cache; `--max-tokens` stops prep early). `hf download` resumes if
-> interrupted, and confirm shards landed with `ls fineweb_local/sample/10BT/`.
+> `--local-glob` + `hf download`/`rsync` are all resumable — nicer than the
+> non-resumable streaming prep anyway.
 
 > **Wide-thought (`-w3`) run:** swap `--preset small` → `--preset small-w3` here **and** in every
 > training command below, and add `--var-weight 3.0` at launch (§5). The retuned `cosine_loss_k` rides

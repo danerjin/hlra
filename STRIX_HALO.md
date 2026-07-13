@@ -98,7 +98,18 @@ cache's actual non-pad ratio), peak GB, and the **ETA in days** for
 `--token-budget` (default 1.2B, the embedding-corrected Chinchilla figure).
 
 Expect dense tok/s to *climb with batch* until the GPU saturates — that plateau,
-and the largest batch that fits 128 GB with headroom, is what you run at.
+and the largest batch that fits the **~68 GB GTT** (§1, *not* 128 GB) with
+headroom, is what you run at.
+
+> **Measured on this box** (Radeon 8060S / gfx1151, `small-w3`,
+> `LATENT_MANUAL_LAYERNORM=1`): batch **32 → ~1.9 days** for the 1.2B-token budget;
+> batch **64 → OOM** on the ~68 GB GTT. So the box is clearly viable. Two notes:
+> the **manual-LayerNorm workaround materializes fp32 intermediates**, costing
+> extra activation memory (part of why 64 OOMs) *and* a little speed — a fixed LN
+> kernel would buy both back; and use **`--grad-accum N`** to reach a larger
+> *effective* batch (better gradient stats) without the single-forward memory.
+> (Data-side: getting the corpus onto this box hit the HF **Xet 403** wall — see
+> `TRAINING.md` §3 for the escape hatches.)
 
 ### Throughput → wall-clock (1.2B tokens)
 | real tok/s | days for 1.2B |
@@ -142,14 +153,20 @@ If none of that gets the ETA acceptable, the levers are: smaller token budget
 (the 1.0–1.5B bracket has slack), a smaller preset, or different hardware.
 
 ## 5. Go / no-go checklist before prepping data or launching
-- [ ] `rocm_smoke.py` prints **PASS** under `--amp-dtype bf16`.
+- [ ] torch from AMD's **gfx1151 index**, `gfx1151` in `get_arch_list()`, matmul
+      finite, **no `HSA_OVERRIDE`** (§1).
+- [ ] `LATENT_MANUAL_LAYERNORM=1 python rocm_smoke.py --preset small-w3` prints
+      **PASS** under bf16 (the manual-LN workaround is required on the current
+      wheel; §1).
 - [ ] `bench_throughput.py` real tok/s at the max-fitting batch gives an ETA you
-      can live with (rule of thumb: target ≲ 1–2 weeks for the full budget).
-- [ ] peak GB at that batch leaves comfortable headroom under 128 GB.
-- [ ] then: `data_prep.py` (parallelize if 1.2B tokens is slow single-process),
-      `train_scaled.py --preset small --amp --amp-dtype bf16 --lr-schedule per-stage`
-      with a batch size from the bench, and a short real-data shakedown watching
-      `latent_std` across a stage boundary before the full launch.
+      can live with (measured here: ~1.9 days @ batch 32; §3).
+- [ ] peak GB at that batch leaves headroom under the **~68 GB GTT** (not 128).
+- [ ] corpus is on the box (mind the HF **Xet 403** — `TRAINING.md` §3 /
+      `data_prep --local-glob`).
+- [ ] then: `LATENT_MANUAL_LAYERNORM=1 train_scaled.py --preset small-w3 --amp
+      --amp-dtype bf16 --lr-schedule per-stage --var-weight 3.0` with a batch from
+      the bench, and a short real-data shakedown watching `val_loss`/`latent_std`
+      across the Stage-B boundary before the full launch.
 
 ## 6. Caveats carried from the rest of the review
 - **AMP was never run in development** (no CUDA/ROCm) — `rocm_smoke.py` is the
@@ -163,7 +180,11 @@ If none of that gets the ETA acceptable, the levers are: smaller token budget
   calibrate it for this reconstruction+SSL objective.
 - **Data source (notes §15.6)** — pile-10k holds only ~20M usable tokens; the
   1.2B budget needs a big single corpus (e.g. fineweb-edu `sample-10BT`) or
-  mixture support wired into `data_prep.py`. Time a 1k-doc prep dry run first.
+  the `--mixture`. **Heads-up (2026-07):** fineweb-edu is **Xet-backed**, and on
+  this box every Xet fetch `403`'d (`cas-bridge.xethub.hf.co`) for both streaming
+  and `hf download`, unresolved in-session — use the `TRAINING.md` §3 escape
+  hatches (`pip uninstall hf_xet` / download-elsewhere+`rsync` / a non-Xet corpus)
+  and prep via `data_prep.py --local-glob`. Time a 1k-doc prep dry run first.
 - **Stage E expectation (notes §15.5)** — the halting head is trained only by
   the ponder cost, so `halt_prob → 1` (always halt at minimum depth) is the
   *expected* Stage-E behavior, not a regression; don't burn run time tuning
@@ -177,9 +198,10 @@ If none of that gets the ETA acceptable, the levers are: smaller token budget
   this. At `small`, the single largest activation term is the **Talker logits**
   (`N·L·vocab` = 32·64·50258 ≈ 103M elements/batch-item, retained across all
   chunks until backward): ~13 GB bf16 @ batch 64 (up to ~26 GB if cross-entropy
-  keeps an fp32 copy), on top of the ~2.5 GB model+optimizer. So OOM is unlikely
-  at `small` on 128 GB — but `--grad-accum N` is the escape hatch if a batch
-  doesn't fit (N smaller micro-batches, each freeing its graph, ~N× less
+  keeps an fp32 copy), on top of the ~2.5 GB model+optimizer. Against the **~68 GB
+  GTT** (not 128) — plus the manual-LayerNorm workaround's fp32 intermediates —
+  this is why **batch 64 OOM'd on `small-w3`** here (batch 32 fit). `--grad-accum N`
+  is the escape hatch (N smaller micro-batches, each freeing its graph, ~N× less
   activation memory at the same effective batch).
 - **"128 GB" is not necessarily allocable to the GPU** — unified memory is shared
   with the CPU/OS and gated by the amdgpu GTT pool (§1). The real ceiling is what

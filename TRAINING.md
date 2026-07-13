@@ -147,13 +147,15 @@ python data_prep.py --dataset HuggingFaceFW/fineweb-edu --name sample-10BT --str
 > ignores `HF_HUB_DISABLE_XET`). Escape hatch — download shards via the classic
 > (non-Xet) path and prep from local parquet:
 > ```bash
-> HF_HUB_DISABLE_XET=1 huggingface-cli download HuggingFaceFW/fineweb-edu \
->   --repo-type dataset --include "sample/10BT/*.parquet" --local-dir fineweb_local
+> # NOTE: the CLI is `hf` now (`huggingface-cli` is deprecated / no-ops on recent hub versions)
+> HF_HUB_DISABLE_XET=1 hf download HuggingFaceFW/fineweb-edu \
+>   --repo-type dataset --include "sample/10BT/00[0-2]_*.parquet" --local-dir fineweb_local
 > python data_prep.py --local-glob "fineweb_local/**/*.parquet" --preset small-w3 \
 >   --max-tokens 1200000000 --out chunk_cache
 > ```
-> Grab a subset first (e.g. `--include "sample/10BT/00[0-2]_*.parquet"`) — a few
-> shards is plenty for a 1.2B-token cache; `--max-tokens` stops prep early.
+> Grab a subset first (a few `sample/10BT/*.parquet` shards is plenty for a
+> 1.2B-token cache; `--max-tokens` stops prep early). `hf download` resumes if
+> interrupted, and confirm shards landed with `ls fineweb_local/sample/10BT/`.
 
 > **Wide-thought (`-w3`) run:** swap `--preset small` → `--preset small-w3` here **and** in every
 > training command below, and add `--var-weight 3.0` at launch (§5). The retuned `cosine_loss_k` rides

@@ -196,28 +196,36 @@ def iter_local_parquet(files, text_field: str = "text",
     Yield document strings from LOCAL parquet file(s) -- the no-network escape
     hatch when HF's Xet streaming CDN 403s on a dataset (e.g. fineweb-edu).
     `files` is a path, a recursive glob, or a list of paths. Download the shards
-    first with the CLASSIC (non-Xet) path, which does honor HF_HUB_DISABLE_XET:
-        HF_HUB_DISABLE_XET=1 huggingface-cli download HuggingFaceFW/fineweb-edu \\
-            --repo-type dataset --include "sample/10BT/*.parquet" --local-dir DIR
-    then prep with `data_prep.py --local-glob "DIR/**/*.parquet"`. Reads with the
-    'parquet' builder in streaming mode so it never loads a whole shard into RAM
-    and hits no network.
+    first on a machine that can reach HF (see STRIX_HALO.md / TRAINING.md §3) and
+    `rsync` them over, then prep with `data_prep.py --local-glob "DIR/**/*.parquet"`.
+
+    Reads with **pyarrow directly** (row-group batches, so a shard is never fully
+    in RAM) and does NOT call `datasets.load_dataset` -- that can trigger a HF-hub
+    metadata check even for local files and HANG on a network-restricted box, which
+    is the whole situation this escape hatch exists for. So this path makes zero
+    network calls.
     """
     import glob as _glob
-    from datasets import load_dataset
+    import pyarrow.parquet as pq
 
     if isinstance(files, str):
         files = sorted(_glob.glob(os.path.expanduser(files), recursive=True))
     if not files:
         raise SystemExit("iter_local_parquet: no parquet files matched -- download shards first "
                          "(see the docstring / STRIX_HALO.md).")
-    ds = load_dataset("parquet", data_files=files, split="train", streaming=True)
-    for i, ex in enumerate(ds):
-        if max_docs is not None and i >= max_docs:
-            return
-        text = ex.get(text_field)
-        if text:
-            yield text
+    emitted = 0
+    for path in files:
+        pf = pq.ParquetFile(path)
+        if text_field not in pf.schema_arrow.names:
+            raise SystemExit(f"iter_local_parquet: column {text_field!r} not in {path} "
+                             f"(columns: {pf.schema_arrow.names}) -- pass --text-field.")
+        for batch in pf.iter_batches(columns=[text_field], batch_size=1024):
+            for text in batch.column(0).to_pylist():
+                if max_docs is not None and emitted >= max_docs:
+                    return
+                if text:
+                    yield text
+                    emitted += 1
 
 
 class SyntheticTextCorpus:

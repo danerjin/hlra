@@ -286,6 +286,18 @@ class GestaltCrossAttentionReader(nn.Module):
         g = torch.sigmoid(self.trust_proj(self._role_tags(ids)))   # (n_roles, 1 or d)
         return g.mean(dim=-1)
 
+    def trust_dims_by_role(self, n_roles: int, device) -> Optional[torch.Tensor]:
+        """The full PER-DIMENSION trust gate per role, (n_roles, d) -- vector gate
+        only (None if the gate is off or scalar). trust_by_role()'s mean hides a
+        discounted polarity subspace: the mean can stay ~0.98 while a few dims fall
+        to ~0, which is exactly the behavior the vector gate is meant to learn.
+        Logging min/std across these dims makes that subspace observable. Role
+        prior only (no content term)."""
+        if not self.trust_gate or self.trust_proj.out_features == 1:
+            return None
+        ids = torch.arange(n_roles, device=device)
+        return torch.sigmoid(self.trust_proj(self._role_tags(ids)))   # (n_roles, d)
+
     def tag_trajectory(self, memory: GestaltMemoryBank, device) -> Optional[torch.Tensor]:
         """The DYNAMIC-tag observation: the soft role-mixture weights per stored
         slot, (…, n_slots, K). Reading it across a speaker's successive turns shows

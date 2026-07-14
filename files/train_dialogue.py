@@ -256,6 +256,35 @@ def main():
     ema = EMATargetEncoder(model.chunk_encoder, momentum=cfg.ema_momentum).to(device)
     flags = stage_f_flags(cfg)
 
+    # --- Anti-sycophancy measurement guard (Layer-3, 2026-07-14 review #2) ---
+    # The contrastive loss is meant to drive trust(USER) down, but the review
+    # found it does not train the trust gate as wired (SGD reduces it via the
+    # response seed/encoder), and a SCALAR gate is self-defeating for this loss
+    # (it discounts topic + polarity together, so it can't fall without hurting
+    # the topic signal the loss needs). So when the term is active, insist the run
+    # is correctly equipped and observable: require a gate, recommend the vector
+    # gate. A warning, not an error, so the scalar-vs-vector A/B stays runnable.
+    # See antisycophancy_trust_gate_note.md.
+    syco_on = bool(sf.syco_weight > 0 and sf.syco_every)
+    if syco_on and not cfg.trust_gate:
+        print(f"[train_dialogue] WARNING: anti-sycophancy loss is ON (syco_weight="
+              f"{sf.syco_weight}) but no trust gate is enabled. The loss has no "
+              f"provenance gate to train, so it can only satisfy itself via the "
+              f"response seed/encoder -- it will NOT learn to distrust user "
+              f"assertions. Add --trust-gate --vector-gate.", flush=True)
+    elif syco_on and not cfg.trust_gate_vector:
+        print(f"[train_dialogue] WARNING: anti-sycophancy loss is ON with a SCALAR "
+              f"trust gate. A scalar gate discounts topic and polarity together, so "
+              f"it cannot be driven down without destroying the topic signal the loss "
+              f"needs (review #2) -- expect trust(USER) to barely move. Use "
+              f"--vector-gate for the per-dimension polarity-subspace gate. See "
+              f"antisycophancy_trust_gate_note.md.", flush=True)
+    elif syco_on:
+        print(f"[train_dialogue] anti-sycophancy ON with the vector trust gate; "
+              f"logging trust(USER) mean + across-dim min/std every {sf.log_every} "
+              f"steps (watch a polarity subspace fall while the mean holds).",
+              flush=True)
+
     chunker = build_chunker(cfg, args.offline)
     if args.hf_chat or args.hf_transcript:
         # Real dialogue data: stream turn-lists from the HF loader (dialogue_data),
@@ -390,10 +419,19 @@ def main():
                        f"ponder={float(dlg['ponder']):.4f}"
                        + (f" syco={syco_val:.4f}" if syco_val is not None else ""))
                 # Watch trust(USER) fall relative to trust(SELF) as anti-sycophancy trains.
-                trust = model.hrm_loop.memory_reader.trust_by_role(len(cfg.role_tags), device)
+                reader = model.hrm_loop.memory_reader
+                trust = reader.trust_by_role(len(cfg.role_tags), device)
                 if trust is not None:
                     msg += " trust=" + "/".join(f"{r}:{float(t):.2f}"
                                                 for r, t in zip(cfg.role_tags, trust))
+                    # Vector gate: the per-role mean hides a discounted polarity
+                    # subspace (mean holds ~0.98 while a few dims -> 0). Log USER's
+                    # across-dim min/std so the subspace is observable (review #2).
+                    dims = reader.trust_dims_by_role(len(cfg.role_tags), device)
+                    if dims is not None and "USER" in cfg.role_tags:
+                        u = dims[cfg.role_tags.index("USER")]
+                        msg += (f" trustUSER[min={float(u.min()):.2f} "
+                                f"std={float(u.std()):.3f}]")
                 (bar.write(msg) if bar is not None else print(msg, flush=True))
             if sf.checkpoint_every and step % sf.checkpoint_every == 0:
                 save(out_dir, "checkpoint.pt", model, adapter, ema, optimizer, cfg, step)

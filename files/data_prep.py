@@ -153,6 +153,10 @@ def main():
                          "REQUIRED for multi-config datasets. The mixture carries its own per-source names.")
     ap.add_argument("--streaming", action="store_true",
                     help="stream the single dataset instead of a full download (the mixture always streams)")
+    ap.add_argument("--regex", action="store_true",
+                    help="use the fast regex sentence chunker instead of the neural SaT model "
+                         "(~1000x faster prep, but an APPROXIMATION of SaT boundaries -- for when "
+                         "GPU-SaT still isn't fast enough / for a quick first run)")
     ap.add_argument("--local-glob", default=None,
                     help="prep from LOCAL parquet file(s) (path/glob) instead of streaming from the Hub -- "
                          "the escape hatch when HF's Xet streaming CDN 403s (see STRIX_HALO.md). Download "
@@ -186,12 +190,17 @@ def main():
         # (build_pipeline), so the cache matches the intended pipeline instead of
         # a regex approximation. Lazy-imported so --offline needs no wtpsplit.
         # Pin the tokenizer to the local gpt2 dir: offline + deterministic ids.
-        from train import build_sat_chunker
-        data_cfg.tokenizer_name = TOKENIZER_DIR
         model_cfg = model_config(args.preset)  # vocab fixed after chunker build
-        chunker, vocab_size = build_sat_chunker(model_cfg, data_cfg)
+        if args.regex:
+            from data import build_regex_gpt2_chunker
+            chunker, vocab_size = build_regex_gpt2_chunker(model_cfg, TOKENIZER_DIR)
+            chunker_name = "regex-gpt2 (fast SaT approximation)"
+        else:
+            from train import build_sat_chunker
+            data_cfg.tokenizer_name = TOKENIZER_DIR
+            chunker, vocab_size = build_sat_chunker(model_cfg, data_cfg)
+            chunker_name = f"SaT({data_cfg.sat_model_name})"
         model_cfg.vocab_size = vocab_size
-        chunker_name = f"SaT({data_cfg.sat_model_name})"
         if args.local_glob:
             text_iter = iter_local_parquet(args.local_glob, args.text_field, max_docs=args.docs)
             src = f"local-parquet[{args.local_glob}]"

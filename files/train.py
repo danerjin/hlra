@@ -54,6 +54,21 @@ def build_sat_chunker(model_cfg: ModelConfig, data_cfg: DataConfig):
     from data import ReservePadTokenizer, PAD
 
     sat_model = SaT(data_cfg.sat_model_name)                       # downloads from HF hub
+    # SaT sentence segmentation is the prep bottleneck; on CPU it's ~seconds per
+    # doc, making a 1.2B-token prep take WEEKS. During prep the GPU is idle (prep
+    # runs before training), so move SaT there -- forward-only inference, so the
+    # LayerNorm-BACKWARD kernel bug (STRIX_HALO) does not apply. Env override:
+    # LATENT_SAT_DEVICE=cpu to force CPU, or =cuda/mps to pin.
+    import os as _os
+    import torch as _torch
+    _sat_dev = _os.environ.get(
+        "LATENT_SAT_DEVICE", "cuda" if _torch.cuda.is_available() else "cpu")
+    if _sat_dev != "cpu":
+        try:
+            sat_model.half().to(_sat_dev)
+            print(f"[chunker] SaT on {_sat_dev} (half) -- GPU-accelerated segmentation", flush=True)
+        except Exception as e:  # any ROCm/device hiccup -> stay on CPU, still correct
+            print(f"[chunker] SaT GPU move failed ({e}); staying on CPU", flush=True)
     base = AutoTokenizer.from_pretrained(data_cfg.tokenizer_name)
     base.model_max_length = int(1e12)  # whole-doc tokenization; silence >1024 warnings
     tokenizer = ReservePadTokenizer(base)

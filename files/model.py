@@ -809,7 +809,8 @@ class LatentThoughtModel(nn.Module):
                                 premise_b_chunks: torch.Tensor, premise_b_mask: torch.Tensor,
                                 answer_chunks: torch.Tensor, answer_mask: torch.Tensor,
                                 ema: EMATargetEncoder, response_seed: torch.Tensor, stage,
-                                agree_weight: float = 1.0, premise_role: int = USER):
+                                agree_weight: float = 1.0, premise_role: int = USER,
+                                freeze_escape: bool = False):
         """
         The Layer-3 (§4.3) contrastive step, routed through the TRUST-GATED
         memory reader. `premise_*_a/b` are two user assertions that differ ONLY
@@ -824,15 +825,34 @@ class LatentThoughtModel(nn.Module):
         This is also what trains the USER memory path (the Q2 train/serve gap):
         A-E only ever writes SELF, so without this step the USER-tagged read is
         untrained. Returns the scalar loss.
+
+        `freeze_escape` (review #2, option 2): detach the two cheap escape routes
+        this loss otherwise flows into -- the response seed (the dominant grad
+        sink, ~57 vs the trust gate's ~0.03) and the premise-encoder path -- so
+        the syco gradient concentrates on the memory read + trust gate, the
+        mechanism it is supposed to train. It cuts only the syco term's grad to
+        those params (via detach here), not the SFT terms' in the same backward;
+        default off = byte-identical. NB: the loop's L/H transitions still carry
+        grad (fully isolating the gate needs a loop-internal change) -- see
+        antisycophancy_trust_gate_note.md.
         """
         B = premise_a_chunks.shape[0]
         active = answer_mask.any(dim=1)
+        seed = response_seed.detach() if freeze_escape else response_seed
         mem_a = GestaltMemoryBank(self.cfg.memory_capacity, self.cfg.d_latent)
         mem_b = GestaltMemoryBank(self.cfg.memory_capacity, self.cfg.d_latent)
-        mem_a.write(self._premise_gestalt(premise_a_chunks, premise_a_mask), premise_role)
-        mem_b.write(self._premise_gestalt(premise_b_chunks, premise_b_mask), premise_role)
-        h_a, _ = self._open_response(response_seed, mem_a, None, None, stage, B, active=active)
-        h_b, _ = self._open_response(response_seed, mem_b, None, None, stage, B, active=active)
+        pg_a = self._premise_gestalt(premise_a_chunks, premise_a_mask)
+        pg_b = self._premise_gestalt(premise_b_chunks, premise_b_mask)
+        if freeze_escape:
+            # Detach the premise content -> the trust gate discounts a FIXED
+            # (well-trained-elsewhere) premise representation instead of the loss
+            # hiding polarity by re-encoding it. The gate still gets grad: it
+            # depends on the role tag, not the content.
+            pg_a, pg_b = pg_a.detach(), pg_b.detach()
+        mem_a.write(pg_a, premise_role)
+        mem_b.write(pg_b, premise_role)
+        h_a, _ = self._open_response(seed, mem_a, None, None, stage, B, active=active)
+        h_b, _ = self._open_response(seed, mem_b, None, None, stage, B, active=active)
         # Restrict the loss to rows with a real answer: a padded/empty-answer row
         # has tgt0=0 (pad-row zero latent) and would inject a spurious gradient
         # pulling pred toward the zero vector. (The shipped ContrastiveDataset

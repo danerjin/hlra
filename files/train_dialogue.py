@@ -208,6 +208,9 @@ def main():
                     help="enable the anti-sycophancy trust gate (§4.3) on the memory reader")
     ap.add_argument("--vector-gate", action="store_true",
                     help="make the trust gate per-dimension (discount a polarity subspace)")
+    ap.add_argument("--syco-freeze", action="store_true",
+                    help="anti-sycophancy: detach the response seed + premise encoder so the "
+                         "syco gradient concentrates on the trust gate (review #2, option 2)")
     ap.add_argument("--content-tags", action="store_true",
                     help="content-condition the soft tags (implies --soft-tags)")
     ap.add_argument("--gestalt-readout", action="store_true",
@@ -284,6 +287,10 @@ def main():
               f"logging trust(USER) mean + across-dim min/std every {sf.log_every} "
               f"steps (watch a polarity subspace fall while the mean holds).",
               flush=True)
+    if syco_on and args.syco_freeze:
+        print("[train_dialogue] --syco-freeze ON: response seed + premise encoder "
+              "detached for the contrastive term (loop transitions still carry "
+              "grad; full gate isolation needs a loop change).", flush=True)
 
     chunker = build_chunker(cfg, args.offline)
     if args.hf_chat or args.hf_transcript:
@@ -390,7 +397,8 @@ def main():
                 pa, pam, pb, pbm, ac, am = (t.to(device) for t in cb)
                 syco = model.forward_anti_sycophancy(pa, pam, pb, pbm, ac, am, ema,
                                                      adapter.response_seed, flags,
-                                                     agree_weight=sf.syco_agree_weight)
+                                                     agree_weight=sf.syco_agree_weight,
+                                                     freeze_escape=args.syco_freeze)
                 loss = loss + sf.syco_weight * syco
                 syco_val = float(syco)
 

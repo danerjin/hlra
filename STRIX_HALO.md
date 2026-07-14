@@ -1,210 +1,309 @@
-# Running the A→E pretraining on AMD Strix Halo (Radeon 8060S, ROCm)
+# STRIX_HALO.md — gfx1151 end-to-end run book (copy-paste)
 
-Practical guide for taking the `small` (~153M) A→E run to a single Strix Halo
-box (Ryzen AI Max, RDNA 3.5 iGPU `gfx1151`, 128 GB unified memory). The code
-needs **no changes** — ROCm exposes the GPU as `torch.cuda`, so `pick_device()`
-returns `"cuda"` and the bf16 AMP path works as-is. The open questions are
-(1) does ROCm run it, and (2) is it fast enough. Two scripts answer both
-*before* you prep a single token.
+From a **fresh AMD Strix Halo box** (Ryzen AI Max, Radeon 8060S iGPU, RDNA 3.5
+`gfx1151`, 128 GB unified memory) to a **running A→E training job**. Every block is
+copy-paste. This is the *verified* path mapped 2026-07 on `zhang-...-NucBox-EVO-X2`
+— it corrects a lot of plausible-but-wrong first guesses (stock PyTorch wheels,
+`HSA_OVERRIDE`, `HF_HUB_DISABLE_XET`, streaming fineweb-edu, CPU SaT). The design
+lives in [`latent-thought-architecture.md`](latent-thought-architecture.md); the
+generic (any-GPU) training reference is [`TRAINING.md`](TRAINING.md) and the long-form
+A→E walkthrough is [`archive/TRAINING.md`](archive/TRAINING.md).
 
-## 0. The one-paragraph verdict
-Memory is a non-issue and actually an advantage: the model+optimizer is ~2.5 GB
-and the ~1.2B-token chunk cache (~10 GB) loads into the 128 GB unified memory
-with room to spare, so the in-RAM `CachedChunkDataset` is fine (memmap optional).
-The real risk is **throughput**: `forward_self_supervised` (the on-loop predictor) is a sequential per-chunk
-loop of many small ops, which is launch-overhead-bound and underutilizes any
-GPU. The 128 GB is the lever — it lets you run a large batch to amortize that
-overhead. Measure it before committing.
+Paths below assume the repo is at `~/hlra`; adjust if yours differs.
 
-## 1. Environment (fresh Linux venv — NOT the Mac torch-2.2.2 venv)
+---
 
-> This section is the **verified** gfx1151 bring-up (mapped 2026-07 on a Radeon
-> 8060S). The important correction to earlier guidance: **the stock
-> `download.pytorch.org/whl/rocm*` wheels do NOT contain gfx1151 kernels** (their
-> `get_arch_list()` has gfx1100/1101/1102 and gfx1200/1201 but no gfx1151), and
-> masquerading via `HSA_OVERRIDE_GFX_VERSION` fails with `invalid device
-> function` / `no kernel image`. You need an **AMD gfx1151-native wheel**, and it
-> runs with **no override at all**.
+## 0. TL;DR — the whole path
 
-**a. GPU access (needs the box admin if you lack sudo).** ROCm device nodes are
-gated to the `render`/`video` groups. If `groups` shows neither, `torch.cuda`
-enumerates zero devices (`hipErrorNoDevice`). Have an admin run
-`sudo usermod -aG render,video $USER`, then **fully log out and back in**.
-
-**b. Install torch from AMD's gfx1151 index** (native gfx1151; `--no-cache-dir`
-is REQUIRED — pip's HTTP cache uses msgpack, which crashes with
-`ValueError: Memoryview is too large` on the >4 GB torch wheel):
-```bash
-python3.10 -m venv .venv-rocm && source .venv-rocm/bin/activate
-pip install --pre --no-cache-dir torch --index-url https://rocm.nightlies.amd.com/v2/gfx1151/
-pip install --no-cache-dir transformers datasets wtpsplit tqdm matplotlib "numpy<2"
 ```
-(If AMD's index is flaky or its `rocm_sdk` preloads a missing `hipsparselt`, the
-fallback is **scottt's self-contained gfx1151 wheels** — <https://github.com/scottt/rocm-TheRock/releases>
-— but those are cp311/cp312, so make a Python 3.11 venv via `uv` first:
-`uv python install 3.11 && uv venv --python 3.11 .venv-gfx1151`.)
+1. groups: render + video          (admin, one-time)
+2. pip install torch  from AMD's gfx1151 index  (--no-cache-dir)   — NO HSA_OVERRIDE
+3. export LATENT_MANUAL_LAYERNORM=1                                 — broken LN-backward kernel
+4. rocm_smoke.py  -> PASS
+5. data: SaT on GPU + get the parquet on-box (HF Xet 403 escape) + data_prep --local-glob
+6. queue training to auto-start after prep
+```
 
-**c. Verify it sees the GPU and can compute** (no override needed):
+Three env vars you will keep set (put in `~/.bashrc`):
+```bash
+echo 'export LATENT_MANUAL_LAYERNORM=1' >> ~/.bashrc   # broken LayerNorm-backward kernel (step 3)
+# (no HSA_OVERRIDE_GFX_VERSION with a native gfx1151 wheel — it BREAKS kernel launch)
+```
+
+---
+
+## 1. Install PyTorch for gfx1151
+
+**1a. GPU access (needs the admin if you lack sudo).** ROCm device nodes are gated
+to the `render`/`video` groups; without them `torch.cuda` sees zero devices
+(`hipErrorNoDevice`). Check, and if missing, have an admin add you:
+```bash
+groups                                   # want 'render' AND 'video'
+# admin runs, then you FULLY log out and back in (new login, not just a new shell):
+#   sudo usermod -aG render,video $USER
+```
+
+**1b. Install torch from AMD's gfx1151 index.** The **stock**
+`download.pytorch.org/whl/rocm*` wheels do **NOT** contain gfx1151 kernels
+(`get_arch_list()` has gfx1100/1101/1102 + gfx1200/1201 but not gfx1151), and
+`HSA_OVERRIDE_GFX_VERSION` masquerading fails with `invalid device function` /
+`no kernel image`. Use AMD's native gfx1151 index. **`--no-cache-dir` is REQUIRED**
+— pip's HTTP cache uses msgpack, which crashes with `ValueError: Memoryview is too
+large` on the >4 GB torch wheel.
+```bash
+python3.10 -m venv ~/hlra/.venv-rocm && source ~/hlra/.venv-rocm/bin/activate
+pip install --pre --no-cache-dir torch --index-url https://rocm.nightlies.amd.com/v2/gfx1151/
+pip install --no-cache-dir transformers datasets wtpsplit tqdm matplotlib pyarrow "numpy<2"
+```
+(Fallback if AMD's index is broken: scottt's self-contained gfx1151 wheels —
+<https://github.com/scottt/rocm-TheRock/releases> — but those are cp311/cp312, so
+make a matching venv with `uv`: `uv python install 3.11 && uv venv --python 3.11`.)
+
+**1c. Verify — GPU visible, can compute, NO override.**
 ```bash
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0)); \
 print(torch.cuda.get_arch_list()); x=torch.randn(2048,2048,device='cuda'); print(float((x@x).sum()))"
 ```
-Want `True`, `Radeon 8060S Graphics`, `gfx1151` in the arch list, and a finite
-matmul. **Do NOT set `HSA_OVERRIDE_GFX_VERSION`** with a native wheel — it forces
-an ISA mismatch and breaks kernel launches.
+Want `True`, `Radeon 8060S Graphics`, **`gfx1151` in the arch list**, and a finite
+number. **Do NOT set `HSA_OVERRIDE_GFX_VERSION`** with a native wheel — it forces an
+ISA mismatch and breaks kernel launches.
 
-**Harmless noise you can ignore:** `/opt/amdgpu/share/libdrm/amdgpu.ids: No such
-file or directory` (just the PCI→name table; cosmetic) and `Mem/Flash Efficient
-attention … experimental` (SDPA warnings; the run works).
+**Harmless noise, ignore it:** `/opt/amdgpu/share/libdrm/amdgpu.ids: No such file`
+(cosmetic PCI→name table) and `Mem/Flash Efficient attention … experimental` (SDPA
+warnings; the run works).
 
-**Broken LayerNorm-backward kernel (as of the 2026-04 `rocm7.13` alpha wheel):**
-`rocm_smoke.py` check `[3]` fails with `grads finite: False` — the fused
-`native_layer_norm_backward` writes NONDETERMINISTIC NaN/Inf into LayerNorm
-weight/bias grads (a different LN param each run; both bf16 and fp32; kernel
-serialization doesn't help). Workaround: **`export LATENT_MANUAL_LAYERNORM=1`** —
-the entry points then route LayerNorm through a manual primitive-op implementation
-(the model's own `hard_normalize` proves manual norms work on this GPU). Off by
-default; drop it once AMD ships a wheel with a fixed kernel.
+---
 
-**Memory:** the GPU allocates from the amdgpu **GTT** pool, which is *not* the full
-128 GB — `rocm_smoke.py` printed **~68 GB total/free** on this box. Size batches
-against the number it prints (`torch.cuda.mem_get_info()`), not 128.
+## 2. The LayerNorm-backward workaround (required on the current wheel)
 
-## 2. Step 1 — does it run? (`rocm_smoke.py`)
+The 2026-04 `rocm7.13` alpha wheel has a **racy `native_layer_norm_backward`
+kernel**: it writes nondeterministic NaN/Inf into LayerNorm weight/bias gradients (a
+different LN param each run; both bf16 and fp32; kernel serialization doesn't help).
+`rocm_smoke.py` check `[3]` fails `grads finite: False`. The model's own
+`hard_normalize` (a manual norm) is fine on the same GPU, so the fix routes
+`F.layer_norm` through manual primitive ops (`files/rocm_compat.py`), gated by an
+env var — off by default, so it's a no-op on any working GPU:
 ```bash
-cd files && LATENT_MANUAL_LAYERNORM=1 python rocm_smoke.py --preset small   # no HSA_OVERRIDE with a native wheel
+export LATENT_MANUAL_LAYERNORM=1        # you added this to ~/.bashrc in step 0
 ```
-(`LATENT_MANUAL_LAYERNORM=1` is the §1 LayerNorm-kernel workaround; drop it if a
-future wheel passes check `[3]` without it.) Runs on synthetic tensors (no data).
-Verifies torch sees the GPU, a bf16 matmul
-is finite, and one real `forward_grounded` + `forward_self_supervised` + ACT
-step — **losses AND gradients** — stays finite under bf16 autocast, i.e. the ops
-most likely to NaN under mixed precision (hard_normalize division, decay-gate
-exp/softplus, masked softmax, CE) in both the forward and the backward kernels.
-**Use bf16, not fp16** (RDNA 3.5 has bf16; keeps fp32 range, needs no
-GradScaler). `PASS` == the training path is numerically safe on this GPU. As a
-second line of defense, the trainer itself skips any optimizer step whose global
-grad norm is non-finite (and hard-fails after 25 consecutive), so a mid-run
-kernel glitch can no longer NaN the weights.
+Drop it once AMD ships a wheel with a fixed LN kernel. (SaT segmentation at prep is
+forward-only, so it is unaffected — see step 5.)
 
-## 3. Step 2 — is it fast enough? (`bench_throughput.py`)
+---
+
+## 3. Does it run? — `rocm_smoke.py` (the gate)
+
 ```bash
-python bench_throughput.py --preset small --batch-size 4,16,32,64 --amp
-python bench_throughput.py --preset small --batch-size 64 --stage E --amp   # ACT path
+cd ~/hlra/files
+LATENT_MANUAL_LAYERNORM=1 python rocm_smoke.py --preset small-w3     # must end PASS
 ```
-Sweeps batch size and reports, per batch: step time, dense tok/s (hardware
-ceiling), **real tok/s** (`--fill-frac`, ~0.6 for real docs — set it to your
-cache's actual non-pad ratio), peak GB, and the **ETA in days** for
-`--token-budget` (default 1.2B, the embedding-corrected Chinchilla figure).
+It runs the real `forward_grounded` + `forward_self_supervised` + ACT step under
+bf16 autocast and checks **losses AND gradients** stay finite (the sequential loop's
+*backward* is the untested ROCm path). `PASS` = training-safe. If it `FAIL`s on
+`[3]`, you forgot `LATENT_MANUAL_LAYERNORM=1`.
 
-Expect dense tok/s to *climb with batch* until the GPU saturates — that plateau,
-and the largest batch that fits the **~68 GB GTT** (§1, *not* 128 GB) with
-headroom, is what you run at.
+---
 
-> **Measured on this box** (Radeon 8060S / gfx1151, `small-w3`,
-> `LATENT_MANUAL_LAYERNORM=1`): batch **32 → ~1.9 days** for the 1.2B-token budget;
-> batch **64 → OOM** on the ~68 GB GTT. So the box is clearly viable. Two notes:
-> the **manual-LayerNorm workaround materializes fp32 intermediates**, costing
-> extra activation memory (part of why 64 OOMs) *and* a little speed — a fixed LN
-> kernel would buy both back; and use **`--grad-accum N`** to reach a larger
-> *effective* batch (better gradient stats) without the single-forward memory.
-> (Data-side: getting the corpus onto this box hit the HF **Xet 403** wall — see
-> `TRAINING.md` §3 for the escape hatches.)
+## 4. How fast / how big? — `bench_throughput.py` (optional)
 
-### Throughput → wall-clock (1.2B tokens)
-| real tok/s | days for 1.2B |
+```bash
+LATENT_MANUAL_LAYERNORM=1 python bench_throughput.py --preset small-w3 --batch-size 16,32,64 --amp
+```
+**Measured on this box** (`small-w3`, manual-LN): **batch 32 fits; batch 64 OOMs.**
+Two facts that matter:
+- **The GPU allocates from the amdgpu GTT pool, ~68 GB — NOT the full 128 GB.** Size
+  batches against what `rocm_smoke.py` prints (`device memory: XXX GB`), not 128.
+- The **manual-LN workaround materializes fp32 intermediates**, costing extra
+  activation memory (part of why 64 OOMs) *and* a little speed. Use `--grad-accum N`
+  to reach a larger *effective* batch without the single-forward memory. A fixed LN
+  kernel would buy both back.
+
+The bottleneck is the **sequential per-chunk HRM loop** (launch-overhead-bound); a
+large batch amortizes it. The thought recurrence across chunks is inherently
+sequential by design and cannot be parallelized without changing semantics.
+
+---
+
+## 5. Data — prep the chunk cache
+
+Training reads a **pre-chunked cache** (SaT-Capped: SaT sentence boundaries +
+length capping). Three things bite on this box; all are handled below.
+
+### 5a. Run SaT on the GPU (else prep takes WEEKS)
+SaT segmentation on CPU is ~seconds/doc → **weeks** for 1.2 B tokens. `build_sat_chunker`
+now moves SaT to the GPU automatically (forward-only, so the §2 LN-backward bug does
+not apply); look for `[chunker] SaT on cuda (half)` in the log. Override with
+`LATENT_SAT_DEVICE=cpu`. Even on GPU it's per-doc-overhead-bound (~10k tok/s here →
+~a day for 1.2 B); the `--regex` fast fallback (5c) skips SaT entirely.
+
+### 5b. Get the corpus on-box — the HF **Xet 403** wall
+fineweb-edu (and many datasets) serve parquet through HF's **Xet** CDN. On this box
+*every* Xet request (`cas-bridge.xethub.hf.co`) `403`'d — for **both** `datasets`
+streaming **and** `hf download` — even authenticated. **`HF_HUB_DISABLE_XET=1` is
+IGNORED.** The CLI is **`hf`** now (`huggingface-cli` is deprecated / no-ops). The
+reliable fix: **download the parquet on a machine that CAN reach Xet (your laptop),
+`rsync` it over, and prep from local files.**
+
+```bash
+# --- on your laptop / any machine with normal internet ---
+pip install -U huggingface_hub && hf auth login          # paste an HF read token
+# each sample/10BT shard is ~2.15 GB ≈ ~1-1.5 B tokens -> you only need 1-2 for 1.2 B:
+hf download HuggingFaceFW/fineweb-edu --repo-type dataset \
+  --include "sample/10BT/00[0-1]_*.parquet" --local-dir ~/fineweb_local
+# ship the shards to the box (NOT the ~20 GB cache — prep on the box, disk lands there):
+rsync -avP ~/fineweb_local/sample/ daniel@<box>:~/hlra/fineweb_local/sample/
+```
+Escape-hatch notes: (1) if `hf_xet` even on the laptop misbehaves, `pip uninstall -y
+hf_xet` forces the classic LFS path; (2) a non-Xet corpus (`Skylion007/openwebtext`,
+`allenai/c4 --name en`) streams fine from anywhere — the architecture only needs long
+English prose; (3) **storage:** shards are 2.15 GB each and the cache is ~20 GB at the
+observed 0.26 fill — do the download+prep where the disk is (the box, 1.9 TB), keeping
+the laptop to ~4 GB of parquet.
+
+### 5c. Prep from the local parquet (offline, on the box)
+`--local-glob` reads parquet with **pyarrow directly** (no `datasets.load_dataset`,
+which can do a hub check and hang) — zero network. **Prep is NOT resumable**: a crash
+restarts from zero (delete the partial dir first), so run under `nohup`/`tmux`.
+
+```bash
+cd ~/hlra/files
+# dry-run first (do NOT skip) -- confirms local read + GPU-SaT + write:
+python data_prep.py --local-glob "$HOME/hlra/fineweb_local/**/*.parquet" \
+  --preset small-w3 --docs 1000 --out chunk_cache_dryrun     # -> "wrote 1000 examples"
+rm -rf ~/hlra/chunk_cache_dryrun
+
+# the real cache (~a day with GPU-SaT; --max-tokens caps it; survives SSH disconnect):
+nohup python data_prep.py --local-glob "$HOME/hlra/fineweb_local/**/*.parquet" \
+  --preset small-w3 --max-tokens 1200000000 --out chunk_cache > prep.log 2>&1 &
+tail -f prep.log
+```
+**Want it in minutes instead of a day?** Add **`--regex`** (fast regex sentence
+chunker — an *approximation* of SaT boundaries, fine for a first run):
+```bash
+nohup python data_prep.py --regex --local-glob "$HOME/hlra/fineweb_local/**/*.parquet" \
+  --preset small-w3 --max-tokens 1200000000 --out chunk_cache > prep.log 2>&1 &
+```
+Prep finishes with `wrote <N> examples (~1.2B tokens)`. **`--preset` must match
+training** (`small-w3` here → pass `--var-weight 3.0` at launch, step 6).
+
+---
+
+## 6. Queue training to auto-start when prep finishes
+
+Prep takes hours; this waits for it, refuses to train on a half-cache, computes the
+stage budget, and launches the real run — all `nohup`'d, all logged to
+`pipeline.log`. Paste while prep is still running:
+
+```bash
+cat > ~/run_pipeline.sh <<'EOF'
+#!/bin/bash
+export LATENT_MANUAL_LAYERNORM=1
+PREP_PID="$1"
+cd ~/hlra/files
+log(){ echo "[$(date '+%F %T')] $*"; }
+log "STATUS: waiting for prep (PID $PREP_PID)..."
+while kill -0 "$PREP_PID" 2>/dev/null; do sleep 60; done
+if [ ! -f ~/hlra/chunk_cache/manifest.json ]; then
+  log "STATUS: ABORTED — prep died without manifest.json (half cache). NOT training. See prep.log."; exit 1
+fi
+EX=$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/hlra/chunk_cache/manifest.json')))['total'])")
+log "STATUS: prep finished — $EX examples"
+BATCH=32
+STAGE_STEPS=$(python3 -c "u=max(1,($EX//$BATCH)//6);print(f'{u},{u},{u},{u},{2*u},0')")
+log "STATUS: launching training — BATCH=$BATCH STAGE_STEPS=$STAGE_STEPS"
+python train_scaled.py --preset small-w3 --cache chunk_cache --device cuda --amp --amp-dtype bf16 \
+  --batch-size "$BATCH" --stage-steps "$STAGE_STEPS" --var-weight 3.0 --lr-schedule per-stage \
+  --num-workers 8 --log-every 50 --checkpoint-every 1000 --archive-every 5000 --out runs/scaled
+log "STATUS: train_scaled.py exited (rc=$?)"
+EOF
+chmod +x ~/run_pipeline.sh
+PREP_PID=$(pgrep -f 'data_prep.py' | head -1)
+nohup ~/run_pipeline.sh "$PREP_PID" > ~/hlra/files/pipeline.log 2>&1 &
+echo "QUEUED (prep PID=$PREP_PID). Read anytime: tail -f ~/hlra/files/pipeline.log"
+```
+
+**To launch training manually instead** (cache already prepped): compute the budget
+and run — remember the box-specifics **`LATENT_MANUAL_LAYERNORM=1`, `--preset
+small-w3`, `--var-weight 3.0`, batch 32**:
+```bash
+cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 && export BATCH=32
+export STAGE_STEPS=$(python3 -c "import json,os;m=json.load(open(os.path.expanduser('~/hlra/chunk_cache/manifest.json')));print(','.join([str(max(1,(m['total']//$BATCH)//6))]*4+[str(2*max(1,(m['total']//$BATCH)//6)),'0']))")
+nohup python train_scaled.py --preset small-w3 --cache chunk_cache --device cuda --amp --amp-dtype bf16 \
+  --batch-size "$BATCH" --stage-steps "$STAGE_STEPS" --var-weight 3.0 --lr-schedule per-stage \
+  --num-workers 8 --log-every 50 --checkpoint-every 1000 --archive-every 5000 --out runs/scaled > train.log 2>&1 &
+```
+
+---
+
+## 7. Monitor, disconnect, resume
+
+**Watch** (the one number that matters is `val_loss` across the A→B boundary — no jump
+= healthy; a jump when the predictor turns on at Stage B = collapse):
+```bash
+grep STATUS ~/hlra/files/pipeline.log            # milestones (prep done, training launched)
+grep -E 'stage=(A|B)' ~/hlra/files/pipeline.log | tail -4
+tail -f ~/hlra/files/pipeline.log                # or train.log for the manual launch
+```
+Healthy line: `[step 2000] stage=B ... logs={'nll':6.9,'ssl':0.7,...} val_loss=6.85 lstd=0.42`.
+
+**Disconnect safely.** `nohup` (and the queue) survive SSH drops / wifi changes /
+laptop close — `Ctrl-C` the `tail` (that only stops the log-follow) and disconnect;
+`tail -f` the log again when you're back. It does **not** survive a box reboot, and
+prep is not resumable (training *is* — see below). For the training run, `tmux new -s
+train` gives you a re-attachable live terminal (`Ctrl-B D` to detach, `tmux attach -t
+train` to return).
+
+**Stop / resume training** (training checkpoints; prep does not):
+```bash
+pgrep -af train_scaled.py ; kill <PID>           # graceful: writes checkpoint.pt, loses ≤1 step
+# resume: re-run the SAME launch command -> auto-resumes from runs/scaled/checkpoint.pt
+```
+Guards on resume: hard-fails if the cache changed size (`LATENT_ALLOW_DATA_CHANGE=1`
+overrides); loud `WARNING: resume schedule differs` if flags differ (fix them).
+
+**When it finishes** (after Stage E):
+```bash
+python plot_metrics.py runs/scaled                                     # runs/scaled/loss_curves.png
+python generate.py --ckpt ~/hlra/runs/scaled/model.pt --score "a sentence to score"
+```
+Off-the-server transfer of the checkpoint: strip to inference weights first
+(`model_state`+`model_cfg`, ~4× smaller than the full model+optimizer+EMA), then
+`rsync`/HF-Hub it.
+
+---
+
+## 8. Troubleshooting (everything that bit us, with the fix)
+
+| Symptom | Cause → fix |
 |---|---|
-| 200 (MPS-like, batch 4) | ~69 |
-| 500 | ~28 |
-| 1,000 | ~14 |
-| 2,000 | ~7 |
-| 5,000 | ~3 |
-| 10,000 | ~1.4 |
+| `Could not find a version that satisfies torch` on `whl/rocm6.x` | `rocm6.x` is a literal, not a wildcard → use a real index; for gfx1151, **AMD's `rocm.nightlies.amd.com/v2/gfx1151/`** (§1b). |
+| `ValueError: Memoryview is too large` (download completes then errors) | pip's msgpack cache can't hold the >4 GB wheel → **`--no-cache-dir`** (§1b). |
+| `cuda? False`, `hipErrorNoDevice` | not in `render`/`video` groups → admin `usermod -aG render,video`, re-login (§1a). |
+| `invalid device function` / `no kernel image` (matmul) | wheel lacks gfx1151 kernels, or you set `HSA_OVERRIDE` → use the gfx1151 wheel, **no override** (§1). |
+| `rocm_smoke.py [3] grads finite: False` (nondeterministic LN params) | broken `native_layer_norm_backward` → **`LATENT_MANUAL_LAYERNORM=1`** (§2). |
+| `amdgpu.ids: No such file` / experimental-SDPA warnings | cosmetic → **ignore** (§1c). |
+| `403 Forbidden … cas-bridge.xethub.hf.co`, "Reconstructing…" hangs | HF **Xet** CDN blocked; `HF_HUB_DISABLE_XET` is ignored → download elsewhere + `rsync` + `--local-glob`, or `pip uninstall hf_xet`, or a non-Xet corpus (§5b). |
+| `huggingface-cli … deprecated and no longer works` | use **`hf`** (`hf download`, `hf auth login`). |
+| `--local-glob` hangs after `Loading weights` | (old code) `load_dataset` hub check → `git pull` (pyarrow reader), or `HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1` (§5c). |
+| prep at `2900% CPU`, 500 examples in ~15 min | SaT on CPU → **GPU-SaT** (auto after `git pull`), or **`--regex`** (§5a/5c). |
+| ran out of disk mid-download | shards are 2.15 GB each; you need 1–2 → keep those, `rm -rf ~/fineweb_local/.cache` (partials), prep on the box (§5b). |
+| OOM at batch 64 (`small-w3`) | ~68 GB GTT + manual-LN memory tax → batch 32, or `--grad-accum N` (§4). |
+| `WARNING: non-finite grad norm … skipping` | one NaN grad; trainer skips the step (weights safe), hard-fails after 25 → check LR / re-run `rocm_smoke`. |
+| `val_loss` rises at Stage B + `ssl`→0 + `lstd` craters | **latent collapse** → lower `--ssl-weight` toward 0.5, relaunch from an `--archive-every` snapshot. |
 
-If large-batch real tok/s lands in the thousands, the run is days and this box is
-viable. If it's stuck in the hundreds even at large batch, the sequential chunk
-loop is the bottleneck (next section), not the GPU.
+---
 
-## 4. Why throughput is loop-bound, and what can actually be sped up
-`forward_self_supervised` walks a document's chunks **sequentially** through the HRM loop. What that means
-for optimization:
+## 9. Caveats carried from review (still true)
 
-- **Already batched** (notes §11.7): the chunk *encoder* runs once over all
-  chunks, not per-chunk. Done.
-- **Inherently sequential — leave it:** the *thought recurrence* across chunks.
-  Thought `t` seeds its state from thought `t-1` and cross-attends to the gestalt
-  memory of thoughts `0..t-1`, which grows as you go. This is the architecture's
-  sequential thought loop (§1) — it cannot be parallelized across chunks without
-  changing semantics. The L/H steps *within* a chunk are likewise a recurrence.
-- **The Talker is already off the sequential path.** Reconstruction is a pure
-  autoencoder codec (`forward_grounded`) that decodes all `B*N` chunks in **one
-  parallel Talker call** with an empty memory — it is not inside the loop. The
-  sequential predictor (`forward_self_supervised`) uses only a cheap linear
-  `pred_head`, not the Talker. So the per-step sequential cost is the **HRM loop's
-  L/H recurrence + memory cross-attention**, per chunk — that's the thing large
-  batch amortizes.
-
-**Order of operations:** (1) large batch — free, no code change, measured by the
-bench; (2) the HRM thought recurrence stays sequential by design (it cannot be
-parallelized across chunks without changing semantics). If the ETA is still
-unacceptable, the levers are budget/preset/hardware, below.
-
-If none of that gets the ETA acceptable, the levers are: smaller token budget
-(the 1.0–1.5B bracket has slack), a smaller preset, or different hardware.
-
-## 5. Go / no-go checklist before prepping data or launching
-- [ ] torch from AMD's **gfx1151 index**, `gfx1151` in `get_arch_list()`, matmul
-      finite, **no `HSA_OVERRIDE`** (§1).
-- [ ] `LATENT_MANUAL_LAYERNORM=1 python rocm_smoke.py --preset small-w3` prints
-      **PASS** under bf16 (the manual-LN workaround is required on the current
-      wheel; §1).
-- [ ] `bench_throughput.py` real tok/s at the max-fitting batch gives an ETA you
-      can live with (measured here: ~1.9 days @ batch 32; §3).
-- [ ] peak GB at that batch leaves headroom under the **~68 GB GTT** (not 128).
-- [ ] corpus is on the box (mind the HF **Xet 403** — `TRAINING.md` §3 /
-      `data_prep --local-glob`).
-- [ ] then: `LATENT_MANUAL_LAYERNORM=1 train_scaled.py --preset small-w3 --amp
-      --amp-dtype bf16 --lr-schedule per-stage --var-weight 3.0` with a batch from
-      the bench, and a short real-data shakedown watching `val_loss`/`latent_std`
-      across the Stage-B boundary before the full launch.
-
-## 6. Caveats carried from the rest of the review
-- **AMP was never run in development** (no CUDA/ROCm) — `rocm_smoke.py` is the
-  first execution of it. Treat a PASS as necessary, not sufficient; watch
-  `latent_std` and loss finiteness over the first few hundred real steps too.
-- **Smoke-tuned hyperparameters** — `cosine_loss_k` (width-dependent, tuned at
-  d=192 not 512), `act_ponder_cost` (0.01, set before the M7 per-thought-mean
-  fix), and the anti-collapse weights need eyeballing at scale.
-- **~1.2B tokens is an embedding-corrected estimate, not a fitted optimum** — the
-  20:1 constant is borrowed from next-token LM; a small token sweep would
-  calibrate it for this reconstruction+SSL objective.
-- **Data source (notes §15.6)** — pile-10k holds only ~20M usable tokens; the
-  1.2B budget needs a big single corpus (e.g. fineweb-edu `sample-10BT`) or
-  the `--mixture`. **Heads-up (2026-07):** fineweb-edu is **Xet-backed**, and on
-  this box every Xet fetch `403`'d (`cas-bridge.xethub.hf.co`) for both streaming
-  and `hf download`, unresolved in-session — use the `TRAINING.md` §3 escape
-  hatches (`pip uninstall hf_xet` / download-elsewhere+`rsync` / a non-Xet corpus)
-  and prep via `data_prep.py --local-glob`. Time a 1k-doc prep dry run first.
-- **Stage E expectation (notes §15.5)** — the halting head is trained only by
-  the ponder cost, so `halt_prob → 1` (always halt at minimum depth) is the
-  *expected* Stage-E behavior, not a regression; don't burn run time tuning
-  `act_ponder_cost` against it. (notes §21.5 fixed a small ACT gradient leak —
-  the ponder cost was reaching one thought back through the raw h/l chain; the
-  fix is in `hrm_loop._TruncationSchedule` and does not change this `halt_prob → 1`
-  expectation.)
-- **Peak memory (notes §15.5, §21.2)** — activation graphs span whole documents
-  in Stages C+ (transitive memory credit — intended per §3.6, *not* a leak the
-  `memory_grad_window` should have stopped); the bench's peak-GB already includes
-  this. At `small`, the single largest activation term is the **Talker logits**
-  (`N·L·vocab` = 32·64·50258 ≈ 103M elements/batch-item, retained across all
-  chunks until backward): ~13 GB bf16 @ batch 64 (up to ~26 GB if cross-entropy
-  keeps an fp32 copy), on top of the ~2.5 GB model+optimizer. Against the **~68 GB
-  GTT** (not 128) — plus the manual-LayerNorm workaround's fp32 intermediates —
-  this is why **batch 64 OOM'd on `small-w3`** here (batch 32 fit). `--grad-accum N`
-  is the escape hatch (N smaller micro-batches, each freeing its graph, ~N× less
-  activation memory at the same effective batch).
-- **"128 GB" is not necessarily allocable to the GPU** — unified memory is shared
-  with the CPU/OS and gated by the amdgpu GTT pool (§1). The real ceiling is what
-  `rocm_smoke.py` prints on startup: `device memory: XXX GB total, YYY GB free`
-  (`torch.cuda.mem_get_info()`). Check that number against the peak-GB the bench
-  reports **before** committing a batch size — don't assume the full 128 GB.
+- **AMP + gfx1151 were never run in development** — `rocm_smoke.py` PASS is necessary,
+  not sufficient; watch `val_loss`/`lstd` over the first few hundred real steps.
+- **Smoke-tuned hyperparameters** (`cosine_loss_k`, `act_ponder_cost`, anti-collapse
+  weights) may want eyeballing at scale; `small-w3` already retunes `cosine_loss_k`
+  and needs `--var-weight 3.0`.
+- **~1.2 B tokens** is an embedding-corrected estimate, not a fitted optimum — the
+  1.0–1.5 B bracket has slack, and `--max-tokens 600000000` is a fine smaller first run.
+- **Fill ~0.26** on fineweb-edu here (lower than the old 0.4–0.5 guess) → more examples
+  per token budget → a ~20 GB cache and more prep time; re-check the bench ETA with the
+  cache's real fill (`python plot_metrics.py` / the manifest).
+- **Stage E**: the halting head is trained only by the ponder cost, so `halt_prob → 1`
+  (always halt at minimum depth) is *expected*, not a regression.

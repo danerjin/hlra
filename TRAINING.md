@@ -46,7 +46,7 @@ run.
 ```bash
 export PROJECT=/path/to/ucsc          # edit to your path
 export HSA_OVERRIDE_GFX_VERSION=11.5.1 # AMD gfx1151 only; harmless otherwise
-cd "$PROJECT" && source .venv/bin/activate
+cd "$PROJECT" && source .venv-rocm/bin/activate
 pip install -r training.txt           # datasets/transformers/wtpsplit/tqdm/matplotlib (torch stays as installed)
 cd "$PROJECT/files"
 python - <<'PY'

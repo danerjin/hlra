@@ -129,10 +129,29 @@ def load_base_model(ckpt_path, preset, device, soft_tags=False, trust_gate=False
         model = LatentThoughtModel(cfg, chunker=None)
         state = _reconcile_role_tables(model, dict(ckpt["model_state"]))
         missing, unexpected = model.load_state_dict(state, strict=False)
-        base_missing = sorted({k.split(".")[0] for k in missing})
-        if base_missing:
-            print(f"[train_dialogue] WARNING: checkpoint missing modules {base_missing} "
-                  f"(randomly initialized).")
+        # Distinguish a top-level module that is ENTIRELY absent from the
+        # checkpoint (a real problem -- the whole module is random) from one that
+        # is only PARTIALLY fresh because an opt-in Stage-F feature (soft tags,
+        # trust gate, gestalt readout) added a few tensors to a module whose bulk
+        # DID load. Collapsing both to "missing module X" (the old behavior) made
+        # `--soft-tags` on a valid A-E checkpoint print a scary, false
+        # "hrm_loop/talker randomly initialized" -- indistinguishable from a
+        # genuinely broken load.
+        if missing:
+            msd = model.state_dict()
+            missing_set = set(missing)
+            fully, partial = [], []
+            for top in sorted({k.split(".")[0] for k in missing}):
+                mod_keys = {k for k in msd if k.split(".")[0] == top}
+                (fully if mod_keys <= missing_set else partial).append(top)
+            if fully:
+                print(f"[train_dialogue] WARNING: checkpoint has NO weights for modules "
+                      f"{fully} (randomly initialized).")
+            if partial:
+                print(f"[train_dialogue] note: {len(missing_set)} new parameter(s) "
+                      f"initialized fresh (opt-in Stage-F params added to existing "
+                      f"modules {partial}); the rest of those modules loaded from the "
+                      f"checkpoint.")
         print(f"[train_dialogue] loaded base checkpoint {ckpt_path} "
               f"(stage_reached={ckpt.get('stage_reached')}).")
         return model, cfg

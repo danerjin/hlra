@@ -461,6 +461,49 @@ Verified: a freshly-prepped offline cache stamps `v3` and loads; a stamp-strippe
 and a `v2` manifest are both refused; the override loads them. A→E training path untouched
 (the check is load-time only, additive).
 
+## Stage-F shakedown (2026-07-13, offline CPU/MPS — no GPU)
+
+The untested Stage-F path (STAGE_F.md: "smoke-only, UNVALIDATED, real HF loaders
+coded but not run") driven end-to-end in-process on the Mac. **33 cases, all
+green** across four surfaces; the A-E training path (`forward_grounded` /
+`forward_self_supervised` / `trainer.py` / `model.py`) was **not touched** — the
+one fix is inference/driver-only.
+
+- **A-E byte-identity re-confirmed**: with every Stage-F flag off the model's
+  state_dict is byte-identical to a plain A-E model (137 tensors), and a saved
+  A-E checkpoint round-trips through `load_base_model` byte-for-byte. Each opt-in
+  flag only *adds* params, except `--soft-tags`, which by design *swaps* the
+  discrete `role_embed` for the soft codebook (verified: the only removed keys).
+- **Full flag matrix** (soft / content / trust / vector-gate / gestalt-readout /
+  rag / persona, plus the full stack, single- **and** multi-turn): `forward_dialogue`
+  + `forward_anti_sycophancy` + backward all produce finite losses and finite
+  grads; `response_seed` receives gradient; the non-finite clip guard holds.
+- **Real-data loaders exercised** (the path the 4-agent review's 3-tuple crash
+  lived in) by mocking `datasets.load_dataset`: `parse_transcript`,
+  `transcript_to_turns`, `messages_to_turns` all emit correct 3-tuples;
+  `iter_hf_chat_turns` / `iter_hf_transcript_turns` → `DialogueTurnsDataset` →
+  `collate_dialogue_sft` → `forward_dialogue` runs; `max_docs` honored, no-SELF
+  docs skipped, >`n_personas` speakers clamp (no IndexError).
+- **Serving + eval**: `lm_eval_adapter._score_continuation` (predictive chain, CPU)
+  returns a valid log-lik; `DialogueSession.reply` multi-turn accumulates memory
+  across turns; `add_source` (RAG, 4-role model) injects RETRIEVED slots and replies.
+
+**One fix landed (`train_dialogue.load_base_model`, driver-only):** the
+"checkpoint missing modules" warning collapsed parameter paths to their top-level
+module (`k.split(".")[0]`), so loading a *valid* A-E checkpoint with `--soft-tags`
+printed **"WARNING: checkpoint missing modules ['hrm_loop', 'talker'] (randomly
+initialized)"** — false (only 6 small tag params are fresh; the whole L/H loop and
+Talker load fine) and, worse, byte-identical to what a genuinely truncated
+checkpoint would print. Now it separates a module *entirely* absent (real WARNING)
+from one with a few opt-in Stage-F params added (informational note). Verified on
+three cases: benign soft-tags load → note; talker-stripped checkpoint → WARNING;
+clean flags-off load → silent. No other change; the fix is off the A-E path.
+
+Still not covered (needs the box / network): a real HF dialogue dataset actually
+streamed (only the loader *logic* is exercised, via a mocked stream), and any
+GPU/bf16/ROCm Stage-F run. Stage F remains **unvalidated as training** — this
+shakes out the plumbing, not the learning.
+
 ## Open items before a large run
 
 - **Re-confirm at full scale (~1.2B tokens):** watch `val_loss` at the Stage-B predictor boundary; the

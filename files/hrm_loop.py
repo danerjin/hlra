@@ -128,6 +128,12 @@ class HaltingHead(nn.Module):
         # Returns a halting probability in (0, 1) per batch element.
         return torch.sigmoid(self.proj(h)).squeeze(-1)
 
+    def logit(self, h: torch.Tensor) -> torch.Tensor:
+        # Pre-sigmoid halt score, for the supervised halt gate's BCE-with-logits
+        # (experiments.md #2). Caller passes a DETACHED h so the BCE trains only
+        # this head, not the loop.
+        return self.proj(h).squeeze(-1)
+
 
 class HRMInnerLoop(nn.Module):
     """
@@ -339,3 +345,51 @@ class HRMInnerLoop(nn.Module):
             ponder_cost = ponder_cost.detach()
 
         return h_state, ponder_cost
+
+    def forward_halt_trace(
+        self,
+        chunk_embed: torch.Tensor,                # (batch, d_latent)
+        memory: GestaltMemoryBank,
+        input_lane_kv: Optional[torch.Tensor],
+        h_state: Optional[torch.Tensor] = None,
+        l_state: Optional[torch.Tensor] = None,
+        grad_window: int = 5,
+        input_lane_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Supervised-halt variant of `forward` (experiments.md #2). Runs the loop to
+        the `act_max_ponder_steps` cap and returns the H-state AFTER EVERY cycle as
+        a stacked trace `(n_cycles_cap, batch, d_latent)`, so the caller can (a)
+        pick a per-row halt depth and (b) build the marginal-improvement BCE target
+        for the halting head. No ponder cost is computed -- the BCE replaces it.
+
+        This is a SEPARATE method on purpose: `forward` (the validated A-E/ponder
+        path) is left byte-identical. The two share `_one_l_group_then_h_update`
+        and `_TruncationSchedule` (rolling cut, depth unknown up front), so the
+        truncation / cross-thought severance semantics (§3.5/§3.6) are identical to
+        the ACT path.
+        """
+        batch, _ = chunk_embed.shape
+        device = chunk_embed.device
+        if h_state is None:
+            h_state = torch.zeros(batch, self.d_latent, device=device)
+        if l_state is None:
+            l_state = torch.zeros(batch, self.d_latent, device=device)
+        chunk_embed = self.chunk_pool_norm(chunk_embed)
+
+        input_lane_pad = None
+        if input_lane_kv is not None and input_lane_mask is not None:
+            input_lane_pad = ~input_lane_mask
+            all_masked = input_lane_pad.all(dim=1)
+            if all_masked.any():
+                input_lane_pad = input_lane_pad.clone()
+                input_lane_pad[all_masked] = False
+
+        # Rolling truncation (depth unknown up front), exactly like the ACT branch.
+        trunc = _TruncationSchedule(grad_window, total_steps=None)
+        trace = []
+        for _ in range(self.act_max_ponder_steps):
+            h_state, l_state = self._one_l_group_then_h_update(
+                h_state, l_state, chunk_embed, input_lane_kv, input_lane_pad, memory, trunc)
+            trace.append(h_state)
+        return torch.stack(trace, dim=0)               # (cap, batch, d_latent)

@@ -72,6 +72,11 @@ def main():
                     help="override ssl_var_weight (default 2.0, the VICReg-style per-dim variance "
                          "floor that resists latent collapse). At wider d_latent the latent starts "
                          "closer to the floor -- recommended ~3.0 for the -w3 presets (small-w3).")
+    ap.add_argument("--halt-mode", default="ponder", choices=["ponder", "supervised"],
+                    help="ACT depth training (experiments.md #2). 'ponder' (default) = the "
+                         "validated Graves/PonderNet soft cost, BYTE-IDENTICAL to every prior run. "
+                         "'supervised' = the TRM-style per-row BCE halt gate (post-run experiment; "
+                         "only affects Stage D+ where ACT is on).")
     ap.add_argument("--out", default="runs/scaled")
     ap.add_argument("--resume", default=None,
                     help="resume from a specific checkpoint path. If omitted and "
@@ -95,7 +100,7 @@ def main():
     total_steps = sum(stage_steps)
     max_steps = args.max_steps if args.max_steps is not None else total_steps
 
-    model_cfg = model_config(args.preset)
+    model_cfg = model_config(args.preset, halt_mode=args.halt_mode)  # default "ponder" == unchanged
     cache_dir = os.path.join(PROJECT, args.cache)
     ds = CachedChunkDataset(cache_dir, expect={
         "max_chunk_len": model_cfg.max_chunk_len,

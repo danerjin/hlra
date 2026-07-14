@@ -32,7 +32,7 @@ Shipped config leaves 3 of 8 loop steps outside the gradient
 - **Cost:** 3 more steps of graph memory per thought.
 - **Compare on:** small preset, Stage B/C metrics (nll, ssl cosine) vs. window=5 baseline.
 
-### 2. TRM-style supervised halt gate (Stage D variant)
+### 2. TRM-style supervised halt gate (Stage D variant) — **PROTOTYPED 2026-07-13**
 
 Replace the Graves/PonderNet ponder cost with TRM's simplification of ACT: a per-row halting
 probability trained with BCE against "is the output good enough now". Directly addresses the
@@ -51,6 +51,33 @@ toward minimum depth) and is simpler than a full ACT accumulator or REINFORCE.
   max steps at eval. A learned compute dial still needs an accumulator/REINFORCE.
 - **Compare on:** small preset Stage D, vs. ponder-cost baseline: depth distribution
   (does it escape min-depth?), nll/ssl at matched compute.
+
+**Implementation (prototype, opt-in, off by default — the A→E path is byte-identical).**
+Chose the **marginal-improvement** target. Gated entirely by `ModelConfig.halt_mode`
+(`"ponder"` default = the validated soft cost; `"supervised"` = this gate); `--halt-mode
+supervised` on `train_scaled.py` flips it. It only diverges at Stage D+ (ACT on); fixed-depth
+stages A–C are identical in both modes. Pieces:
+- `losses.supervised_halt_loss` — BCE(halt_logit_c, target_c) with a self-calibrating
+  target: `target_c = 1` iff `cos_dist_c − cos_dist_{c+1} < halt_epsilon` (the next cycle
+  barely helps); the cap cycle's target is 1. cos_dist is a **detached label**.
+- `hrm_loop.HRMInnerLoop.forward_halt_trace` — a *separate* method (leaves `forward`
+  byte-identical) that runs the loop to the `act_max_ponder_steps` cap and returns the H-state
+  after every cycle `(cap, batch, d)`, reusing the same rolling `_TruncationSchedule` as ACT.
+- `model.forward_self_supervised_halt` — a parallel predictor reached only via a guarded
+  dispatch in `forward_self_supervised`. Per chunk it (a) **selects** a per-row halt depth
+  (first cycle ≥ floor with prob > 0.5, else cap) and drives the primary SSL prediction +
+  memory write from the *selected* thought (train/test depth match, per-row depth = the gain
+  over the batch-mean vote), and (b) **supervises** the halt head with the BCE above, reading a
+  **detached** H-state so the BCE trains only the head — the primary losses still shape the
+  reasoning. Returns the same `(ssl, second_term)` 2-tuple, so `trainer.py` is untouched.
+- **Verified:** the ponder path is bit-for-bit identical to pre-change HEAD (ssl/second/gradnorm
+  to the last digit, both `use_act` modes); the supervised path trains (halt BCE 0.98 → 0.04 on
+  an overfit smoke batch) and the selected depth adapts from cap→floor as marginal improvement
+  vanishes. Config guards a bad mode / an inverted depth range.
+- **Still open (as flagged above):** no "think harder on hard chunks" pressure (needs an
+  accumulator/REINFORCE); a depth *spread* needs varied/harder data than the smoke overfit; the
+  trainer logs the second term under the `ponder` key in both modes (a label only). Unvalidated
+  at scale — this is a runnable A/B, not a result.
 
 ### 3. Shared L/H transition network (ablation, lowest confidence)
 

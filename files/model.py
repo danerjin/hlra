@@ -51,7 +51,8 @@ from gestalt_memory import GestaltMemoryBank, GestaltReadout
 from talker import Talker
 from ema_target import ChunkEncoder, EMATargetEncoder
 from losses import (scaled_cosine_loss, grounded_nll_loss, ponder_cost_loss,
-                    variance_regularization, anti_sycophancy_loss)
+                    variance_regularization, anti_sycophancy_loss,
+                    supervised_halt_loss)
 
 USER, SELF, SYSTEM = 0, 1, 2  # role-tag ids, matching config.role_tags order
 # RETRIEVED (3) is the latent-RAG provenance tag (§Q3). It is only usable when
@@ -280,7 +281,17 @@ class LatentThoughtModel(nn.Module):
         Returns (ssl_loss = cos_weight*cos + var_weight*var, ponder_loss). Collapse
         is held by the always-on autoencoder anchor + the variance floor + the slow
         EMA target (notes §25.1/§26.1).
+
+        Halt mode (experiments.md #2): with cfg.halt_mode == "supervised" AND ACT
+        on (Stage D+), the depth is trained by a supervised BCE halt gate instead
+        of the ponder cost -- dispatched here to a separate method so THIS one (the
+        validated A-E/ponder path) is byte-identical at the default halt_mode.
         """
+        if self.cfg.halt_mode == "supervised" and stage.use_act:
+            return self.forward_self_supervised_halt(
+                chunk_tensor, chunk_mask, raw_token_ids, raw_mask, memory, role_id,
+                stage, ema, cos_weight=cos_weight, var_weight=var_weight,
+                chunk_vecs=chunk_vecs)
         batch, n_chunks, chunk_len = chunk_tensor.shape
         device = chunk_tensor.device
 
@@ -349,6 +360,123 @@ class LatentThoughtModel(nn.Module):
         if n_valid > 0:
             total_ponder = total_ponder / n_valid
         return cos_weight * cos + var_weight * var, ponder_cost_loss(total_ponder, ponder_weight)
+
+    # ------------------------------------------------------------------
+    # Supervised halt gate (experiments.md #2): the ACT-alternative predictor.
+    # Structurally a copy of forward_self_supervised, differing only in the depth
+    # mechanism -- per-row halt SELECTION + a BCE halt loss instead of the ponder
+    # cost. Kept separate so the validated method above stays byte-identical; it
+    # is only ever reached via that method's guarded dispatch (halt_mode ==
+    # "supervised" and use_act).
+    # ------------------------------------------------------------------
+    def forward_self_supervised_halt(self, chunk_tensor: torch.Tensor, chunk_mask: torch.Tensor,
+                                      raw_token_ids: torch.Tensor, raw_mask: torch.Tensor,
+                                      memory: GestaltMemoryBank, role_id: int, stage: StageFlags,
+                                      ema: EMATargetEncoder, cos_weight: float = 1.0,
+                                      var_weight: float = 0.0, chunk_vecs=None):
+        """
+        TRM-style supervised halt gate. Per chunk t, the loop runs to the ACT cap
+        recording the H-state after every cycle (`hrm_loop.forward_halt_trace`).
+        Then, per row:
+          * SELECT a halt depth -- the first cycle at/after the min-depth floor
+            (h_updates_per_thought) whose halt prob > 0.5, else the cap. The
+            SELECTED thought drives the primary SSL prediction + the memory write,
+            so training sees the SAME depth inference will use (no train/test
+            depth mismatch), and depth is PER ROW (the gain over the ponder path's
+            batch-mean vote).
+          * SUPERVISE the halting head with BCE toward a self-calibrating target:
+            halt when one more cycle would cut the SSL cosine distance by <
+            cfg.halt_epsilon. The head reads a DETACHED H-state, so the BCE trains
+            only the head -- the primary losses (unchanged) shape the reasoning.
+
+        Returns (cos_weight*cos + var_weight*var, supervised_halt_weight*halt_bce),
+        matching forward_self_supervised's 2-tuple contract so the trainer needs no
+        change (the second term flows into `total` exactly where the ponder did).
+        """
+        batch, n_chunks, chunk_len = chunk_tensor.shape
+        device = chunk_tensor.device
+        cap = self.hrm_loop.act_max_ponder_steps
+        floor = max(0, self.hrm_loop.h_updates_per_thought - 1)   # 0-indexed min-depth cycle
+
+        # --- input lane (identical leak guard to forward_self_supervised) ---
+        input_lane_kv, input_lane_mask = None, None
+        if stage.use_input_lanes:
+            aged = memory.filtered_stacked([USER, SYSTEM])
+            if aged is not None:
+                aged_mask = torch.ones(aged.shape[0], aged.shape[1], dtype=torch.bool, device=device)
+                no_raw = raw_token_ids[:, :0]
+                no_raw_mask = raw_mask[:, :0]
+                input_lane_kv, input_lane_mask = self.input_lane(no_raw, no_raw_mask, aged, aged_mask)
+
+        flat_ids = chunk_tensor.reshape(batch * n_chunks, chunk_len)
+        if chunk_vecs is None:
+            chunk_vecs = self._encode_real_rows(flat_ids, self.chunk_encoder).reshape(batch, n_chunks, -1)
+        with torch.no_grad():
+            tgt = self._encode_real_rows(flat_ids, ema.encode).reshape(batch, n_chunks, -1)
+
+        h_state = l_state = None
+        preds, targets = [], []
+        halt_logits_all, cos_dist_all, sup_mask_all = [], [], []
+        for t in range(n_chunks):
+            active = chunk_mask[:, t]
+            if not active.any():
+                continue
+            trace = self.hrm_loop.forward_halt_trace(          # (cap, batch, d_latent)
+                chunk_vecs[:, t], memory, input_lane_kv,
+                h_state=h_state, l_state=l_state,
+                grad_window=stage.inner_loop_grad_window,
+                input_lane_mask=input_lane_mask)
+
+            # Halt logits/probs on a DETACHED trace (BCE trains only the head).
+            flat = trace.detach().reshape(cap * batch, -1)
+            logits = self.hrm_loop.halting_head.logit(flat).reshape(cap, batch)   # (cap, batch)
+            probs = torch.sigmoid(logits)
+
+            # Per-row selected depth: first cycle >= floor with prob>0.5, else cap-1.
+            halt_ok = probs.detach() > 0.5
+            if floor > 0:
+                halt_ok[:floor] = False
+            has = halt_ok.any(0)
+            first = torch.argmax(halt_ok.float(), dim=0)                          # 0 if none
+            sel = torch.where(has, first, torch.full_like(first, cap - 1)).clamp_min(floor)
+            h_sel = trace[sel, torch.arange(batch, device=device)]                # (batch, d), keeps grad
+
+            l_state = h_sel
+            write_vec = h_sel.detach() if stage.detach_memory else h_sel
+            memory.write(write_vec, role_id)
+            memory.apply_grad_truncation(stage.memory_grad_window)
+            h_state = h_sel
+
+            if t + 1 < n_chunks:
+                pair = active & chunk_mask[:, t + 1]
+                if pair.any():
+                    preds.append(self.pred_head(h_sel)[pair])
+                    targets.append(tgt[:, t + 1][pair])
+                    # Per-cycle cosine distance of pred_head(h_c) to the target
+                    # (the BCE label; detached, built under no_grad).
+                    with torch.no_grad():
+                        pred_c = self.pred_head(trace.detach().reshape(cap * batch, -1)).reshape(cap, batch, -1)
+                        tgt_next = tgt[:, t + 1].unsqueeze(0).expand(cap, -1, -1)
+                        cos_dist = 1.0 - F.cosine_similarity(pred_c, tgt_next, dim=-1)   # (cap, batch)
+                    sup = pair.unsqueeze(0).expand(cap, -1).clone()
+                    if floor > 0:
+                        sup[:floor] = False                    # no halting below the min-depth floor
+                    halt_logits_all.append(logits)
+                    cos_dist_all.append(cos_dist)
+                    sup_mask_all.append(sup)
+
+        cos = (scaled_cosine_loss(torch.cat(preds, 0), torch.cat(targets, 0), k=self.cfg.cosine_loss_k)
+               if preds else torch.zeros((), device=device))
+        flat_valid = chunk_mask.reshape(batch * n_chunks)
+        var = (variance_regularization(chunk_vecs.reshape(batch * n_chunks, -1)[flat_valid])
+               if var_weight > 0 else torch.zeros((), device=device))
+        if halt_logits_all:
+            halt = supervised_halt_loss(
+                torch.cat(halt_logits_all, dim=1), torch.cat(cos_dist_all, dim=1),
+                torch.cat(sup_mask_all, dim=1), epsilon=self.cfg.halt_epsilon)
+        else:
+            halt = torch.zeros((), device=device)
+        return cos_weight * cos + var_weight * var, self.cfg.supervised_halt_weight * halt
 
     @torch.no_grad()
     def predict_next_latent(self, latent, memory, h_state=None, l_state=None,

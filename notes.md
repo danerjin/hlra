@@ -504,6 +504,44 @@ streamed (only the loader *logic* is exercised, via a mocked stream), and any
 GPU/bf16/ROCm Stage-F run. Stage F remains **unvalidated as training** — this
 shakes out the plumbing, not the learning.
 
+## TRM supervised halt gate — prototype (2026-07-13, offline CPU)
+
+`experiments.md` #2 (the TRM-style supervised halt gate, the fix for "ACT halting
+doesn't learn") **implemented as an opt-in alternative to the ponder cost**, off by
+default. With `halt_mode="ponder"` (the default, what the big run uses) the A→E path
+is **byte-for-bit identical to pre-change HEAD** — verified by running the same
+fixed-seed `forward_self_supervised` in a HEAD worktree and the new tree: ssl,
+second term, and grad-norm matched to the last digit in both `use_act` modes.
+
+- **New config** (`ModelConfig`): `halt_mode` ("ponder"|"supervised"), `halt_epsilon`
+  (marginal cosine-distance threshold), `supervised_halt_weight`; `__post_init__`
+  rejects a bad mode and an inverted depth range (`act_max_ponder_steps <
+  h_updates_per_thought`). `train_scaled.py` gains `--halt-mode` (default "ponder" =
+  unchanged).
+- **New code, all additive**: `losses.supervised_halt_loss` (self-calibrating BCE:
+  halt when one more cycle cuts the SSL cosine distance by < ε; cos_dist is a detached
+  label); `HaltingHead.logit` + `HRMInnerLoop.forward_halt_trace` (a *separate* method
+  that runs to the ACT cap and returns the per-cycle H-states — `forward` is left
+  byte-identical); `model.forward_self_supervised_halt` (a parallel predictor reached
+  only via a guarded early-return in `forward_self_supervised`).
+- **Design**: per chunk it (a) SELECTS a per-row halt depth (first cycle ≥ min-depth
+  floor with prob>0.5, else cap) and drives the primary SSL prediction + memory write
+  from the *selected* thought — train/test depth match, and per-row depth is the gain
+  over the ponder path's batch-mean vote; (b) SUPERVISES the halt head with the BCE on
+  a **detached** H-state, so the halt objective trains only the head, never reshaping
+  the reasoning (the unchanged primary losses do that). Returns the same
+  `(ssl, second_term)` 2-tuple, so `trainer.py`/`curriculum.py` are untouched — the
+  second term flows in exactly where the ponder did.
+- **Verified (smoke, CPU)**: default path bit-identical to HEAD (above); supervised
+  path trains (halt BCE 0.98→0.04 on an overfit batch), the halt head receives
+  gradient, and the selected depth adapts cap(6)→floor(2) as marginal improvement
+  vanishes. Stage-F harnesses + config validation still green.
+- **Not done / honest limits**: unvalidated at scale (a runnable A/B, not a result);
+  no "think harder on hard chunks" pressure (needs an accumulator/REINFORCE); a depth
+  *spread* needs harder/varied data than the smoke overfit; the trainer logs the second
+  term under the `ponder` key in supervised mode too (a label only). Post-run
+  experiment — does **not** land before the A→E run.
+
 ## Open items before a large run
 
 - **Re-confirm at full scale (~1.2B tokens):** watch `val_loss` at the Stage-B predictor boundary; the

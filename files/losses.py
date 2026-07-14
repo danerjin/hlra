@@ -55,6 +55,43 @@ def ponder_cost_loss(ponder_cost: torch.Tensor, weight: float) -> torch.Tensor:
     return weight * ponder_cost
 
 
+def supervised_halt_loss(halt_logits: torch.Tensor, cos_dist: torch.Tensor,
+                          supervise_mask: torch.Tensor, epsilon: float = 0.01) -> torch.Tensor:
+    """
+    TRM-style supervised halt gate (experiments.md #2). Replaces the soft ponder
+    cost with a BCE that gives the halting head a *quality-grounded* signal: at
+    each candidate depth c, the target is "halt now" iff running one more cycle
+    would improve the SSL prediction by less than `epsilon`.
+
+      halt_logits   (C, N):  the halting head's pre-sigmoid output at each of the
+                             C candidate cycles, for N supervised rows. Computed
+                             on a DETACHED H-state by the caller, so this loss
+                             trains ONLY the halting head -- it never reshapes the
+                             reasoning (the primary SSL/gen losses do that).
+      cos_dist      (C, N):  per-cycle cosine distance (1 - cos) of pred_head(h_c)
+                             to the EMA target, DETACHED (a label, not a gradient
+                             path). Built under no_grad by the caller.
+      supervise_mask (C, N): bool, True where (cycle c, row n) is a legal halt
+                             point (c >= min-depth floor, row has a real t+1
+                             target). Rows/cycles outside get no gradient.
+
+    Target: halt_c = 1 when (cos_dist_c - cos_dist_{c+1}) < epsilon (the next
+    cycle barely helps), else 0. The last candidate cycle has no successor, so its
+    target is 1 (must stop at the cap). Self-calibrating: epsilon is in cosine-
+    distance units, and the target adapts to whatever improvement curve the model
+    currently produces. Returns a scalar (mean BCE over supervised entries; 0 if
+    none).
+    """
+    C = halt_logits.shape[0]
+    # marginal improvement from doing ONE more cycle; last cycle -> +inf (always halt)
+    nxt = torch.cat([cos_dist[1:], torch.full_like(cos_dist[:1], float("inf"))], dim=0)
+    improvement = cos_dist - nxt                       # >0 means the next cycle helps
+    target = (improvement < epsilon).float()           # halt when it stops helping
+    bce = F.binary_cross_entropy_with_logits(halt_logits, target, reduction="none")
+    m = supervise_mask.float()
+    return (bce * m).sum() / m.sum().clamp_min(1.0)
+
+
 def anti_sycophancy_loss(pred_a: torch.Tensor, pred_b: torch.Tensor, target: torch.Tensor,
                          k: float = 4.0, agree_weight: float = 1.0) -> torch.Tensor:
     """

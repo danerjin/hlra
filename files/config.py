@@ -82,6 +82,21 @@ class ModelConfig:
     # ---- adaptive computation time / test-time compute dial (§1.1, §5.5) -
     act_ponder_cost: float = 0.01
     act_max_ponder_steps: int = 6
+    # ---- halt mode (experiments.md #2: TRM-style supervised halt gate) ---
+    # How the ACT depth is trained once use_act is on (Stage D+):
+    #   "ponder"     -- (default) the Graves/PonderNet soft ponder cost in
+    #                   hrm_loop.py. BYTE-IDENTICAL to the validated A-E path;
+    #                   the big run uses this, so it is untouched by the option.
+    #   "supervised" -- a per-row halting head trained with BCE against a
+    #                   self-calibrating target (halt when one more cycle
+    #                   improves the SSL cosine distance by < halt_epsilon).
+    #                   Replaces the ponder cost. Post-run experiment; opt-in.
+    # The dispatch (model.forward_self_supervised) only diverges when this is
+    # "supervised" AND use_act is on, so a fixed-depth stage (A-C) is identical
+    # in both modes too.
+    halt_mode: str = "ponder"
+    halt_epsilon: float = 0.01           # cosine-distance improvement below which "halt now" is the BCE target
+    supervised_halt_weight: float = 0.1  # weight on the halt BCE (only when halt_mode == "supervised")
 
     # ---- role tags for the two-lane input/self separation (§4.2) -------
     role_tags: tuple = ("USER", "SELF", "SYSTEM")
@@ -183,6 +198,15 @@ class ModelConfig:
             warnings.warn("soft_role_content has no effect without soft_role_tags (ignored).")
         if self.trust_gate_vector and not self.trust_gate:
             warnings.warn("trust_gate_vector has no effect without trust_gate (ignored).")
+        if self.halt_mode not in ("ponder", "supervised"):
+            raise ValueError(f"halt_mode must be 'ponder' or 'supervised', got {self.halt_mode!r}")
+        # The supervised halt gate selects a per-row depth in [h_updates_per_thought,
+        # act_max_ponder_steps]; an inverted range would leave no room to halt.
+        if self.halt_mode == "supervised" and self.act_max_ponder_steps < self.h_updates_per_thought:
+            raise ValueError(
+                f"halt_mode='supervised' needs act_max_ponder_steps "
+                f"({self.act_max_ponder_steps}) >= h_updates_per_thought "
+                f"({self.h_updates_per_thought})")
 
 
 @dataclass

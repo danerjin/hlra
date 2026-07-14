@@ -252,8 +252,13 @@ class LatentThoughtLM(TemplateLM):
             prev_thought = h_state
 
         # Negative NLL is the log-likelihood the harness expects. A continuation
-        # that produced no chunks (empty string) scores 0.0 -- log P = 0 over an
-        # empty event, and is trivially "greedy".
+        # that produced NO scorable chunks -- an empty string, or one the chunker
+        # dropped to zero chunks (whitespace-only, unusual unicode) -- must NOT
+        # score 0.0: that is the MAXIMUM possible log-likelihood and would rank a
+        # degenerate candidate above every real (negative-scoring) one. Return a
+        # large-negative score so it can never win, and is not "greedy".
+        if total_tok == 0:
+            return -1e30, False
         return -total_nll, bool(all_greedy)
 
     @torch.no_grad()

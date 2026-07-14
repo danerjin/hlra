@@ -152,15 +152,36 @@ def load_base_model(ckpt_path, preset, device, soft_tags=False, trust_gate=False
                       f"initialized fresh (opt-in Stage-F params added to existing "
                       f"modules {partial}); the rest of those modules loaded from the "
                       f"checkpoint.")
+        if unexpected:
+            # Tensors in the checkpoint the current model has no home for -- they
+            # are silently DROPPED. The common case is a reparameterization:
+            # --soft-tags removes the discrete `role_embed` (replaced by
+            # `role_logits`), so the A-E-trained SELF role vector is discarded
+            # here. Warn rather than swallow it (the old behavior).
+            print(f"[train_dialogue] note: {len(unexpected)} checkpoint tensor(s) "
+                  f"unused by this model and DROPPED (reparameterized/removed modules "
+                  f"{sorted({k.split('.')[0] for k in unexpected})}; e.g. --soft-tags "
+                  f"discards the trained discrete role_embed).")
+        # Resume payload: only a Stage-F checkpoint (written by save() below,
+        # stage_reached=='F') carries an adapter/EMA/optimizer state that is
+        # COMPATIBLE with this driver's optimizer (base + adapter param groups).
+        # An A-E checkpoint's optimizer is over model params only, so we must NOT
+        # load it -- starting a fine-tune re-seeds EMA/optimizer fresh by design.
+        resume = None
+        if ckpt.get("stage_reached") == "F":
+            resume = {"adapter_state": ckpt.get("adapter_state"),
+                      "ema": ckpt.get("ema"),
+                      "optimizer": ckpt.get("optimizer"),
+                      "step": int(ckpt.get("step") or 0)}
         print(f"[train_dialogue] loaded base checkpoint {ckpt_path} "
               f"(stage_reached={ckpt.get('stage_reached')}).")
-        return model, cfg
+        return model, cfg, resume
     print("[train_dialogue] NO --ckpt given: initializing a FRESH model (smoke only; "
           "a real Stage-F fine-tune must start from a trained A-E checkpoint).")
     cfg = model_config(preset)
     cfg = _apply_feature_flags(cfg, soft_tags, trust_gate, gestalt_readout,
                                vector_gate, content_tags, rag, persona)
-    return LatentThoughtModel(cfg, chunker=None), cfg
+    return LatentThoughtModel(cfg, chunker=None), cfg, None
 
 
 def stage_f_flags(cfg: ModelConfig) -> StageFlags:
@@ -226,7 +247,7 @@ def main():
     if args.lr is not None: sf.lr = args.lr
     set_seed(sf.seed)
 
-    model, cfg = load_base_model(args.ckpt, args.preset, device,
+    model, cfg, resume = load_base_model(args.ckpt, args.preset, device,
                                  soft_tags=args.soft_tags, trust_gate=args.trust_gate,
                                  gestalt_readout=args.gestalt_readout, vector_gate=args.vector_gate,
                                  content_tags=args.content_tags, rag=args.rag, persona=args.persona)
@@ -272,15 +293,32 @@ def main():
     optimizer = torch.optim.AdamW(list(model.parameters()) + list(adapter.parameters()),
                                   lr=sf.lr, weight_decay=sf.weight_decay)
 
+    # Resume a prior Stage-F run: restore the trained response seed, the EMA
+    # target, and the optimizer moments (all written by save() but previously
+    # never read back -- a resumed run silently re-zeroed the seed and restarted
+    # Adam/EMA cold). Absent for an A-E-foundation start (resume is None).
+    start_step = 0
+    if resume is not None:
+        if resume["adapter_state"] is not None:
+            adapter.load_state_dict(resume["adapter_state"])
+        if resume["ema"] is not None:
+            ema.load_state_dict(resume["ema"])
+        if resume["optimizer"] is not None:
+            optimizer.load_state_dict(resume["optimizer"])
+        start_step = resume["step"]
+        print(f"[train_dialogue] resumed Stage-F state (response seed + EMA + "
+              f"optimizer) from step {start_step}.")
+
     model.train()
-    step, nonfinite_streak = 0, 0
+    step, nonfinite_streak = start_step, 0
     out_dir = os.path.join(PROJECT, args.out)
     print(f"[train_dialogue] device={device} d_latent={cfg.d_latent} steps={sf.steps} "
           f"batch={sf.batch_size} lr={sf.lr}  (offline={args.offline})")
 
     try:
         from tqdm.auto import tqdm
-        bar = tqdm(total=sf.steps, disable=(None if args.progress == "auto" else args.progress == "off"),
+        bar = tqdm(total=sf.steps, initial=start_step,
+                   disable=(None if args.progress == "auto" else args.progress == "off"),
                    desc="stage-F", unit="step")
     except Exception:
         bar = None

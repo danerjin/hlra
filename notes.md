@@ -542,6 +542,60 @@ second term, and grad-norm matched to the last digit in both `use_act` modes.
   term under the `ponder` key in supervised mode too (a label only). Post-run
   experiment — does **not** land before the A→E run.
 
+## Stage-F + halt-gate review (2026-07-14, 4 independent adversarial audits)
+
+The first review aimed squarely at the two **additive, un-hardened** surfaces (Stage F and the
+TRM halt gate) rather than the A→E path — the A→E semantics are frozen for the run. Four parallel
+audits with distinct lenses (halt-gate correctness; Stage-F gradient routing / three separations;
+Stage-F state-dict/tagging/checkpoint; Stage-F data pipeline + lm-eval), each verifying claims with
+CPU smoke probes. **Both surfaces are structurally sound: no target leak, no garbage-training, no
+A→E perturbation, and the halt gate is fully clean.**
+
+Probe-verified clean: halt gate — all 6 claims (ponder path bit-identical incl. Stages A–C
+mode-independent; BCE trains only the head, zero grad on encoder/loop/pred_head; target sign
+correct; per-row depth train/test match, no off-by-one; truncation severance; trainer untouched).
+Stage F — the 2026-07-13 raw-lane target-leak drop is present and correct; `score_tokens` can't copy
+(NLL pinned at chance); `forward_dialogue` SELF-masked; all-flags-off byte-identity (0 extra params,
+137-key state_dict); `_reconcile_role_tables` 3→4 preserves the first 3 rows bit-exactly; 8-tuple
+field order matches end-to-end; SFT lane/target strings disjoint at runtime; lm-eval scores via the
+predictive chain (no answer leak); structural lane isolation holds.
+
+**Fixes landed (all off the frozen A→E path, all verified):**
+- **[#1 moderate] Stage-F resume silently dropped trained state.** `train_dialogue.save()` wrote
+  `adapter_state` (the response seed) + `ema` + `optimizer`, but `load_base_model` never read them
+  back — a resumed run re-zeroed the seed and restarted Adam/EMA cold. `load_base_model` now returns
+  a `resume` payload (only for a `stage_reached=='F'` checkpoint — an A→E checkpoint's optimizer is
+  over model-only params and must NOT be loaded), and `main()` restores seed/EMA/optimizer and the
+  step. Verified: response seed round-trips bit-identical, optimizer moments present, run continues
+  from the saved step.
+- **[#3 low] lm-eval zero-chunk continuation returned logprob 0.0 = the max score**, so any
+  empty/whitespace-only candidate outranked every real answer. `_score_continuation` now returns
+  `-1e30` (can't win, not greedy) when `total_tok == 0`.
+- **[#5 low] `--soft-tags` on an A→E checkpoint silently discarded the trained discrete
+  `role_embed`** (dropped tensors landed in an uncaptured `unexpected` list). Now warned — surfaces
+  `hrm_loop.memory_reader.role_embed.weight` + the Talker's copy.
+
+**Flagged, NOT auto-fixed (design decisions):**
+- **[#2 moderate/design] The anti-sycophancy loss does not train the trust gate as wired.** Routing
+  is correct (grad reaches the USER trust params) but SGD reduces the loss via the response seed /
+  encoder instead (probe: `trust_proj` grad ≈0.03 vs `response_seed` ≈57), and the *scalar* gate is
+  self-defeating (discounts topic+polarity together). The load-bearing Layer-3 separation is
+  therefore unproven as built. Options and a recommendation (require+log the vector gate; freeze the
+  escape routes; add an explicit trust objective; separate question from premise) in
+  [`antisycophancy_trust_gate_note.md`](antisycophancy_trust_gate_note.md).
+- Low-severity, left as documented heuristics: train/serve latent-rescale delta on `score_tokens`;
+  `acc_norm` numerator/denominator tokenization mismatch; preceding turn → lane regardless of role
+  (adjacent SELF turns); `parse_transcript` drops pre-first-marker text and `SPEAKER:body`
+  (no-space) lines; `_reconcile_role_tables` is a shape-heuristic; `>n_personas` speakers collapse.
+
+Smoke suites re-run on CPU this session (offline, post-fix chunker cache): the Stage-F dialogue smoke
+(`--multi-turn --persona`) and the halt A/B (`train_scaled`, ponder vs supervised, explicit stage
+budgets) both walk a clean A→F — Stages A–C bit-identical across halt modes, the gate diverges only
+at Stage D as designed, `val_loss` falls through the Stage-B boundary with no collapse. The offline
+`train.py` plateau-gated walk is a poor regression harness (no hard step cap; Stage A's autoencoder
+loss keeps creeping down so the plateau gate never fires — it sat in Stage A past step 2250); use
+`train_scaled` with explicit `--stage-steps` for an A→F smoke.
+
 ## Open items before a large run
 
 - **Re-confirm at full scale (~1.2B tokens):** watch `val_loss` at the Stage-B predictor boundary; the

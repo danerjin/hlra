@@ -148,9 +148,19 @@ MMLU-style continuations are the degenerate worst case; LAMBADA/cloze map best.
 ## 9. Honest limits
 
 - **Unvalidated** — smoke-only on synthetic data; no real dialogue run.
+- **Behavioral separation (Layer 3) is not yet trained.** The 2026-07-14 review found the
+  anti-sycophancy loss routes correctly but does not actually move the trust gate — SGD
+  reduces it via the response seed / encoder instead, and the scalar gate is self-defeating
+  (discounts topic + polarity together). Treat "the loss drives `trust(USER)` down" (§3) as
+  an affordance the current loss does *not* reliably train, not as achieved. Options and a
+  recommendation in [`antisycophancy_trust_gate_note.md`](antisycophancy_trust_gate_note.md).
 - **RAG is mechanism-only** — needs retrieval-augmented training data; the Talker
   grounding reader is untrained dead weight until then.
-- **Scalar trust gate discounts a whole slot** (topic + polarity) — the vector gate
-  is the finer tool, still unproven.
 - **Real HF loaders are coded, not run** against an actual dataset.
 - **Multi-party persona** assumes ≤ `n_personas` distinct speakers per conversation.
+
+**2026-07-14 review (4 adversarial audits) — no target leak, no garbage-training, halt gate
+clean.** Fixes landed off the frozen A→E path: Stage-F resume now restores the response
+seed/EMA/optimizer (was silently dropped); lm-eval no longer scores a zero-chunk continuation
+as max-likelihood; `--soft-tags` now warns that it discards the trained discrete `role_embed`.
+Full findings + the deferred low-severity items in `notes.md`.

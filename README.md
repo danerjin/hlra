@@ -135,8 +135,8 @@ doc §1.1.
   6 checks covering the training-mode and eval-mode/monitoring paths — it must end `PASS`).
 - A 2026-07-10 pre-flight review (gradient-routing audit, truncation severance, A→E walk,
   resume equivalence) found the training path clean; see `notes.md` for the three
-  inference/tooling fixes it landed and the items it flagged (notably: fix the input-lane
-  target leak before ever training Stage F on generic documents).
+  inference/tooling fixes it landed and the items it flagged (notably the input-lane
+  target leak on generic documents — **fixed 2026-07-13**, see `notes.md`).
 - A second, comprehensive 2026-07-10 review (full spec+code pass, three independent adversarial
   audits, all invariants re-verified) landed a chunker rewrite (`_cap_span` no longer explodes
   long sentences into one-word chunks or deletes delimiters — **re-prep any cache built before

@@ -55,8 +55,20 @@ from data import (
 TOKENIZER_DIR = os.path.join(PROJECT, "gpt2_tok")
 
 
+def _git_commit():
+    """Best-effort git HEAD of the code that prepped this cache, for provenance.
+    Returns None if git is unavailable or this isn't a checkout (never fatal)."""
+    import subprocess
+    try:
+        out = subprocess.run(["git", "-C", PROJECT, "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() or None if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
 def prepare(text_iter, chunker, model_cfg, out_dir, shard_size, min_chunks,
-            vocab_size, max_examples=None, max_tokens=None):
+            vocab_size, chunker_name, max_examples=None, max_tokens=None):
     # Refuse to prep into a non-empty directory: mixing shards from two prep
     # runs leaves a stale manifest next to a blend of old and new shards, and
     # the load-time consistency check only catches it when the totals differ.
@@ -101,8 +113,16 @@ def prepare(text_iter, chunker, model_cfg, out_dir, shard_size, min_chunks,
             break
     flush()
 
+    from chunker import CHUNKER_VERSION
     manifest = {
         "shards": shard_files, "counts": counts, "total": total, "tokens": tokens,
+        # Freshness stamp (2026-07-13): chunker_version is hard-checked by
+        # data.CachedChunkDataset so a cache built by an older chunker (whose
+        # config dims are IDENTICAL to a fresh cache's) can no longer be trained
+        # by mistake. Bump chunker.CHUNKER_VERSION when the boundary policy changes.
+        "chunker_version": CHUNKER_VERSION,
+        "chunker_name": chunker_name,
+        "prep_commit": _git_commit(),
         "config": {
             "max_chunk_len": model_cfg.max_chunk_len,
             "max_chunks_per_doc": model_cfg.max_chunks_per_doc,
@@ -190,7 +210,7 @@ def main():
     print(f"[data_prep] preset={args.preset} chunker={chunker_name} vocab={vocab_size} out={out_dir} "
           f"chunk_dims=({model_cfg.max_chunk_len},{model_cfg.max_chunks_per_doc},{model_cfg.recent_token_window})")
     prepare(text_iter, chunker, model_cfg, out_dir, data_cfg.shard_size, min_chunks,
-            vocab_size, max_examples=args.docs, max_tokens=args.max_tokens)
+            vocab_size, chunker_name, max_examples=args.docs, max_tokens=args.max_tokens)
 
 
 if __name__ == "__main__":

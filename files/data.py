@@ -295,6 +295,12 @@ def chunk_text_example(text: str, chunker, window: int):
     chunk. Measured 0% overlap on 8k+-char docs. raw_ids/raw_mask are unused
     in Stages A-E -- input lanes are Stage F -- but the cache should not bake
     in a window that violates its own contract.)
+
+    NOTE (2026-07-13 leak fix): this window is the doc's *trailing* tokens, i.e.
+    future chunks, so it is never fed into `forward_self_supervised`'s input lane
+    (that would leak the SSL target -- see model.py's LEAK GUARD). It is retained
+    for cache-format stability and the smoke/bench harnesses; the real Stage-F
+    lane (forward_dialogue) is built from the disjoint user turn, not from here.
     """
     max_chars = getattr(chunker, "max_chunks_per_doc", 0) * getattr(chunker, "max_chunk_len", 0) * 8
     if max_chars and len(text) > max_chars:
@@ -378,6 +384,25 @@ class CachedChunkDataset(Dataset):
                     raise ValueError(
                         f"cache/model mismatch on {k}: cache={cfg.get(k)} model={expect.get(k)}. "
                         f"Rebuild the cache with the matching preset (data_prep.py).")
+        # Freshness stamp (2026-07-13). A cache built by an older chunker has the
+        # SAME config dims as a fresh one (the manifest recorded no chunker
+        # identity), so a stale-cache typo would pass every guard above and train
+        # the big run on pre-fix data. Hard-check the chunker version: a missing
+        # stamp means the cache predates this guard (i.e. an old, suspect chunker,
+        # e.g. the renamed STALE-pre-0711 shakedown cache); a mismatch means the
+        # boundary policy changed since prep. Either way, re-prep. The override is
+        # for the rare deliberate case (a known-good pre-stamp cache) only.
+        from chunker import CHUNKER_VERSION
+        cache_ver = self.manifest.get("chunker_version")
+        if cache_ver != CHUNKER_VERSION and not os.environ.get("LATENT_ALLOW_STALE_CHUNKER"):
+            detail = ("has no chunker_version stamp -- it was prepped before this guard "
+                      "existed (its chunker is unknown and presumed stale)"
+                      if cache_ver is None else
+                      f"was prepped by chunker v{cache_ver}")
+            raise ValueError(
+                f"cache at {cache_dir} {detail}; the current chunker is "
+                f"v{CHUNKER_VERSION}. Re-prep with data_prep.py, or set "
+                f"LATENT_ALLOW_STALE_CHUNKER=1 if you are certain this cache is fine.")
         cts, cms, ris, rms = [], [], [], []
         for shard in self.manifest["shards"]:
             d = torch.load(os.path.join(cache_dir, shard))

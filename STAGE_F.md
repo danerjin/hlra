@@ -23,7 +23,7 @@ analog of SFT prompt-masking. Three separations, enforced at three levels:
 | Layer | What | Where enforced |
 |---|---|---|
 | **1. Structural** | who may write the recurrent belief state | free: the input lane is only ever cross-attention K/V; it has no path to `h_state`/`l_state` (`input_lane.py`) |
-| **2. Informational** | the target must not be visible while predicted | data contract: user turn → lane, assistant turn → target, disjoint strings (`dialogue_data.tensorize_*`) |
+| **2. Informational** | the target must not be visible while predicted | data contract: user turn → lane, assistant turn → target, disjoint strings (`dialogue_data.tensorize_*`). For the *document* predictor (`forward_self_supervised` with lanes on), the raw-token lane is **dropped** — the cached window is the doc's trailing tokens, i.e. future chunks, so it would leak the target; only causal prior-turn (USER/SYSTEM) gestalts may enter. Fixed 2026-07-13. |
 | **3. Behavioral** | "the user asserted X" ≠ "I concluded X" | a **training signal**: `anti_sycophancy_loss` + the trust gate (role tags alone are only an affordance) |
 
 Layer 3 is the load-bearing one — a model can have a perfect structural boundary

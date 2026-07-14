@@ -116,6 +116,13 @@ re-prep or touch the cache dir once the run has started** — the val/train spli
 cache size, and resume hard-fails if it changed (see §7). The **first** prep run downloads the
 `sat-3l-sm` SaT model (needs `wtpsplit`, see §1).
 
+> **Chunker-version guard (2026-07-13).** Each manifest is stamped with
+> `chunker_version` (= `chunker.CHUNKER_VERSION`, currently **3**), and the loader **refuses**
+> any cache whose stamp is missing or mismatched — so a stale pre-0711 cache (whose config
+> dims are identical to a fresh one) can no longer be trained by a `--cache` typo. If you hit
+> `cache ... prepped by chunker vN ... Re-prep`, prep fresh with the current code. Override
+> only for a known-good pre-stamp cache: `LATENT_ALLOW_STALE_CHUNKER=1`.
+
 ```bash
 # tiny timed dry-run first (do NOT skip) -- confirms the SaT download, streaming + chunking work:
 python data_prep.py --dataset HuggingFaceFW/fineweb-edu --name sample-10BT --streaming \
@@ -307,6 +314,7 @@ trends down with no rise at the Stage-B band, and `latent_std` holds/rises.
 | `data_prep` starts a huge download | Missing `--name sample-10BT` or `--streaming` — pass both; delete the partial cache. |
 | `cache/model mismatch` at start | Cache prepped with a different `--preset` than training — match them. |
 | `cache inconsistent: manifest says X but shards hold Y` | Re-prepped into an existing dir — delete the folder and prep fresh. |
+| `cache ... no chunker_version stamp` / `prepped by chunker vN` | Stale cache (older chunker) — re-prep with current code, or `LATENT_ALLOW_STALE_CHUNKER=1` if you're certain it's fine. |
 | OOM at start | Lower `--batch-size`; keep the effective batch with `--grad-accum N`. |
 | `WARNING: non-finite grad norm ... skipping optimizer step` | A NaN/Inf gradient appeared; the trainer skips that step so weights stay finite (one-off spikes are survivable). It hard-fails after 25 consecutive — if that happens, the run is numerically dead: check the last checkpoint, re-run `rocm_smoke.py`, consider a lower LR or no `--amp`. |
 | **`val_loss` rises at Stage B + `ssl`→0 + `lstd` craters** | **Latent collapse.** Lower `--ssl-weight` (from 1.0 toward 0.5) and relaunch from the last healthy `--archive-every` snapshot. Re-tuning at scale is expected. |

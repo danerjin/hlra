@@ -336,7 +336,7 @@ Flagged, deliberately not changed:
 - **The manifest still has no chunker-version/prep-commit stamp** — cache freshness remains
   procedural (the rename above + TRAINING.md's fresh-prep flow). Adding a stamp to
   `data_prep.py`/`data.py` is the right post-run hardening; not worth touching the audited
-  loader right before the run.
+  loader right before the run. **(DONE 2026-07-13 — see below.)**
 - **`ema.update()` still runs on steps skipped by the non-finite guard** — the target takes an
   extra momentum step toward *unchanged* online weights; equivalent to marginally lower
   effective momentum on skip steps, negligible.
@@ -408,6 +408,59 @@ contract, and A→E-byte-identical-when-off all re-verified). Fixes landed:
   discount polarity while keeping topic — use the vector gate).
 Post-fix: all smokes + the lm-eval self-test pass; A→E smokes numerically unchanged.
 
+## Stage-F input-lane SSL-target-leak fix (2026-07-13)
+
+The leak flagged in the 1st/2nd/3rd pre-flight reviews (see the "Stage F would leak the
+SSL target through the input lane" items above) is **fixed**. It lived only in
+`forward_self_supervised` with `use_input_lanes=True` on *generic-document* data:
+`input_lane_kv` was built once from `raw_token_ids` — which `data.chunk_text_example`
+fills with the document's **trailing** tokens (the last kept chunks) — and reused at every
+chunk `t`, so predicting chunk `t+1` could cross-attend to `t+1`'s own tokens through the
+lane. Inert for A→E (lanes off in every A→E stage) and for real dialogue
+(`forward_dialogue`'s lane is the disjoint user turn), but it would have corrupted a
+Stage-F run on plain documents (the `curriculum.py` Stage F path, which the Trainer would
+hit if ever advanced to F on document data).
+
+**Fix (`model.forward_self_supervised`):** the raw-token document lane is dropped. There is
+no causal single-window form — any static document window contains future chunks — and a
+self-supervised document has no external "input turn" to legitimately place in the lane
+(that is `forward_dialogue`'s user turn). The only causally-safe lane content is prior-turn
+aged gestalts (USER/SYSTEM) already in memory, snapshotted before the loop writes any
+current thought. When there are none (the A→E-shaped case: memory holds only SELF) the lane
+stays `None` — **exactly equivalent to `use_input_lanes=False`**, and leak-free.
+
+Verified (CPU, smoke preset): lanes-on document == lanes-off **bit-for-bit** (ssl+ponder
+identical to the last digit); the pre-fix raw lane *did* shift the cosine prediction (~2%),
+so the equality is meaningful, not vacuous; a legitimate prior USER gestalt still enters the
+lane (holding only the aged gestalt, never raw tokens); the offline `train_dialogue.py`
+smoke (`forward_dialogue`, untouched) still runs. The change is guarded entirely inside
+`if stage.use_input_lanes:`, so the A→E path is untouched by construction.
+
+## Cache manifest chunker-version stamp (2026-07-13)
+
+Closes the "no chunker-version stamp" flag from the fifth review. Before this, a cache
+built by an *older* chunker had a manifest byte-indistinguishable from a fresh one (same
+`max_chunk_len/max_chunks_per_doc/recent_token_window/vocab_size`), so a one-word `--cache`
+typo pointing at a stale cache passed every guard and would train the big run on pre-fix
+data — the exact footgun the renamed `chunk_cache_shakedown.STALE-...` cache embodied.
+
+- **`chunker.CHUNKER_VERSION`** (currently `3`) is the source-of-truth version of the
+  chunk-boundary policy; bump it whenever a change makes existing caches stale. History in
+  the constant's comment (1 = original, 2 = 0710 `_cap_span` rewrite, 3 = 0711 fragment
+  merge + char-boundary fallback).
+- **`data_prep.py`** stamps `chunker_version`, `chunker_name`, and a best-effort
+  `prep_commit` (git HEAD) into every manifest.
+- **`data.CachedChunkDataset`** hard-checks `chunker_version` on load: a **missing** stamp
+  (a pre-guard/pre-0711 cache, unknown chunker → presumed stale) or a **mismatch** raises a
+  clear `ValueError` telling you to re-prep. `LATENT_ALLOW_STALE_CHUNKER=1` overrides for a
+  known-good pre-stamp cache.
+
+The guard is universal, so old analysis caches (`wiki_cache`, offline smoke caches built
+before today) will now also demand a re-prep or the override — intended fail-loud behavior.
+Verified: a freshly-prepped offline cache stamps `v3` and loads; a stamp-stripped manifest
+and a `v2` manifest are both refused; the override loads them. A→E training path untouched
+(the check is load-time only, additive).
+
 ## Open items before a large run
 
 - **Re-confirm at full scale (~1.2B tokens):** watch `val_loss` at the Stage-B predictor boundary; the
@@ -424,7 +477,9 @@ Post-fix: all smokes + the lm-eval self-test pass; A→E smokes numerically unch
 - **Re-prep the cache with the post-2026-07-11 chunker** (splitter-fragment merge +
   character-boundary fallback): any cache built earlier — including one built right after the
   2026-07-10 `_cap_span` fix — has the tiny-chunk pathology and, on unicode-heavy docs,
-  corrupted fallback chunks.
+  corrupted fallback chunks. **Now enforced** (2026-07-13): `data.CachedChunkDataset` refuses
+  any cache not stamped `chunker_version == CHUNKER_VERSION` (currently 3), so a stale cache
+  can't be trained by mistake — re-prep, or `LATENT_ALLOW_STALE_CHUNKER=1` to override.
 
 ## Post-run experiments
 

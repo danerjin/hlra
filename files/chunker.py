@@ -37,6 +37,21 @@ from typing import List, Protocol, Sequence
 import torch
 
 
+# Chunking-algorithm version. BUMP THIS whenever the chunk-boundary policy
+# changes in a way that makes an existing cache stale (different chunk contents
+# for the same input). It is stamped into every cache manifest by data_prep.py
+# and hard-checked by data.CachedChunkDataset on load, so a stale cache can no
+# longer masquerade as fresh (its manifest dims are identical to a new cache's --
+# see notes.md, the fifth pre-flight review). History:
+#   1  original _cap_span (split-and-recurse; emitted 1-word fragments, dropped
+#      delimiters) -- pre-2026-07-10.
+#   2  2026-07-10 _cap_span rewrite (delimiter-preserving greedy re-pack).
+#   3  2026-07-11 splitter-fragment merge (min_chunk_tokens) + character-boundary
+#      hard fallback (verbatim, cap-exact, no U+FFFD). This is the current method;
+#      every big-run cache must be prepped at version >= 3.
+CHUNKER_VERSION = 3
+
+
 # ----------------------------------------------------------------------
 # Real method: SaT Capped (Thought Gestalt's actual preprocessing)
 # ----------------------------------------------------------------------

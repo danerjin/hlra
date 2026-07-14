@@ -286,10 +286,27 @@ class LatentThoughtModel(nn.Module):
 
         input_lane_kv, input_lane_mask = None, None
         if stage.use_input_lanes:
+            # LEAK GUARD (§4 SSL-target leak). raw_token_ids is the document's own
+            # trailing window (data.chunk_text_example: the ids of the LAST kept
+            # chunks), so feeding it here would let the loop cross-attend to chunk
+            # t+1's own tokens while predicting t+1 -- the SSL target leaking
+            # through the lane. There is no causal single-window fix: any static
+            # document window contains future chunks. A self-supervised *document*
+            # also has no external "input turn" to legitimately place in the lane
+            # (that is forward_dialogue's user turn, disjoint from the SELF target
+            # by construction). So the raw-token document lane is dropped; the only
+            # causally-safe lane content is prior-turn aged gestalts already in
+            # memory (USER/SYSTEM), snapshotted here before the loop writes any
+            # current-document thought. When there are none (the A->E-shaped
+            # document case: memory holds only SELF), the lane stays None -- exactly
+            # equivalent to use_input_lanes=False, and leak-free.
             aged = memory.filtered_stacked([USER, SYSTEM])
-            aged_mask = (torch.ones(aged.shape[0], aged.shape[1], dtype=torch.bool, device=device)
-                         if aged is not None else None)
-            input_lane_kv, input_lane_mask = self.input_lane(raw_token_ids, raw_mask, aged, aged_mask)
+            if aged is not None:
+                aged_mask = torch.ones(aged.shape[0], aged.shape[1],
+                                       dtype=torch.bool, device=device)
+                no_raw = raw_token_ids[:, :0]        # (batch, 0): no document tokens in the lane
+                no_raw_mask = raw_mask[:, :0]
+                input_lane_kv, input_lane_mask = self.input_lane(no_raw, no_raw_mask, aged, aged_mask)
 
         flat_ids = chunk_tensor.reshape(batch * n_chunks, chunk_len)
         if chunk_vecs is None:

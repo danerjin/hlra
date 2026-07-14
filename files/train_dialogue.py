@@ -47,6 +47,7 @@ from torch.utils.data import DataLoader
 from config import ModelConfig, StageFConfig, model_config, MODEL_PRESETS
 from model import LatentThoughtModel, StageFlags
 from ema_target import EMATargetEncoder
+from losses import trust_prior_loss
 from dialogue import DialogueAdapter
 from dialogue_data import (DialogueSFTCorpus, ContrastiveCorpus, DialogueSFTDataset,
                            ContrastiveDataset, collate_sft, collate_contrastive,
@@ -211,6 +212,9 @@ def main():
     ap.add_argument("--syco-freeze", action="store_true",
                     help="anti-sycophancy: detach the response seed + premise encoder so the "
                          "syco gradient concentrates on the trust gate (review #2, option 2)")
+    ap.add_argument("--trust-prior", action="store_true",
+                    help="explicit provenance prior: a hinge driving trust(USER) below "
+                         "trust(SELF), trained every step (review #2, option 3; needs --trust-gate)")
     ap.add_argument("--content-tags", action="store_true",
                     help="content-condition the soft tags (implies --soft-tags)")
     ap.add_argument("--gestalt-readout", action="store_true",
@@ -291,6 +295,15 @@ def main():
         print("[train_dialogue] --syco-freeze ON: response seed + premise encoder "
               "detached for the contrastive term (loop transitions still carry "
               "grad; full gate isolation needs a loop change).", flush=True)
+    if args.trust_prior and not cfg.trust_gate:
+        raise SystemExit("--trust-prior needs a trust gate to regularize; add --trust-gate "
+                         "(and --vector-gate for the polarity-subspace form).")
+    if args.trust_prior:
+        print(f"[train_dialogue] --trust-prior ON: hinge driving trust(USER) at least "
+              f"{sf.trust_prior_margin} below trust(SELF) but not below floor "
+              f"{sf.trust_prior_floor}, weight {sf.trust_prior_weight}, trained every step "
+              f"(review #2, option 3 -- a first-class provenance signal, not the "
+              f"emergent one).", flush=True)
 
     chunker = build_chunker(cfg, args.offline)
     if args.hf_chat or args.hf_transcript:
@@ -402,6 +415,19 @@ def main():
                 loss = loss + sf.syco_weight * syco
                 syco_val = float(syco)
 
+            # Explicit provenance prior (review #2, option 3): a first-class hinge
+            # driving trust(USER) below trust(SELF), trained EVERY step (cheap --
+            # role-prior only) so the gate gets a direct signal instead of the
+            # emergent-but-tiny one from the contrastive loss.
+            tp_val = None
+            if args.trust_prior:
+                trust = model.hrm_loop.memory_reader.trust_by_role(len(cfg.role_tags), device)
+                tp = trust_prior_loss(trust, cfg.role_tags.index("USER"),
+                                      cfg.role_tags.index("SELF"), margin=sf.trust_prior_margin,
+                                      floor=sf.trust_prior_floor)
+                loss = loss + sf.trust_prior_weight * tp
+                tp_val = float(tp)
+
             loss.backward()
             total_norm = torch.nn.utils.clip_grad_norm_(
                 list(model.parameters()) + list(adapter.parameters()), sf.grad_clip)
@@ -425,7 +451,8 @@ def main():
                 msg = (f"[step {step}] nll={float(nll):.4f} cos={float(dlg['cos']):.4f} "
                        f"gen={float(dlg['gen']):.4f} var={float(dlg['var']):.4f} "
                        f"ponder={float(dlg['ponder']):.4f}"
-                       + (f" syco={syco_val:.4f}" if syco_val is not None else ""))
+                       + (f" syco={syco_val:.4f}" if syco_val is not None else "")
+                       + (f" tprior={tp_val:.4f}" if tp_val is not None else ""))
                 # Watch trust(USER) fall relative to trust(SELF) as anti-sycophancy trains.
                 reader = model.hrm_loop.memory_reader
                 trust = reader.trust_by_role(len(cfg.role_tags), device)

@@ -139,3 +139,38 @@ def variance_regularization(z: torch.Tensor, target_std: float = 0.1, eps: float
         return torch.zeros((), device=z.device)
     std = torch.sqrt(z.var(dim=0, unbiased=False) + eps)      # (d,)
     return torch.clamp(target_std - std, min=0.0).mean()
+
+
+def trust_prior_loss(trust_by_role: torch.Tensor, user_idx: int, self_idx: int,
+                     margin: float = 0.1, floor: float = 0.2) -> torch.Tensor:
+    """
+    Explicit provenance prior on the trust gate (review #2, option 3). The
+    anti-sycophancy loss is *supposed* to drive trust(USER) down, but as an
+    emergent signal it barely reaches the gate (SGD prefers the response
+    seed/encoder; see antisycophancy_trust_gate_note.md). This makes "distrust a
+    user assertion more than your own conclusion" a FIRST-CLASS objective: a
+    one-sided hinge that pushes trust(USER) at least `margin` below trust(SELF).
+
+    `trust_by_role`: the per-role trust scalars, (n_roles,), from
+    `reader.trust_by_role(...)` (the mean over dims for the vector gate), kept
+    IN-GRAPH so this trains `trust_proj` directly. Relative, not absolute: it
+    anchors to the model's own SELF trust (which the SFT read keeps high), so it
+    encodes a prior ("trust yourself more than the user") without dictating an
+    arbitrary absolute level. `margin` is how much less USER is trusted -- a floor
+    on the GAP, not a target, so it does not keep pushing once the gap is met.
+
+    `floor` is the lower-floor SAFETY: the gap hinge is one-sided (no restoring
+    force), so a too-strong prior can crush trust(USER) toward ~0 -- a fully
+    zeroed slot means the loop cannot read the user's assertion AT ALL, past the
+    intended "attend but discount." A second hinge keeps trust(USER) >= `floor`
+    so the slot stays noticeable. Set floor=0.0 for the pure note version.
+    Returns a scalar. (For the vector gate this regularizes the per-role MEAN;
+    combined with the anti-sycophancy + topic-preservation pressure the optimizer
+    tends to lower a polarity SUBSPACE rather than uniformly -- a subspace-targeted
+    prior is the finer, unimplemented refinement.)
+    """
+    trust_user = trust_by_role[user_idx]
+    gap = trust_by_role[self_idx] - trust_user               # want gap >= margin
+    below = torch.clamp(margin - gap, min=0.0)               # push USER margin below SELF
+    collapse = torch.clamp(floor - trust_user, min=0.0)      # but keep USER >= floor (noticeable)
+    return below + collapse

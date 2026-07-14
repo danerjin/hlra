@@ -303,6 +303,9 @@ class StageFConfig:
     syco_weight: float = 0.5
     syco_agree_weight: float = 1.0
     syco_every: int = 4               # run a contrastive step every N dialogue steps (0 = off)
+    trust_prior_weight: float = 0.1   # explicit provenance prior on the gate (review #2 opt.3); used only when --trust-prior is passed
+    trust_prior_margin: float = 0.1   # push trust(USER) at least this far below trust(SELF)
+    trust_prior_floor: float = 0.2    # ...but keep trust(USER) >= this so the slot stays noticeable (0 = pure hinge)
     log_every: int = 50
     checkpoint_every: int = 500
     seed: int = 0

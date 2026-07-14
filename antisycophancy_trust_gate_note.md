@@ -1,10 +1,30 @@
 # Design note — the anti-sycophancy loss does not train the trust gate as wired
 
-**Status:** open design decision, flagged by the 2026-07-14 Stage-F review (finding #2).
-Nothing here is a coding bug — the objective is non-vacuous and the gradient *reaches*
-the trust-gate parameters. The problem is that gradient descent has no reason to *use*
-them, so the load-bearing behavioral separation (STAGE_F.md §1, "Layer 3 is the
-load-bearing one") is unproven as built. Decide before spending a real Stage-F run on it.
+**Status:** flagged by the 2026-07-14 Stage-F review (finding #2). Nothing here is a
+coding bug — the objective is non-vacuous and the gradient *reaches* the trust-gate
+parameters. The problem is that gradient descent has no reason to *use* them, so the
+load-bearing behavioral separation (STAGE_F.md §1, "Layer 3 is the load-bearing one") is
+unproven as built.
+
+**Implemented (2026-07-14, all opt-in, off = byte-identical A→E/Stage-F):** options 1–3
+below are now code, meant to be run as an escalating A/B on the box — nothing here is
+*validated*, only wired and smoke-checked.
+- **#1 measurement** — `train_dialogue` warns when the syco loss runs without a gate or
+  with only a scalar gate, and logs `trust(USER)` mean + across-dim `min/std` (vector
+  gate) so the gate's movement is observable. *(commit 54857966)*
+- **#2 freeze escape routes** — `--syco-freeze` detaches the response seed + premise
+  encoder for the contrastive term (probe: seed grad 59→0, encoder 6→0, trust gate stays
+  live; the loop's H-transition still carries ~14.6 — full isolation still needs the
+  loop change in §4). *(commit fbdc406e)*
+- **#3 explicit prior** — `--trust-prior`: a hinge driving `trust(USER)` a `margin` below
+  `trust(SELF)`, trained every step, **plus a lower-floor safety** (`trust_prior_floor`,
+  default 0.2). The floor exists because the one-sided hinge has no restoring force: a
+  probe at aggressive lr crushed `trust(USER)` to ~0.001 (a fully-zeroed slot the loop
+  can't read at all); with the floor it settles at ~0.259. *(commit 31829523)*
+
+Still unbuilt: the H-transition isolation (§4 option 2's "optionally") and option 4
+(separate question from premise in the data). Run #1→#2→#3 and read `trust(USER)` before
+reaching for those.
 
 ---
 

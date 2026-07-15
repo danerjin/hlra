@@ -352,7 +352,10 @@ class TrainConfig:
     # this weight where the old linear SSL flirted with collapse. RE-TUNE at scale.)
     ssl_loss_weight: float = 1.0              # weight on the on-loop SSL cosine prediction term
     ssl_var_weight: float = 2.0              # weight on the anti-collapse variance regularizer
-    log_every: int = 10
+    log_every: int = 10                       # full metric line (runs eval -> val_loss; feeds metrics.json/curves)
+    heartbeat_every: int = 0                  # cheap "[step N] stage=X" liveness ping every N steps, NO eval/metrics;
+                                              # 0 = off. Decoupled from log_every so slow GPUs still show progress
+                                              # between the (expensive) metric lines. Does not touch metrics.json.
     device: str = "cpu"
     seed: int = 0
 

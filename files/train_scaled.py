@@ -57,6 +57,9 @@ def main():
     ap.add_argument("--amp-dtype", default="bf16", choices=["bf16", "fp16"])
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--log-every", type=int, default=50)
+    ap.add_argument("--heartbeat-every", type=int, default=10,
+                    help="cheap '[step N] stage=X (heartbeat)' liveness ping every N steps (no eval/metrics); "
+                         "0 = off. Lets you see progress between the pricier --log-every metric lines.")
     ap.add_argument("--checkpoint-every", type=int, default=500)
     ap.add_argument("--archive-every", type=int, default=0,
                     help="also keep a numbered checkpoint_{step}.pt every N steps "
@@ -124,6 +127,7 @@ def main():
         batch_size=args.batch_size, lr=args.lr, device=device,
         grad_accum_steps=args.grad_accum, amp=args.amp, amp_dtype=args.amp_dtype,
         num_workers=args.num_workers, log_every=args.log_every,
+        heartbeat_every=args.heartbeat_every,
         checkpoint_every=args.checkpoint_every,
         checkpoint_archive_every=args.archive_every,
         warmup_steps=max(100, total_steps // 50), total_steps=total_steps,

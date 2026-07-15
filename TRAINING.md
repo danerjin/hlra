@@ -112,6 +112,11 @@ compile). If the first-step line hasn't printed but `cat /sys/class/drm/card*/de
 reads `100`, it's compiling — **wait, don't restart**. (A ~45-min first step means you
 forgot `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` and it's on the slow math attention.)
 
+Once live you'll see a cheap **`[step N] stage=X … (heartbeat)`** ping every **10 steps**
+(default `--heartbeat-every 10`; no eval, so it's basically free) plus the full metric
+line with `val_loss` every `--log-every` (50). The heartbeat is liveness-only and does
+**not** feed `metrics.json` — the loss curves still come from the `--log-every` lines.
+
 ### 4.2 How much time is left?
 **During prep** — reads the live token count from the log (never hardcode it), assumes the 1.2 B target:
 ```bash

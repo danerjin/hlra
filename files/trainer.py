@@ -305,6 +305,13 @@ class Trainer:
                 self._emit(f"[trainer] first optimizer step done in {time.time() - _loop_t0:.0f}s "
                            f"-- training is LIVE (next log at step {self.train_cfg.log_every}).")
                 _first_step_logged = True
+            # Cheap liveness heartbeat: just step/stage/lr, NO eval pass. Skipped on
+            # steps that already print the full metric line below, so no double log.
+            hb = self.train_cfg.heartbeat_every
+            if (hb and self.global_step % hb == 0
+                    and not (self.train_cfg.log_every and self.global_step % self.train_cfg.log_every == 0)):
+                self._emit(f"[step {self.global_step}/{max_steps}] stage={self.curriculum.stage.name} "
+                           f"lr={lr:.2e} (heartbeat)")
             if self._bar is not None:
                 self._bar.update(1)
                 self._bar.set_postfix(stage=self.curriculum.stage.name, lr=f"{lr:.1e}",

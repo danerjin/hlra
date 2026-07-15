@@ -195,42 +195,55 @@ stage budget, and launches the real run — all `nohup`'d, all logged to
 `pipeline.log`. Paste while prep is still running:
 
 ```bash
+A nohup'd script does NOT inherit an un-activated shell, so it must not rely on
+bare `python` — it would fall back to whatever interpreter is on the default PATH
+(often a torch-less base python). The robust fix is to reuse **the exact interpreter
+prep is running**, which is proven to have the working gfx1151 torch — whether that's
+a venv or a system-wide install. Note `readlink /proc/PID/exe` alone is NOT enough: a
+venv's `python` symlinks to the base interpreter, so it resolves to e.g.
+`/usr/bin/python3.10` even inside a venv. Check `VIRTUAL_ENV` too (below).
+
+```bash
 cat > ~/run_pipeline.sh <<'EOF'
 #!/bin/bash
-source ~/hlra/.venv-rocm/bin/activate   # run in the torch venv -- a nohup'd script does NOT
-                                        # inherit an un-activated shell, so activate explicitly
-                                        # or training launches under the wrong (torch-less) python
+PY="__PY__"                              # the exact interpreter prep used (has the working gfx1151 torch)
 export LATENT_MANUAL_LAYERNORM=1
 PREP_PID="$1"
 cd ~/hlra/files
 log(){ echo "[$(date '+%F %T')] $*"; }
-log "STATUS: venv=$VIRTUAL_ENV python=$(which python)"   # confirm the right interpreter in pipeline.log
+log "STATUS: python=$PY torch=$("$PY" -c 'import torch;print(torch.__version__, torch.cuda.is_available())' 2>&1)"
 log "STATUS: waiting for prep (PID $PREP_PID)..."
 while kill -0 "$PREP_PID" 2>/dev/null; do sleep 60; done
 if [ ! -f ~/hlra/chunk_cache/manifest.json ]; then
   log "STATUS: ABORTED — prep died without manifest.json (half cache). NOT training. See prep.log."; exit 1
 fi
-EX=$(python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/hlra/chunk_cache/manifest.json')))['total'])")
+EX=$("$PY" -c "import json,os;print(json.load(open(os.path.expanduser('~/hlra/chunk_cache/manifest.json')))['total'])")
 log "STATUS: prep finished — $EX examples"
 BATCH=32
-STAGE_STEPS=$(python3 -c "u=max(1,($EX//$BATCH)//6);print(f'{u},{u},{u},{u},{2*u},0')")
+STAGE_STEPS=$("$PY" -c "u=max(1,($EX//$BATCH)//6);print(f'{u},{u},{u},{u},{2*u},0')")
 log "STATUS: launching training — BATCH=$BATCH STAGE_STEPS=$STAGE_STEPS"
-python train_scaled.py --preset small-w3 --cache chunk_cache --device cuda --amp --amp-dtype bf16 \
+"$PY" train_scaled.py --preset small-w3 --cache chunk_cache --device cuda --amp --amp-dtype bf16 \
   --batch-size "$BATCH" --stage-steps "$STAGE_STEPS" --var-weight 3.0 --lr-schedule per-stage \
   --num-workers 8 --log-every 50 --checkpoint-every 1000 --archive-every 5000 --out runs/scaled
 log "STATUS: train_scaled.py exited (rc=$?)"
 EOF
-chmod +x ~/run_pipeline.sh
+# resolve the SAME interpreter prep runs under -- venv-aware (a bare readlink of
+# /proc/exe resolves a venv's python symlink to the base interpreter, so also read
+# VIRTUAL_ENV); works for a venv OR a system-wide torch install:
 PREP_PID=$(pgrep -f 'data_prep.py' | head -1)
+PREP_VENV=$(tr '\0' '\n' < /proc/$PREP_PID/environ | sed -n 's/^VIRTUAL_ENV=//p')
+if [ -n "$PREP_VENV" ]; then PY="$PREP_VENV/bin/python"; else PY=$(readlink -f /proc/$PREP_PID/exe); fi
+sed -i "s|__PY__|$PY|" ~/run_pipeline.sh
+chmod +x ~/run_pipeline.sh
 nohup ~/run_pipeline.sh "$PREP_PID" > ~/hlra/files/pipeline.log 2>&1 &
-echo "QUEUED (prep PID=$PREP_PID). Read anytime: tail -f ~/hlra/files/pipeline.log"
-head -2 ~/hlra/files/pipeline.log   # verify: venv=.../.venv-rocm  python=.../.venv-rocm/bin/python
+echo "QUEUED (prep PID=$PREP_PID, python=$PY). Read anytime: tail -f ~/hlra/files/pipeline.log"
+sleep 2; head -2 ~/hlra/files/pipeline.log   # verify: python=<path> torch=<ver> True
 ```
 
-**Already queued a watcher without the `source` line?** Editing the file won't fix the
-running one (it launched with its own environment). Kill and re-queue against the
-still-running prep: `pkill -f run_pipeline.sh`, re-paste the block above, done — prep is
-a separate process and keeps going. Confirm which venv a live watcher holds with:
+**Already queued a watcher without this?** Editing the file won't fix the running one
+(it launched with its own environment). Kill and re-queue against the still-running
+prep: `pkill -f run_pipeline.sh`, then re-paste the block above — prep is a separate
+process and keeps going. Confirm what a live watcher holds with:
 `tr '\0' '\n' < /proc/"$(pgrep -f run_pipeline.sh | head -1)"/environ | grep -E '^(VIRTUAL_ENV|PATH)='`.
 
 **To launch training manually instead** (cache already prepped): compute the budget

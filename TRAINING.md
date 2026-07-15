@@ -1,5 +1,9 @@
 # TRAINING.md — quickstart for the A→E run
 
+> **Just want it to run?** [`training_easy.md`](training_easy.md) is the two-paste
+> version — one command to verify the box, one command for the whole prep→train
+> pipeline. Come back here for the *why*, the flags, and monitoring.
+
 The **no-brainer path** to a trained model. Copy-paste, top to bottom.
 
 - **On a Strix Halo / gfx1151 box** (the reference setup): follow the complete

@@ -95,6 +95,12 @@ def prepare(text_iter, chunker, model_cfg, out_dir, shard_size, min_chunks,
         shard_files.append(name); counts.append(len(buf))
         shard_idx += 1
         buf.clear()
+        # GPU-SaT (build_sat_chunker moves SaT to cuda) grows a cached allocator
+        # pool on the unified-memory GTT over a long prep; on Strix Halo that pool
+        # eventually competes with system RAM and the run slows to a crawl (~0.7
+        # tok/s). Return it each shard so throughput stays flat.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     for text in text_iter:
         ex = chunk_text_example(text, chunker, window)
@@ -167,6 +173,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=None)
     ap.add_argument("--min-chunks", type=int, default=None)
     args = ap.parse_args()
+    torch.set_grad_enabled(False)   # prep is inference-only (SaT + chunking); no autograd to accumulate
 
     if args.mixture and args.max_tokens is None and args.docs is None:
         raise SystemExit("--mixture needs a cap: pass --max-tokens (the run's token budget) or "

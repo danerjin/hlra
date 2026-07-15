@@ -18,7 +18,9 @@ Paths below assume the repo is at `~/hlra`; adjust if yours differs.
 ```
 1. groups: render + video          (admin, one-time)
 2. pip install torch  from AMD's gfx1151 index  (--no-cache-dir)   — NO HSA_OVERRIDE
-3. export LATENT_MANUAL_LAYERNORM=1                                 — broken LN-backward kernel
+3. export LATENT_MANUAL_LAYERNORM=1  +  TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+       (LN-backward kernel workaround  +  flash attention: without it the first TRAIN step
+        JIT-compiles a math fallback for ~45 min and looks hung)
 4. rocm_smoke.py  -> PASS
 5. data: SaT on GPU + get the parquet on-box (HF Xet 403 escape) + data_prep --local-glob
 6. queue training to auto-start after prep
@@ -26,7 +28,8 @@ Paths below assume the repo is at `~/hlra`; adjust if yours differs.
 
 Three env vars you will keep set (put in `~/.bashrc`):
 ```bash
-echo 'export LATENT_MANUAL_LAYERNORM=1' >> ~/.bashrc   # broken LayerNorm-backward kernel (step 3)
+echo 'export LATENT_MANUAL_LAYERNORM=1' >> ~/.bashrc              # broken LayerNorm-backward kernel (step 3)
+echo 'export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1' >> ~/.bashrc  # flash attention: else first train step ~45min on math fallback
 # (no HSA_OVERRIDE_GFX_VERSION with a native gfx1151 wheel — it BREAKS kernel launch)
 ```
 
@@ -208,6 +211,7 @@ cat > ~/run_pipeline.sh <<'EOF'
 #!/bin/bash
 PY="__PY__"                              # the exact interpreter prep used (has the working gfx1151 torch)
 export LATENT_MANUAL_LAYERNORM=1
+export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1   # flash attention (else first step ~45min on math fallback)
 PREP_PID="$1"
 cd ~/hlra/files
 log(){ echo "[$(date '+%F %T')] $*"; }
@@ -224,7 +228,7 @@ STAGE_STEPS=$("$PY" -c "u=max(1,($EX//$BATCH)//6);print(f'{u},{u},{u},{u},{2*u},
 log "STATUS: launching training — BATCH=$BATCH STAGE_STEPS=$STAGE_STEPS"
 "$PY" train_scaled.py --preset small-w3 --cache chunk_cache --device cuda --amp --amp-dtype bf16 \
   --batch-size "$BATCH" --stage-steps "$STAGE_STEPS" --var-weight 3.0 --lr-schedule per-stage \
-  --num-workers 8 --log-every 50 --checkpoint-every 1000 --archive-every 5000 --out runs/scaled
+  --num-workers 2 --log-every 50 --checkpoint-every 1000 --archive-every 5000 --out runs/scaled
 log "STATUS: train_scaled.py exited (rc=$?)"
 EOF
 # resolve the SAME interpreter prep runs under -- venv-aware (a bare readlink of
@@ -247,14 +251,15 @@ process and keeps going. Confirm what a live watcher holds with:
 `tr '\0' '\n' < /proc/"$(pgrep -f run_pipeline.sh | head -1)"/environ | grep -E '^(VIRTUAL_ENV|PATH)='`.
 
 **To launch training manually instead** (cache already prepped): compute the budget
-and run — remember the box-specifics **`LATENT_MANUAL_LAYERNORM=1`, `--preset
-small-w3`, `--var-weight 3.0`, batch 32**:
+and run — remember the box-specifics **`LATENT_MANUAL_LAYERNORM=1`,
+`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`, `--preset small-w3`, `--var-weight 3.0`,
+batch 32**:
 ```bash
-cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 && export BATCH=32
+cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 && export BATCH=32
 export STAGE_STEPS=$(python3 -c "import json,os;m=json.load(open(os.path.expanduser('~/hlra/chunk_cache/manifest.json')));print(','.join([str(max(1,(m['total']//$BATCH)//6))]*4+[str(2*max(1,(m['total']//$BATCH)//6)),'0']))")
 nohup python train_scaled.py --preset small-w3 --cache chunk_cache --device cuda --amp --amp-dtype bf16 \
   --batch-size "$BATCH" --stage-steps "$STAGE_STEPS" --var-weight 3.0 --lr-schedule per-stage \
-  --num-workers 8 --log-every 50 --checkpoint-every 1000 --archive-every 5000 --out runs/scaled > train.log 2>&1 &
+  --num-workers 2 --log-every 50 --checkpoint-every 1000 --archive-every 5000 --out runs/scaled > train.log 2>&1 &
 ```
 
 ---
@@ -306,7 +311,9 @@ daniel@<box>:~/hlra/runs/scaled/model.pt <local>`.
 | `cuda? False`, `hipErrorNoDevice` | not in `render`/`video` groups → admin `usermod -aG render,video`, re-login (§1a). |
 | `invalid device function` / `no kernel image` (matmul) | wheel lacks gfx1151 kernels, or you set `HSA_OVERRIDE` → use the gfx1151 wheel, **no override** (§1). |
 | `rocm_smoke.py [3] grads finite: False` (nondeterministic LN params) | broken `native_layer_norm_backward` → **`LATENT_MANUAL_LAYERNORM=1`** (§2). |
-| `amdgpu.ids: No such file` / experimental-SDPA warnings | cosmetic → **ignore** (§1c). |
+| **First TRAIN step takes ~45 min**, GPU pinned at 100%, no `[step 50]`, last log line is the `scaled_dot_product_attention` warning | flash attention is off → SDPA fell back to the slow math backend, whose first step JIT-compiles forever → **`export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`** (validate with `rocm_smoke.py` → PASS; it's numerically exact). The cache load itself is only seconds (`[data] LOADED … in ~3s`). |
+| The `scaled_dot_product_attention` **warning text** itself | cosmetic → **ignore** (the *warning* is harmless; the slow *math fallback* it implies is the row above). |
+| `amdgpu.ids: No such file` | cosmetic → **ignore** (§1c). |
 | `403 Forbidden … cas-bridge.xethub.hf.co`, "Reconstructing…" hangs | HF **Xet** CDN blocked; `HF_HUB_DISABLE_XET` is ignored → download elsewhere + `rsync` + `--local-glob`, or `pip uninstall hf_xet`, or a non-Xet corpus (§5b). |
 | `huggingface-cli … deprecated and no longer works` | use **`hf`** (`hf download`, `hf auth login`). |
 | `--local-glob` hangs after `Loading weights` | (old code) `load_dataset` hub check → `git pull` (pyarrow reader), or `HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1` (§5c). |

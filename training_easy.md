@@ -34,6 +34,7 @@ set -eo pipefail
 cd ~/hlra/files
 source ~/hlra/.venv-rocm/bin/activate          # <-- edit if your venv path differs
 export LATENT_MANUAL_LAYERNORM=1               # gfx1151 LayerNorm-backward workaround
+export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1   # gfx1151 fast (flash) attention -- WITHOUT it the math fallback makes the first step take ~45 min
 
 read -rp "Model size to smoke [small-w3] (small-w3 base-w3 large-w3 xl-w3 …): " PRESET </dev/tty || true
 PRESET=${PRESET:-small-w3}
@@ -104,6 +105,7 @@ STAGEF_BATCH=8
 echo "preset=$PRESET batch=$BATCH  stage-F=$RUN_STAGE_F ($HF_CHAT)"
 
 export LATENT_MANUAL_LAYERNORM=1
+export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1   # fast attention (see note under the block)
 
 # 1) launch prep (background, survives logout):
 nohup python data_prep.py "${PREP_ARGS[@]}" --preset "$PRESET" --max-tokens "$MAX_TOKENS" \
@@ -117,6 +119,7 @@ cat > ~/run_pipeline.sh <<'WATCHER'
 PY="__PY__"; BATCH="__BATCH__"; PRESET="__PRESET__"
 RUN_STAGE_F="__RUN_STAGE_F__"; HF_CHAT="__HF_CHAT__"; SPLIT="__SPLIT__"; STAGEF_STEPS="__STAGEF_STEPS__"; STAGEF_BATCH="__STAGEF_BATCH__"
 export LATENT_MANUAL_LAYERNORM=1
+export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
 PREP_PID="$1"
 cd ~/hlra/files
 log(){ echo "[$(date '+%F %T')] $*"; }
@@ -132,7 +135,7 @@ STAGE_STEPS=$("$PY" -c "u=max(1,($EX//$BATCH)//6);print(f'{u},{u},{u},{u},{2*u},
 log "STATUS: prep done — $EX examples; launching A→E training BATCH=$BATCH STAGE_STEPS=$STAGE_STEPS"
 "$PY" train_scaled.py --preset "$PRESET" --cache chunk_cache --device cuda --amp --amp-dtype bf16 \
   --batch-size "$BATCH" --stage-steps "$STAGE_STEPS" --var-weight 3.0 --lr-schedule per-stage \
-  --num-workers 8 --log-every 50 --checkpoint-every 1000 --archive-every 5000 --out runs/scaled
+  --num-workers 2 --log-every 50 --checkpoint-every 1000 --archive-every 5000 --out runs/scaled
 RC=$?
 log "STATUS: train_scaled.py exited (rc=$RC) -> runs/scaled/model.pt"
 # --- auto-chain Stage-F, but ONLY if A→E exited cleanly (a crash must not fine-tune junk) ---
@@ -167,6 +170,20 @@ right venv. **Now you can disconnect SSH.** Output → `pipeline.log`. Results:
 `runs/scaled/model.pt` (foundation) and, if `RUN_STAGE_F=1`, `runs/dialogue/model.pt`
 (chatbot) — separate files.
 
+> **Two gfx1151 must-knows baked into the blocks above:**
+> - **`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`** turns on flash attention. Without
+>   it, ROCm falls back to a math-backend attention whose first step JIT-compiles for
+>   **~45 minutes** and looks hung. Flash attention is numerically exact (the preflight's
+>   `rocm_smoke` PASS validates it) and makes the first step ~minutes. `--num-workers 2`
+>   (not 8) because the cache is already fully in RAM — extra workers just fork a
+>   multi-GB process for nothing.
+> - **Healthy startup** in the log looks like: `[data] LOADING cache … 356 shards` →
+>   `[data] LOADED … in ~3s (cache ready)` → `[trainer] training loop starting …` →
+>   `[trainer] first optimizer step done in Xs -- LIVE` → `[step 50] stage=A …`. The
+>   cache load is seconds; only the **first optimizer step** takes minutes (kernel
+>   compile). If GPU (`cat /sys/class/drm/card*/device/gpu_busy_percent`) reads 100 and
+>   the first-step line hasn't printed yet, it's compiling — wait, don't restart.
+
 ---
 
 ## ③ Stage-F standalone — fine-tune off an existing foundation (one paste)
@@ -189,6 +206,7 @@ bash <<'STAGEF'
 cd ~/hlra/files
 source ~/hlra/.venv-rocm/bin/activate
 export LATENT_MANUAL_LAYERNORM=1
+export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1   # fast attention (gfx1151)
 
 #==================== CONFIG — edit these ====================
 FOUNDATION=runs/scaled/model.pt          # finished A→E model (loaded READ-ONLY; config inherited)

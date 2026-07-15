@@ -35,8 +35,11 @@ export PROJECT=~/hlra                      # repo root; edit to yours
 cd "$PROJECT" && source .venv-rocm/bin/activate   # or your torch env
 pip install -r training.txt                # datasets transformers wtpsplit tqdm matplotlib pyarrow
 cd "$PROJECT/files"
-# GPU sanity (must PASS; ROCm/gfx1151: prepend LATENT_MANUAL_LAYERNORM=1 -- see STRIX_HALO.md §2):
-python rocm_smoke.py --preset small-w3
+# GPU sanity (must PASS). ROCm/gfx1151: prepend BOTH env vars --
+#   LATENT_MANUAL_LAYERNORM=1                 (LN-backward kernel workaround, see STRIX_HALO.md §2)
+#   TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 (flash attention; without it the first TRAIN step
+#                                              JIT-compiles the math fallback for ~45 min)
+LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 python rocm_smoke.py --preset small-w3
 ```
 
 ## 2. Data → chunk cache (one-time)
@@ -81,12 +84,15 @@ rm -rf "$PROJECT/runs/scaled_sanity"
 # real run (background, survives disconnect):
 nohup python train_scaled.py --preset small-w3 --cache chunk_cache --device cuda --amp --amp-dtype bf16 \
   --batch-size "$BATCH" --stage-steps "$STAGE_STEPS" --var-weight 3.0 --lr-schedule per-stage \
-  --num-workers 8 --log-every 50 --checkpoint-every 1000 --archive-every 5000 \
+  --num-workers 2 --log-every 50 --checkpoint-every 1000 --archive-every 5000 \
   --out runs/scaled > train.log 2>&1 &
 tail -f train.log
 ```
-On ROCm/gfx1151 prepend `LATENT_MANUAL_LAYERNORM=1` and use the auto-start queue in
-[`STRIX_HALO.md`](STRIX_HALO.md) §6.
+On ROCm/gfx1151 **export both** `LATENT_MANUAL_LAYERNORM=1` and
+`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` (the latter enables flash attention —
+without it the first step JIT-compiles the math fallback for ~45 min), and use the
+auto-start queue in [`STRIX_HALO.md`](STRIX_HALO.md) §6. `--num-workers 2` (not 8) — the
+cache loads fully into RAM, so extra workers only fork a multi-GB process for nothing.
 
 ## 4. Monitor
 
@@ -98,6 +104,13 @@ pgrep -af 'data_prep|train_scaled' || echo "NOT RUNNING"
 grep -m1 "manual LayerNorm active" train.log   # ROCm/gfx1151: MUST print once, else the run is corrupt -> kill & relaunch with LATENT_MANUAL_LAYERNORM=1
 ls -l --time-style=+%H:%M runs/scaled/checkpoint.pt   # mtime should keep advancing (proof it's still writing)
 ```
+**Healthy startup** (flushed markers, in order): `[data] LOADING cache … 356 shards` →
+`[data] LOADED … in ~3s (cache ready)` → `[trainer] training loop starting …` →
+`[trainer] first optimizer step done in Xs -- LIVE` → `[step 50] stage=A …`. The cache
+load is **seconds**; only the **first optimizer step** takes minutes (GPU kernel
+compile). If the first-step line hasn't printed but `cat /sys/class/drm/card*/device/gpu_busy_percent`
+reads `100`, it's compiling — **wait, don't restart**. (A ~45-min first step means you
+forgot `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` and it's on the slow math attention.)
 
 ### 4.2 How much time is left?
 **During prep** — reads the live token count from the log (never hardcode it), assumes the 1.2 B target:
@@ -156,7 +169,7 @@ carries the `small-w3` config, so Stage F inherits it — **don't pass `--preset
 
 ### 6.1 Offline smoke (plumbing check — no ckpt, no downloads, ~1 min)
 ```bash
-cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1
+cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
 python train_dialogue.py --offline --preset small-w3 --multi-turn --persona \
   --steps 20 --batch-size 2 --out runs/dlg_sanity && rm -rf ~/hlra/runs/dlg_sanity
 ```
@@ -167,7 +180,7 @@ real fine-tune below loads the trained one via `--ckpt`).
 The foundation (`runs/scaled/model.pt`) is loaded **read-only**; Stage-F writes to a
 **separate** `--out runs/dialogue` — it never overwrites the A→E checkpoint.
 ```bash
-cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1
+cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
 nohup python train_dialogue.py --ckpt runs/scaled/model.pt \
   --hf-chat HuggingFaceH4/no_robots --split train \
   --multi-turn --soft-tags --content-tags --trust-gate --vector-gate --persona --gestalt-readout \
@@ -218,7 +231,7 @@ setup (install, LayerNorm workaround, Xet-escape) lives in
 ```bash
 source ~/hlra/.venv-rocm/bin/activate
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"   # -> ...rocm... True
-cd ~/hlra/files && LATENT_MANUAL_LAYERNORM=1 python rocm_smoke.py --preset small-w3   # must end PASS
+cd ~/hlra/files && LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 python rocm_smoke.py --preset small-w3   # must end PASS
 ```
 
 ### 7.2 Prep the chunk cache (the command that ran)

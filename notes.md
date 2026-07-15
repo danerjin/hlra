@@ -596,6 +596,72 @@ at Stage D as designed, `val_loss` falls through the Stage-B boundary with no co
 loss keeps creeping down so the plateau gate never fires — it sat in Stage A past step 2250); use
 `train_scaled` with explicit `--stage-steps` for an A→F smoke.
 
+## Modern-architecture upgrades — opt-in, default-off byte-identical (2026-07-14)
+
+Brought the transformer stack up to the current decoder-only conventions (RMSNorm, RoPE, QK-norm,
+SwiGLU, GQA) as **opt-in flags that all default to the exact legacy path**, so the frozen A→E
+semantics and every existing checkpoint are untouched unless a flag is explicitly set. New file
+[`modern.py`](files/modern.py) holds the primitives (`RMSNorm`, `RoPE`, `ModernAttention` with
+QK-norm + GQA over `F.scaled_dot_product_attention`, `SwiGLU`, `ModernEncoder`); the flags live on
+`ModelConfig`, bundled into the `cfg.arch` property (an `ArchConfig`).
+
+**Scope — token-level only, by design.** The `cfg.arch` flags reach only the four TOKEN-SEQUENCE
+transformers: the baseline GPT, the Talker (RoPE on self-attn only — the cross-attn reads a length-2
+`[thought, memory]` set with no token order), the input-lane encoder, and the chunk encoder
+(`ema_target`). The loop's recurrence is deliberately excluded: RoPE is meaningless for a gated
+recurrence over pooled thoughts, and the loop's bounded-state discipline is MagicNorm `hard_normalize`
+(a fixed-norm shell, §3.3), not a LayerNorm to swap. When RoPE is on, a module drops its learned
+`pos_embed` table. RoPE cos/sin are non-persistent buffers (out of the state_dict).
+
+**How back-compat holds.** Flags default to their legacy values → `arch.is_legacy` → each wired module
+builds the *exact* stock `nn.MultiheadAttention` / `nn.TransformerEncoderLayer` / `nn.LayerNorm` /
+GELU path, so the state_dict is byte-identical. The flags round-trip through `model_cfg =
+asdict(cfg)`: a modern-trained checkpoint rebuilds its modern arch on load; an old checkpoint lacks
+the fields → dataclass defaults → legacy. Verified: a smoke `LatentThoughtModel` built default
+strict-loads the pre-edit 137-key reference; every modern variant (full stack / rms-only / rope+gqa /
+modern+w3) runs `forward_grounded` + on-loop SSL + backward finite; GQA cuts params; modern cfg
+round-trips `asdict → ModelConfig → strict self-load`. Baseline A/B harness added
+(`baseline_gpt.py --modern`, plus granular `--arch-*` to bisect which upgrade moves the metric).
+
+**`core_qk_norm` — the one core upgrade (separate flag, NOT in `cfg.arch`).** QK-norm on the three
+cross-attention readers (the loop's `input_reader` + `memory_reader`, and the Talker's dead-weight
+`memory_reader`). Off → stock reader, core byte-identical (the pre-edit reference still strict-loads).
+On → `ModernAttention(qk_norm=True, bias=True)`; the query pre-norm stays LayerNorm (the flag is
+QK-norm *only*). **Safe for the core because QK-norm lives entirely inside the attention op** (per-head
+RMSNorm on Q,K before the dot product) — it does not touch `_TruncationSchedule`, `hard_normalize`,
+the decay gates, or the h/l state chain, so the §3.5/§3.6 credit-assignment is provably unchanged.
+`ModernAttention` gained a `value=` arg for the reader's trust-gated value (`value = kv * g`, key
+untouched) and a `bias` arg (`bias=True` on the core so its projections are a structural *superset* of
+`nn.MultiheadAttention`).
+
+**Importing old checkpoints into a QK-normed core — exact remap.**
+`modern.remap_legacy_core_readers(state_dict, model)` transfers the readers' learned projections with
+zero loss: it slices the packed MHA `in_proj_weight`/`in_proj_bias` (3E) into `q/k/v_proj`, copies
+`out_proj` verbatim (same key name), and handles the two-width input reader's separate
+`q/k/v_proj_weight` at `latent_mult>1`. The only params without an old counterpart — the new QK-norm
+scales — init to 1. Scoped to the three core readers via their parent's `core_qk_norm` flag, so a
+legacy Talker self-attn is never touched; a no-op on an already-modern checkpoint. Wired into
+`generate.load(ckpt, core_qk_norm=True)` (load-time arch override via `dataclasses.replace` +
+auto-remap). Verified exact + clean strict load for `latent_mult` 1 (packed) and 3 (packed + bridged).
+Caveat: the *projection transfer* is exact, but QK-norm is a genuinely new op (rescales Q,K to unit
+RMS), so it is a maximal warm-start, not a byte-for-byte continuation — enabling it does **not**
+strict-*resume* an A→E run without this remap.
+
+**Anti-collapse validated** (offline, real machinery: `build_offline_chunker` → reconstruction anchor
++ on-loop cosine SSL + VICReg variance floor + EMA target, synthetic varied text, smoke, 160 steps).
+`latent_collapse_metric` (mean per-dim std; collapse floor 0.1) stays healthy and *grows* in every
+config — final std: legacy 0.995, rms-only 1.010, full-modern 1.015, core-qk-only 0.999,
+core-qk+modern 1.016; none approaches the floor. **Notable:** RMSNorm at the encoder `out_norm` (no
+mean-centering) puts the latent on a *wider* shell — full-modern init std 0.964 vs legacy 0.686 — which
+is collapse-favorable but means the width-dependent `cosine_loss_k` / variance-floor margin should be
+re-checked at scale, same caveat as the w3 widening. This is smoke-scale evidence of *no collapse
+pathology*, **not** a claim that the tuned constants are optimal through the real Stage-B boundary.
+
+**Guidance:** highest-value flag on the Strix Halo box is `norm="rms"` — it removes every token-level
+LayerNorm, sidestepping the broken gfx1151 LayerNorm-backward kernel that `LATENT_MANUAL_LAYERNORM=1`
+works around. **None of these are enabled for the pending A→E run** (flags off = the validated path);
+re-validate anti-collapse at width before turning any on.
+
 ## Open items before a large run
 
 - **Re-confirm at full scale (~1.2B tokens):** watch `val_loss` at the Stage-B predictor boundary; the

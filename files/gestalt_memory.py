@@ -177,7 +177,7 @@ class GestaltCrossAttentionReader(nn.Module):
                  soft_role_tags: bool = False, soft_role_codebook: int = 16,
                  trust_gate: bool = False, soft_role_content: bool = False,
                  trust_gate_vector: bool = False, persona_tags: bool = False,
-                 n_personas: int = 16):
+                 n_personas: int = 16, core_qk_norm: bool = False):
         super().__init__()
         # `d_model` here is the width of a stored thought -- d_latent in the
         # widened design (the memory holds chunk-level thoughts, not tokens).
@@ -220,7 +220,17 @@ class GestaltCrossAttentionReader(nn.Module):
             # role tag. Zero-init => inert at start, so enabling it is gentle.
             self.persona_embed = nn.Embedding(n_personas, d_model)
             nn.init.zeros_(self.persona_embed.weight)
-        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        # core_qk_norm: QK-normed attention over SDPA (bias=True so the projections
+        # mirror MultiheadAttention). The trust gate makes value != key, so the
+        # reader passes a separate `value` in forward -- ModernAttention supports
+        # it. Off = the exact stock reader (byte-identical). The query pre-norm
+        # stays LayerNorm either way: this flag is QK-norm only, nothing else.
+        self.core_qk_norm = core_qk_norm
+        if core_qk_norm:
+            from modern import ModernAttention
+            self.attn = ModernAttention(d_model, n_heads, dropout, qk_norm=True, bias=True)
+        else:
+            self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.norm_q = nn.LayerNorm(d_model)
 
     def _role_tags(self, role_ids: torch.Tensor, content: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -273,7 +283,10 @@ class GestaltCrossAttentionReader(nn.Module):
         if self.trust_gate:
             g = torch.sigmoid(self.trust_proj(tags))           # (…, n_slots, 1 or d)
             value = kv * g
-        out, _ = self.attn(self.norm_q(q), kv, value, need_weights=False)
+        if self.core_qk_norm:
+            out = self.attn(self.norm_q(q), kv=kv, value=value)
+        else:
+            out, _ = self.attn(self.norm_q(q), kv, value, need_weights=False)
         return out.squeeze(1) if single_vector else out
 
     def trust_by_role(self, n_roles: int, device) -> Optional[torch.Tensor]:

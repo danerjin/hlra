@@ -29,6 +29,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from config import ArchConfig
+from modern import ModernEncoder
+
 
 class InputLaneEncoder(nn.Module):
     """
@@ -41,7 +44,7 @@ class InputLaneEncoder(nn.Module):
 
     def __init__(self, vocab_size: int, d_model: int, n_heads: int, d_ff: int,
                  dropout: float, n_layers: int, max_len: int,
-                 d_latent: int | None = None):
+                 d_latent: int | None = None, arch: ArchConfig | None = None):
         super().__init__()
         # The input lane is a token-level (word-level) encoder: it runs at
         # d_model. Aged gestalts, however, are chunk-level thoughts at d_latent,
@@ -49,19 +52,30 @@ class InputLaneEncoder(nn.Module):
         # (aged_proj is Identity when d_latent == d_model). Raw tokens are native
         # d_model.
         d_latent = d_model if d_latent is None else d_latent
+        self.arch = arch = arch if arch is not None else ArchConfig()
         self.token_embed = nn.Embedding(vocab_size, d_model)
-        self.pos_embed = nn.Embedding(max_len, d_model)
+        # RoPE (inside the encoder's self-attention) replaces the learned absolute
+        # position table over the raw-token stream, so the table exists only when
+        # arch.rope is off. Aged-gestalt slots have no token position and rely on
+        # the type embedding for their distinction, unchanged in either path.
+        self.pos_embed = None if arch.rope else nn.Embedding(max_len, d_model)
         self.aged_proj = nn.Identity() if d_latent == d_model else nn.Linear(d_latent, d_model)
         # A "type" embedding distinguishing raw-token slots from aged-gestalt
         # slots, since they arrive from different modalities (token id vs.
         # already-pooled vector) even though both end up at width d_model.
         self.type_embed = nn.Embedding(2, d_model)  # 0 = raw token, 1 = aged gestalt
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
-            dropout=dropout, batch_first=True, norm_first=True,  # Pre-LN, MagicNorm-style
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        if arch.is_legacy:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
+                dropout=dropout, batch_first=True, norm_first=True,  # Pre-LN, MagicNorm-style
+            )
+            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        else:
+            # Modern pre-LN encoder (RMSNorm / QK-normed GQA / SwiGLU / RoPE),
+            # same bidirectional self-attention + src_key_padding_mask contract.
+            self.encoder = ModernEncoder(d_model, n_heads, d_ff, dropout, n_layers,
+                                         arch, max_len=max_len)
 
     def forward(
         self,
@@ -82,11 +96,9 @@ class InputLaneEncoder(nn.Module):
         batch, n_raw = raw_token_ids.shape
         device = raw_token_ids.device
         positions = torch.arange(n_raw, device=device).unsqueeze(0)
-        raw_embeds = (
-            self.token_embed(raw_token_ids)
-            + self.pos_embed(positions)
-            + self.type_embed(torch.zeros_like(raw_token_ids))
-        )
+        raw_embeds = self.token_embed(raw_token_ids) + self.type_embed(torch.zeros_like(raw_token_ids))
+        if self.pos_embed is not None:                 # learned positions (non-RoPE); RoPE adds them in-attention
+            raw_embeds = raw_embeds + self.pos_embed(positions)
 
         if aged_gestalts is not None and aged_gestalts.shape[1] > 0:
             n_aged = aged_gestalts.shape[1]

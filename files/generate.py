@@ -49,7 +49,7 @@ CKPT = os.path.join(PROJECT, "runs", "model.pt")
 _LEGACY_CFG_FIELDS = {"parcae_min_decay": "decay_min", "parcae_max_decay": "decay_max"}
 
 
-def load(ckpt_path: str = CKPT):
+def load(ckpt_path: str = CKPT, **cfg_overrides):
     import dataclasses
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)  # carries non-tensor RNG/cfg state
     raw_cfg = dict(ckpt["model_cfg"])
@@ -62,12 +62,28 @@ def load(ckpt_path: str = CKPT):
         print(f"[generate] WARNING: ignoring unknown checkpoint config fields {dropped} "
               f"(older/newer code version); defaults will be used where they mattered.")
     cfg = ModelConfig(**{k: v for k, v in raw_cfg.items() if k in known})
+    # Load-time arch overrides: e.g. load(..., core_qk_norm=True) imports an old
+    # A-E checkpoint (stock MHA core readers) INTO a QK-normed-core model. The
+    # readers' learned projections are remapped exactly below; other arch flags
+    # (norm/rope/ffn/...) genuinely change params and are NOT remappable this way.
+    if cfg_overrides:
+        cfg = dataclasses.replace(cfg, **cfg_overrides)
     tok_src = ckpt.get("tokenizer_path") if os.path.isdir(ckpt.get("tokenizer_path", "")) else TOKENIZER_DIR
     chunker, _ = build_regex_gpt2_chunker(cfg, tok_src)
     model = LatentThoughtModel(cfg, chunker)
+    state = ckpt["model_state"]
+    if cfg.core_qk_norm:
+        # Exact remap of stock-MHA core readers -> ModernAttention (no-op if the
+        # checkpoint was already trained with core_qk_norm=True).
+        from modern import remap_legacy_core_readers
+        state, remapped = remap_legacy_core_readers(state, model)
+        if remapped:
+            print(f"[generate] remapped {len(remapped)} core reader(s) from stock "
+                  f"MultiheadAttention -> QK-normed ModernAttention (exact projection "
+                  f"transfer; new QK-norm scales init to 1): {remapped}")
     # strict=False so checkpoints predating the gen_predictor head still load;
     # report anything missing so degraded generation is attributable.
-    missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
+    missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
         mods = sorted({k.split(".")[0] for k in missing})
         print(f"[generate] WARNING: checkpoint predates module(s) {mods}; they are "

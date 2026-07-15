@@ -116,6 +116,7 @@ class LatentThoughtModel(nn.Module):
             vocab_size=cfg.vocab_size, d_model=cfg.d_model, d_latent=cfg.d_latent,
             n_heads=cfg.n_heads, d_ff=cfg.latent_d_ff, dropout=cfg.dropout,
             max_len=cfg.max_chunk_len, n_layers=cfg.chunk_encoder_layers,
+            arch=cfg.arch,
         )
         # The loop works natively at the thought width cfg.d_latent -- it reads a
         # d_latent chunk latent and emits a d_latent thought (what memory,
@@ -132,7 +133,7 @@ class LatentThoughtModel(nn.Module):
             soft_role_tags=cfg.soft_role_tags, soft_role_codebook=cfg.soft_role_codebook,
             trust_gate=cfg.trust_gate, soft_role_content=cfg.soft_role_content,
             trust_gate_vector=cfg.trust_gate_vector, persona_tags=cfg.persona_tags,
-            n_personas=cfg.n_personas,
+            n_personas=cfg.n_personas, core_qk_norm=cfg.core_qk_norm,
         )
 
         # --- Input lane (§4.1, §4.2) -----------------------------------
@@ -142,6 +143,7 @@ class LatentThoughtModel(nn.Module):
             vocab_size=cfg.vocab_size, d_model=cfg.d_model, d_latent=cfg.d_latent,
             n_heads=cfg.n_heads, d_ff=cfg.d_ff, dropout=cfg.dropout,
             n_layers=cfg.input_lane_layers, max_len=cfg.recent_token_window,
+            arch=cfg.arch,
         )
 
         # --- Talker (§1.3) -----------------------------------------------
@@ -154,7 +156,7 @@ class LatentThoughtModel(nn.Module):
             soft_role_tags=cfg.soft_role_tags, soft_role_codebook=cfg.soft_role_codebook,
             trust_gate=cfg.trust_gate, soft_role_content=cfg.soft_role_content,
             trust_gate_vector=cfg.trust_gate_vector, persona_tags=cfg.persona_tags,
-            n_personas=cfg.n_personas,
+            n_personas=cfg.n_personas, arch=cfg.arch, core_qk_norm=cfg.core_qk_norm,
         )
 
         # --- Self-supervised JEPA branch (§2.1) — the HRM loop IS the predictor.

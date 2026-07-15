@@ -12,6 +12,54 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+@dataclass(frozen=True)
+class ArchConfig:
+    """
+    Opt-in "modern transformer" upgrades for the TOKEN-LEVEL modules only -- the
+    shared chunk encoder (ema_target.ChunkEncoder), the Talker, the input lane,
+    and the standalone baseline GPT. Every field defaults to the legacy value, so
+    the default ArchConfig is `is_legacy`: each wired module then builds the EXACT
+    stock path it always has (nn.MultiheadAttention / nn.TransformerEncoderLayer /
+    nn.LayerNorm / GELU), producing a byte-identical state_dict that old
+    checkpoints load into unchanged. Turning any field on switches only that
+    module family to a custom path (modern.py) whose parameters are a NEW arch --
+    a checkpoint trained with flags on loads back with the same flags on (the
+    flags live in model_cfg, restored on load), and mixing is caught by the
+    strict-key checks in generate.load / train_dialogue.load_base_model.
+
+    Deliberate SCOPE boundary: these upgrades touch only the token-sequence
+    transformers. The reasoning core -- the HRM loop (hrm_loop.py, whose
+    bounded-state discipline at arbitrary depth is MagicNorm's hard_normalize, a
+    fixed-norm shell, NOT a LayerNorm to be swapped) and the gestalt-memory
+    cross-attention readers (gestalt_memory.py, the most-audited anti-collapse /
+    trust-gate code) -- is left byte-identical regardless of these flags. RoPE has
+    no meaning for a gated recurrence over pooled thoughts or for length-2
+    cross-attention, and perturbing the validated predictive path before the run
+    is exactly what the run discipline forbids. Extending qk_norm into the loop's
+    two attention readers is a possible follow-up, kept out of this pass on
+    purpose.
+
+    Which to turn on (see notes): norm="rms" is the highest-value one on the Strix
+    Halo box -- it removes every token-level LayerNorm, sidestepping the broken
+    gfx1151 LayerNorm-backward kernel that LATENT_MANUAL_LAYERNORM=1 works around.
+    qk_norm is cheap training-stability insurance. swiglu + rope are standard
+    quality upgrades. n_kv_heads (GQA) only starts to matter at large n_heads /
+    KV-cache scale, so it defaults off.
+    """
+    norm: str = "layer"       # "layer" (nn.LayerNorm) | "rms" (RMSNorm)
+    rope: bool = False        # rotary pos emb on token-sequence SELF-attention (replaces the learned pos table there)
+    qk_norm: bool = False     # per-head RMSNorm on Q and K before the dot product
+    ffn: str = "gelu"         # "gelu" (Linear-GELU-Linear) | "swiglu"
+    n_kv_heads: int = 0       # GQA key/value head groups; 0 == n_heads (plain MHA)
+
+    @property
+    def is_legacy(self) -> bool:
+        """True when every field is its legacy default, so a wired module must
+        build the exact stock path (byte-identical state_dict)."""
+        return (self.norm == "layer" and not self.rope and not self.qk_norm
+                and self.ffn == "gelu" and self.n_kv_heads in (0, None))
+
+
 @dataclass
 class ModelConfig:
     # ---- basic sizes ---------------------------------------------------
@@ -152,6 +200,42 @@ class ModelConfig:
     input_lane_layers: int = 2
     recent_token_window: int = 128  # raw tokens kept at full fidelity before aging into gestalts
 
+    # ---- modern-transformer upgrades (opt-in, TOKEN-LEVEL modules only) --
+    # Bring the token-level transformers (chunk encoder, Talker, input lane, and
+    # baseline GPT) up to the current decoder-only stack WITHOUT touching the
+    # validated reasoning core (HRM loop + gestalt memory) -- see ArchConfig for
+    # the scope rationale. Every field defaults to the legacy value, so the
+    # default build is byte-identical to the pre-upgrade module and old
+    # checkpoints load unchanged; a checkpoint carries these flags in model_cfg,
+    # so a modern-trained model rebuilds its modern arch on load automatically.
+    # These are grouped into cfg.arch (an ArchConfig) and threaded to each
+    # token-level module. RE-VALIDATE before enabling on a real run.
+    norm: str = "layer"       # "layer" | "rms": RMSNorm in the token-level modules (dodges the gfx1151 LN-backward kernel)
+    rope: bool = False        # rotary pos emb on token-seq self-attention (replaces that module's learned pos table)
+    qk_norm: bool = False     # per-head RMSNorm on Q,K -- training stability, cheap
+    ffn: str = "gelu"         # "gelu" | "swiglu": token-level FFN form (swiglu sized to match the GELU FFN's params)
+    n_kv_heads: int = 0       # GQA groups for token-level attention; 0 = full MHA. Becomes worth it at large n_heads / KV scale.
+
+    # ---- CORE QK-norm (opt-in; the ONE modern upgrade that reaches the loop) --
+    # QK-norm on the reasoning core's three cross-attention readers -- the HRM
+    # loop's input-lane reader and memory reader, and the Talker's (dead-weight)
+    # memory reader. It is a SEPARATE flag from the token-level `qk_norm` above so
+    # the validated core stays byte-identical by default: off, the readers build
+    # the exact stock nn.MultiheadAttention + LayerNorm. QK-norm lives entirely
+    # inside the attention op (per-head RMSNorm on Q,K before the dot product), so
+    # it does NOT touch the loop's truncation schedule, hard_normalize, decay
+    # gates, or h/l state chain -- the §3.5/§3.6 credit-assignment semantics are
+    # provably unchanged (that is why this, unlike RoPE or a norm swap, is a safe
+    # core upgrade). No RoPE/GQA here: memory is cross-attention over pooled
+    # thoughts / a length-2 set, with no token order and few slots.
+    #
+    # CHECKPOINT NOTE: enabling this switches the core readers to ModernAttention
+    # (q/k/v/out projections, built with bias=True to mirror MultiheadAttention),
+    # so parameter NAMES change -- an A-E checkpoint does NOT strict-resume into
+    # it. Enable on a fresh run (or write the exact remap: slice in_proj into
+    # q/k/v, copy out_proj, copy biases). Off = old checkpoints load unchanged.
+    core_qk_norm: bool = False
+
     # The next-latent prediction (§2.1's self-supervised signal AND generation) is
     # produced by the HRM loop itself: loop(encode(chunk_t)) -> pred_head predicts
     # chunk t+1's encoder-space latent (model.forward_self_supervised). There is no
@@ -180,6 +264,16 @@ class ModelConfig:
         itself stays the token-level FFN width (Talker, input lane)."""
         return self.latent_mult * self.d_ff
 
+    @property
+    def arch(self) -> "ArchConfig":
+        """The token-level modern-transformer options as one bundle, threaded to
+        the chunk encoder / Talker / input lane (see ArchConfig). Built from the
+        flat fields above so they round-trip through model_cfg = asdict(cfg): the
+        fields are saved, and this property reconstructs the bundle on load. The
+        default is `is_legacy` -> byte-identical builds."""
+        return ArchConfig(norm=self.norm, rope=self.rope, qk_norm=self.qk_norm,
+                          ffn=self.ffn, n_kv_heads=self.n_kv_heads)
+
     def __post_init__(self) -> None:
         if not isinstance(self.latent_mult, int) or self.latent_mult < 1:
             raise ValueError(f"latent_mult must be an int >= 1, got {self.latent_mult!r}")
@@ -207,6 +301,28 @@ class ModelConfig:
                 f"halt_mode='supervised' needs act_max_ponder_steps "
                 f"({self.act_max_ponder_steps}) >= h_updates_per_thought "
                 f"({self.h_updates_per_thought})")
+        # ---- modern-transformer flags (token-level; see ArchConfig) --------
+        if self.norm not in ("layer", "rms"):
+            raise ValueError(f"norm must be 'layer' or 'rms', got {self.norm!r}")
+        if self.ffn not in ("gelu", "swiglu"):
+            raise ValueError(f"ffn must be 'gelu' or 'swiglu', got {self.ffn!r}")
+        if self.n_kv_heads:
+            # GQA: the query heads are split into n_kv_heads groups, so n_kv_heads
+            # must divide n_heads (and not exceed it). 0 means full MHA.
+            if self.n_kv_heads < 0 or self.n_heads % self.n_kv_heads != 0:
+                raise ValueError(
+                    f"n_kv_heads ({self.n_kv_heads}) must be 0 (full MHA) or a positive "
+                    f"divisor of n_heads ({self.n_heads})")
+        if self.rope:
+            # RoPE rotates pairs of head-dim channels, so the head dim must be
+            # even. The token-level modules attend at two widths -- the Talker/
+            # input lane at d_model, the chunk encoder body at d_latent -- so both
+            # per-head dims must be even for a single flag to cover all of them.
+            for name, width in (("d_model", self.d_model), ("d_latent", self.d_latent)):
+                if (width // self.n_heads) % 2 != 0:
+                    raise ValueError(
+                        f"rope=True needs an even head dim, but {name}//n_heads "
+                        f"= {width}//{self.n_heads} = {width // self.n_heads} is odd")
 
 
 @dataclass

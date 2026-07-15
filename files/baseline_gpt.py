@@ -50,6 +50,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from utils import set_seed
+from config import ArchConfig
+from modern import ModernAttention, RoPE, SwiGLU, make_norm, build_ffn
 
 # Standard GPT shapes. d_ff = 4*d_model (the usual ratio).
 PRESETS = {
@@ -61,20 +63,37 @@ PRESETS = {
 
 
 class Block(nn.Module):
-    """Standard pre-LN transformer decoder block."""
+    """Standard pre-LN transformer decoder block.
 
-    def __init__(self, d_model, n_heads, d_ff, dropout):
+    Legacy (arch.is_legacy, the default): the exact stock block -- nn.LayerNorm +
+    nn.MultiheadAttention + GELU FFN, driven by an external boolean causal mask.
+    Modern (any arch flag on): RMSNorm / QK-normed GQA over SDPA (is_causal) /
+    SwiGLU, with RoPE passed in by the parent (no external mask). `rope` is the
+    parent GPT's shared RoPE cache, or None."""
+
+    def __init__(self, d_model, n_heads, d_ff, dropout, arch: ArchConfig):
         super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_ff), nn.GELU(), nn.Dropout(dropout), nn.Linear(d_ff, d_model)
-        )
+        self.arch = arch
+        if arch.is_legacy:
+            self.ln1 = nn.LayerNorm(d_model)
+            self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+            self.ln2 = nn.LayerNorm(d_model)
+            self.ffn = nn.Sequential(
+                nn.Linear(d_model, d_ff), nn.GELU(), nn.Dropout(dropout), nn.Linear(d_ff, d_model)
+            )
+        else:
+            self.ln1 = make_norm(arch, d_model)
+            self.attn = ModernAttention(d_model, n_heads, dropout,
+                                        n_kv_heads=arch.n_kv_heads, qk_norm=arch.qk_norm)
+            self.ln2 = make_norm(arch, d_model)
+            self.ffn = build_ffn(arch, d_model, d_ff, dropout)
 
-    def forward(self, x, causal_mask):
+    def forward(self, x, causal_mask, rope=None):
         h = self.ln1(x)
-        x = x + self.attn(h, h, h, attn_mask=causal_mask, need_weights=False)[0]
+        if self.arch.is_legacy:
+            x = x + self.attn(h, h, h, attn_mask=causal_mask, need_weights=False)[0]
+        else:
+            x = x + self.attn(h, is_causal=True, rope=rope)
         x = x + self.ffn(self.ln2(x))
         return x
 
@@ -84,16 +103,23 @@ class GPT(nn.Module):
     of pre-LN blocks, a final LN, and a tied LM head (weight-shared with the
     token embedding, the usual memory-saving choice)."""
 
-    def __init__(self, vocab_size, d_model, n_layers, n_heads, d_ff, block_size, dropout=0.1):
+    def __init__(self, vocab_size, d_model, n_layers, n_heads, d_ff, block_size,
+                 dropout=0.1, arch: ArchConfig | None = None):
         super().__init__()
+        arch = arch if arch is not None else ArchConfig()
+        self.arch = arch
         self.block_size = block_size
         self.token_embed = nn.Embedding(vocab_size, d_model)
-        self.pos_embed = nn.Embedding(block_size, d_model)
+        # RoPE replaces the learned absolute position table -- so it exists only
+        # when arch.rope is off. (A modern-but-rope=False build, e.g. RMSNorm-only,
+        # still uses the learned table.)
+        self.pos_embed = None if arch.rope else nn.Embedding(block_size, d_model)
+        self.rope = RoPE(d_model // n_heads, block_size) if arch.rope else None
         self.drop = nn.Dropout(dropout)
         self.blocks = nn.ModuleList(
-            [Block(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)]
+            [Block(d_model, n_heads, d_ff, dropout, arch) for _ in range(n_layers)]
         )
-        self.ln_f = nn.LayerNorm(d_model)
+        self.ln_f = make_norm(arch, d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
         # GPT-2 initialization. Without this, PyTorch's default N(0,1) embeddings
@@ -104,7 +130,10 @@ class GPT(nn.Module):
         for blk in self.blocks:  # scale residual output projections by 1/sqrt(2*L) (GPT-2)
             with torch.no_grad():
                 blk.attn.out_proj.weight.mul_(1.0 / math.sqrt(2 * n_layers))
-                blk.ffn[3].weight.mul_(1.0 / math.sqrt(2 * n_layers))
+                # Legacy/GELU FFN is an nn.Sequential (last Linear at index 3);
+                # SwiGLU's residual projection is `down`.
+                ffn_out = blk.ffn.down if isinstance(blk.ffn, SwiGLU) else blk.ffn[3]
+                ffn_out.weight.mul_(1.0 / math.sqrt(2 * n_layers))
         self.lm_head.weight = self.token_embed.weight   # weight tying (after init)
 
     @staticmethod
@@ -126,13 +155,18 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         b, t = idx.shape
-        pos = torch.arange(t, device=idx.device).unsqueeze(0)
-        x = self.drop(self.token_embed(idx) + self.pos_embed(pos))
-        # Boolean causal mask (True = disallow), MPS/AMP-safe -- same choice the
-        # latent model's Talker makes.
-        mask = torch.triu(torch.ones(t, t, dtype=torch.bool, device=idx.device), diagonal=1)
+        x = self.token_embed(idx)
+        if self.pos_embed is not None:                 # learned absolute positions (legacy / non-RoPE modern)
+            pos = torch.arange(t, device=idx.device).unsqueeze(0)
+            x = x + self.pos_embed(pos)
+        x = self.drop(x)
+        # Legacy blocks take an explicit boolean causal mask (True = disallow),
+        # MPS/AMP-safe. Modern blocks use SDPA is_causal + RoPE, so the mask is
+        # unused there (None) -- built only when needed.
+        mask = (None if not self.arch.is_legacy
+                else torch.triu(torch.ones(t, t, dtype=torch.bool, device=idx.device), diagonal=1))
         for blk in self.blocks:
-            x = blk(x, mask)
+            x = blk(x, mask, rope=self.rope)
         logits = self.lm_head(self.ln_f(x))
         loss = None
         if targets is not None:
@@ -208,6 +242,17 @@ def pick_device():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--preset", default="same-params", choices=list(PRESETS))
+    # Modern-architecture A/B: --modern turns on the full stack (RMSNorm + RoPE +
+    # QK-norm + SwiGLU); the granular flags override individual pieces so you can
+    # bisect which upgrade moves the metric. Legacy (no flags) is byte-identical
+    # to the original baseline.
+    ap.add_argument("--modern", action="store_true",
+                    help="RMSNorm + RoPE + QK-norm + SwiGLU (the full modern stack)")
+    ap.add_argument("--arch-norm", choices=["layer", "rms"], default=None)
+    ap.add_argument("--arch-rope", dest="arch_rope", action="store_true", default=None)
+    ap.add_argument("--arch-qk-norm", dest="arch_qk_norm", action="store_true", default=None)
+    ap.add_argument("--arch-ffn", choices=["gelu", "swiglu"], default=None)
+    ap.add_argument("--arch-kv-heads", type=int, default=0, help="GQA groups (0 = full MHA)")
     ap.add_argument("--steps", type=int, default=900)
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--block-size", type=int, default=128)
@@ -224,11 +269,22 @@ def main():
 
     stream, docs = load_stream(tok)
     cfg = PRESETS[args.preset]
-    model = GPT(vocab_size=tok.vocab_size, block_size=args.block_size, **cfg).to(device)
+    # Assemble the ArchConfig: --modern is the full stack; granular flags win over it.
+    base = dict(norm="rms", rope=True, qk_norm=True, ffn="swiglu") if args.modern else {}
+    if args.arch_norm is not None:     base["norm"] = args.arch_norm
+    if args.arch_rope is not None:     base["rope"] = args.arch_rope
+    if args.arch_qk_norm is not None:  base["qk_norm"] = args.arch_qk_norm
+    if args.arch_ffn is not None:      base["ffn"] = args.arch_ffn
+    if args.arch_kv_heads:             base["n_kv_heads"] = args.arch_kv_heads
+    arch = ArchConfig(**base)
+    model = GPT(vocab_size=tok.vocab_size, block_size=args.block_size, arch=arch, **cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    n_nonemb = n_params - model.token_embed.weight.numel() - model.pos_embed.weight.numel()
+    n_emb = model.token_embed.weight.numel()
+    n_emb += model.pos_embed.weight.numel() if model.pos_embed is not None else 0
+    n_nonemb = n_params - n_emb
     print(f"[baseline {args.preset}] device={device} params={n_params:,} "
-          f"(non-embedding {n_nonemb:,})  tokens={len(stream)}  cfg={cfg}")
+          f"(non-embedding {n_nonemb:,})  tokens={len(stream)}  cfg={cfg}  "
+          f"arch={'legacy' if arch.is_legacy else arch}")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     gen = torch.Generator().manual_seed(0)
@@ -260,7 +316,9 @@ def main():
     if args.out:
         out = os.path.join(PROJECT, args.out)
         os.makedirs(out, exist_ok=True)
+        import dataclasses
         torch.save({"model_state": model.state_dict(), "cfg": cfg,
+                    "arch": dataclasses.asdict(arch),
                     "preset": args.preset, "block_size": args.block_size,
                     "params": n_params, "final_nll": nll, "final_ppl": ppl},
                    os.path.join(out, "model.pt"))

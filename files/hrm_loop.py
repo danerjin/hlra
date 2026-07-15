@@ -150,7 +150,7 @@ class HRMInnerLoop(nn.Module):
                  soft_role_tags: bool = False, soft_role_codebook: int = 16,
                  trust_gate: bool = False, soft_role_content: bool = False,
                  trust_gate_vector: bool = False, persona_tags: bool = False,
-                 n_personas: int = 16):
+                 n_personas: int = 16, core_qk_norm: bool = False):
         super().__init__()
         # The loop works entirely at the thought width d_latent: a thought is a
         # chunk-level object, so the chunk encoder already hands it in at d_latent
@@ -182,14 +182,23 @@ class HRMInnerLoop(nn.Module):
             soft_role_tags=soft_role_tags, soft_role_codebook=soft_role_codebook,
             trust_gate=trust_gate, soft_role_content=soft_role_content,
             trust_gate_vector=trust_gate_vector, persona_tags=persona_tags,
-            n_personas=n_personas)
+            n_personas=n_personas, core_qk_norm=core_qk_norm)
 
         # Cross-attention into the input lane (raw tokens + aged gestalts), per
         # §4.2: the Reasoner's H/L state may only *read* the input lane, never
         # have it written into its recurrent state. The lane runs at the token
         # width d_input; the loop queries it at d_latent, so bridge when they
         # differ (kdim/vdim=d_input), else build it plainly.
-        if self._bridge_input:
+        # core_qk_norm switches this reader to QK-normed SDPA attention too (same
+        # rationale as the memory reader); ModernAttention's kdim handles the
+        # two-width (d_input != d_latent) bridge the stock path used vdim/kdim for.
+        self.core_qk_norm = core_qk_norm
+        if core_qk_norm:
+            from modern import ModernAttention
+            self.input_reader = ModernAttention(
+                d_latent, n_heads, dropout, kdim=(d_input if self._bridge_input else None),
+                qk_norm=True, bias=True)
+        elif self._bridge_input:
             self.input_reader = nn.MultiheadAttention(
                 d_latent, n_heads, dropout=dropout, batch_first=True, kdim=d_input, vdim=d_input)
         else:
@@ -223,9 +232,13 @@ class HRMInnerLoop(nn.Module):
         # both purely as cross-attention context feeding the H-module's injection.
         query = l_state.unsqueeze(1)
         if input_lane_kv is not None:
-            input_ctx, _ = self.input_reader(self.input_norm(query), input_lane_kv, input_lane_kv,
-                                               key_padding_mask=input_lane_pad,
-                                               need_weights=False)
+            if self.core_qk_norm:
+                input_ctx = self.input_reader(self.input_norm(query), kv=input_lane_kv,
+                                              key_padding_mask=input_lane_pad)
+            else:
+                input_ctx, _ = self.input_reader(self.input_norm(query), input_lane_kv, input_lane_kv,
+                                                   key_padding_mask=input_lane_pad,
+                                                   need_weights=False)
             input_ctx = input_ctx.squeeze(1)
         else:
             input_ctx = torch.zeros_like(l_state)

@@ -25,6 +25,9 @@ from contextlib import nullcontext
 import torch
 import torch.nn as nn
 
+from config import ArchConfig
+from modern import ModernEncoder, make_norm
+
 
 class ChunkEncoder(nn.Module):
     """Encodes one chunk of token ids into a single vector via a small
@@ -34,7 +37,7 @@ class ChunkEncoder(nn.Module):
 
     def __init__(self, vocab_size: int, d_model: int, n_heads: int, d_ff: int,
                  dropout: float, max_len: int, n_layers: int = 2,
-                 d_latent: int | None = None):
+                 d_latent: int | None = None, arch: ArchConfig | None = None):
         super().__init__()
         # Tokens are looked up at the word-level width d_model, then lifted into
         # the (possibly wider) thought width d_latent BEFORE the transformer body,
@@ -44,20 +47,30 @@ class ChunkEncoder(nn.Module):
         # d_latent == d_model makes in_proj an Identity and every width below
         # equal to d_model, i.e. the original single-width encoder exactly.
         d_latent = d_model if d_latent is None else d_latent
+        self.arch = arch = arch if arch is not None else ArchConfig()
         self.token_embed = nn.Embedding(vocab_size, d_model)
         self.in_proj = nn.Identity() if d_latent == d_model else nn.Linear(d_model, d_latent)
-        self.pos_embed = nn.Embedding(max_len, d_latent)
-        layer = nn.TransformerEncoderLayer(
-            d_model=d_latent, nhead=n_heads, dim_feedforward=d_ff,
-            dropout=dropout, batch_first=True, norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
-        self.out_norm = nn.LayerNorm(d_latent)
+        # The encoder body runs at d_latent, so RoPE here rotates d_latent//n_heads
+        # per head (the __post_init__ evenness check covers this width too). Learned
+        # position table exists only when RoPE is off.
+        self.pos_embed = None if arch.rope else nn.Embedding(max_len, d_latent)
+        if arch.is_legacy:
+            layer = nn.TransformerEncoderLayer(
+                d_model=d_latent, nhead=n_heads, dim_feedforward=d_ff,
+                dropout=dropout, batch_first=True, norm_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+        else:
+            self.encoder = ModernEncoder(d_latent, n_heads, d_ff, dropout, n_layers,
+                                         arch, max_len=max_len)
+        self.out_norm = make_norm(arch, d_latent)
 
     def forward(self, chunk_ids: torch.Tensor, chunk_mask: torch.Tensor) -> torch.Tensor:
         batch, chunk_len = chunk_ids.shape
         positions = torch.arange(chunk_len, device=chunk_ids.device).unsqueeze(0)
-        x = self.in_proj(self.token_embed(chunk_ids)) + self.pos_embed(positions)
+        x = self.in_proj(self.token_embed(chunk_ids))
+        if self.pos_embed is not None:                 # learned positions (non-RoPE)
+            x = x + self.pos_embed(positions)
 
         # Guard all-pad rows: an entirely-masked key_padding_mask row makes the
         # attention softmax divide by zero -> NaN. Such rows occur for padded

@@ -197,10 +197,14 @@ stage budget, and launches the real run — all `nohup`'d, all logged to
 ```bash
 cat > ~/run_pipeline.sh <<'EOF'
 #!/bin/bash
+source ~/hlra/.venv-rocm/bin/activate   # run in the torch venv -- a nohup'd script does NOT
+                                        # inherit an un-activated shell, so activate explicitly
+                                        # or training launches under the wrong (torch-less) python
 export LATENT_MANUAL_LAYERNORM=1
 PREP_PID="$1"
 cd ~/hlra/files
 log(){ echo "[$(date '+%F %T')] $*"; }
+log "STATUS: venv=$VIRTUAL_ENV python=$(which python)"   # confirm the right interpreter in pipeline.log
 log "STATUS: waiting for prep (PID $PREP_PID)..."
 while kill -0 "$PREP_PID" 2>/dev/null; do sleep 60; done
 if [ ! -f ~/hlra/chunk_cache/manifest.json ]; then
@@ -220,7 +224,14 @@ chmod +x ~/run_pipeline.sh
 PREP_PID=$(pgrep -f 'data_prep.py' | head -1)
 nohup ~/run_pipeline.sh "$PREP_PID" > ~/hlra/files/pipeline.log 2>&1 &
 echo "QUEUED (prep PID=$PREP_PID). Read anytime: tail -f ~/hlra/files/pipeline.log"
+head -2 ~/hlra/files/pipeline.log   # verify: venv=.../.venv-rocm  python=.../.venv-rocm/bin/python
 ```
+
+**Already queued a watcher without the `source` line?** Editing the file won't fix the
+running one (it launched with its own environment). Kill and re-queue against the
+still-running prep: `pkill -f run_pipeline.sh`, re-paste the block above, done — prep is
+a separate process and keeps going. Confirm which venv a live watcher holds with:
+`tr '\0' '\n' < /proc/"$(pgrep -f run_pipeline.sh | head -1)"/environ | grep -E '^(VIRTUAL_ENV|PATH)='`.
 
 **To launch training manually instead** (cache already prepped): compute the budget
 and run — remember the box-specifics **`LATENT_MANUAL_LAYERNORM=1`, `--preset

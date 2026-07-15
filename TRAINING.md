@@ -196,6 +196,95 @@ python web_chat.py runs/dialogue/model.pt          # web UI -> pick the "Chat" m
 
 ---
 
+## 7. Command reference — the exact invocations that worked (reference gfx1151 box)
+
+Every command below is a **known-good** one from a real A→E bring-up (paths are the
+reference box `daniel@…:~/hlra`; edit to yours). Copy-paste in order. Box-specific
+setup (install, LayerNorm workaround, Xet-escape) lives in
+[`STRIX_HALO.md`](STRIX_HALO.md); this is the operational cheat-sheet.
+
+### 7.1 Activate the env and prove torch sees the GPU
+```bash
+source ~/hlra/.venv-rocm/bin/activate
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"   # -> ...rocm... True
+cd ~/hlra/files && LATENT_MANUAL_LAYERNORM=1 python rocm_smoke.py --preset small-w3   # must end PASS
+```
+
+### 7.2 Prep the chunk cache (the command that ran)
+```bash
+cd ~/hlra/files
+# from LOCAL parquet (Xet-CDN escape hatch; downloaded on the Mac + rsync'd to the box):
+nohup python data_prep.py --local-glob "/home/daniel/hlra/fineweb_local/**/*.parquet" \
+  --preset small-w3 --max-tokens 1200000000 --out chunk_cache > prep.log 2>&1 &
+# want it in minutes not hours? add --regex (fast approx chunker, fine for a first run).
+```
+Prep is **not resumable** and writes `manifest.json` only at the very end. Salvage a
+killed/stalled prep (0.5–1 B tokens is a fine first run):
+```bash
+pkill -f data_prep
+python make_manifest.py ~/hlra/chunk_cache small-w3     # rebuilds manifest.json from the shards on disk
+```
+
+### 7.3 Which interpreter/venv is a running process using?
+`readlink /proc/PID/exe` alone is **misleading** — a venv's `python` symlinks to the
+base interpreter, so it shows e.g. `/usr/bin/python3.10` even inside a venv. Read
+`VIRTUAL_ENV` to be sure:
+```bash
+PID=$(pgrep -f data_prep.py | head -1)
+echo "cmdline: $(tr '\0' ' ' < /proc/$PID/cmdline)"
+tr '\0' '\n' < /proc/$PID/environ | grep -E '^(VIRTUAL_ENV|PATH)='   # VIRTUAL_ENV= line -> that's the venv
+```
+
+### 7.4 Queue training to auto-start when prep finishes (venv-aware)
+The full paste-able block is [`STRIX_HALO.md`](STRIX_HALO.md) §6 — it bakes in **the exact
+interpreter prep runs** (so it works for a venv *or* a system-wide torch), exports
+`LATENT_MANUAL_LAYERNORM=1`, refuses to train on a half-cache, and logs to
+`pipeline.log`. Verify it armed correctly:
+```bash
+head -2 ~/hlra/files/pipeline.log
+#   -> STATUS: python=/home/daniel/hlra/.venv-rocm/bin/python torch=...rocm... True
+#   -> STATUS: waiting for prep (PID ....)
+```
+Manage the watcher (prep is a separate process and keeps running):
+```bash
+pgrep -af 'run_pipeline|data_prep|train_scaled'     # what's running
+pkill -f run_pipeline.sh                            # stop ONLY the watcher, then re-paste the §6 block to re-queue
+```
+
+### 7.5 Monitor (queued run logs to `pipeline.log`, manual run to `train.log`)
+> The auto-start runs training *inside* the nohup'd watcher, so training output goes to
+> **`pipeline.log`**, not `train.log`. Point these at whichever applies. Run from `~/hlra/files`.
+```bash
+LOG=pipeline.log                                    # or train.log for a manual launch
+
+# alive + workaround engaged + still checkpointing:
+pgrep -af 'data_prep|train_scaled' || echo "NOT RUNNING"
+grep -m1 "manual LayerNorm active" "$LOG"           # MUST print once (else corrupt -> relaunch)
+
+# prep ETA (live token count, never hardcoded):
+T=$(grep -oE '~[0-9]+ tokens' prep.log | tail -1 | grep -oE '[0-9]+'); S=$(ps -o etimes= -p "$(pgrep -f data_prep|head -1)"|tr -d ' ')
+python3 -c "t=$T;s=$S;b=1.2e9;r=t/s;print(f'{t/1e6:.0f}M tok · {r/1000:.1f}k tok/s · ETA ~{(b-t)/r/3600:.1f}h to {b/1e9:.1f}B')"
+
+# training progress + ETA (total steps ~= examples//BATCH):
+TOT=$(python3 -c "import json,os;m=json.load(open(os.path.expanduser('~/hlra/chunk_cache/manifest.json')));print(m['total']//32)")
+N=$(grep -oE '\[step [0-9]+\]' "$LOG" | tail -1 | grep -oE '[0-9]+'); S=$(ps -o etimes= -p "$(pgrep -f train_scaled|head -1)"|tr -d ' ')
+python3 -c "n=$N;tot=$TOT;s=$S;r=n/max(s,1);print(f'step {n}/{tot} ({100*n/tot:.0f}%) · {r:.2f} step/s · ETA ~{(tot-n)/max(r,1e-9)/3600:.1f}h')"
+
+# health (THE check) + GPU:
+grep -E 'stage=(A|B|C|D|E)' "$LOG" | tail -5       # val_loss must be flat/lower across A->B
+rocm-smi --showuse --showmeminfo vram
+```
+
+### 7.6 Detach / retrieve
+```bash
+# disconnect SSH without killing anything (already nohup'd -> just close the session, or):
+exit                                                # nohup jobs survive logout
+
+# when done, get runs/scaled/model.pt off the box -> §6.3 (push_to_hf.py or rsync).
+```
+
+---
+
 **In doubt:** the run is healthy as long as **`val_loss` trends down with no jump when
 Stage B turns the predictor on**, and `lstd` holds its Stage-A band. Watch `val_loss`
 above all; keep checkpoints. Full Strix-Halo path + troubleshooting:

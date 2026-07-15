@@ -27,6 +27,7 @@ where M = max_chunks_per_doc, L = max_chunk_len, W = recent_token_window.
 """
 from __future__ import annotations
 
+import json
 import random
 import re
 from typing import Callable, Iterable, Iterator, List, Optional, Tuple
@@ -313,21 +314,53 @@ def transcript_to_turns(text: str, target_speaker: str,
             for sp, utt in parse_transcript(text)]
 
 
-def messages_to_turns(messages: List[dict]) -> List[Tuple[int, int, str]]:
+# Role-name -> (role_id, persona_id). Covers the two common chat schemas: OpenAI/HF
+# `role` (assistant/user/system) and ShareGPT `from` (gpt/human/system, plus bot/ai).
+_ROLE_MAP = {
+    "assistant": (SELF, 0), "gpt": (SELF, 0), "bot": (SELF, 0), "ai": (SELF, 0), "model": (SELF, 0),
+    "system": (SYSTEM, 2), "instruction": (SYSTEM, 2),
+    "user": (USER, 1), "human": (USER, 1),
+}
+
+
+def _coerce_messages(msgs) -> Optional[List[dict]]:
+    """Normalize a dataset's `messages` cell to a list[dict], tolerating the JSON
+    formatting real datasets ship. `no_robots`/`ultrachat` give a native list, but
+    depending on the `datasets`/pyarrow version (or a plain-string column) the same
+    field can arrive as a JSON STRING -- in which case the old `isinstance(list)`
+    gate silently dropped every example. Handles: native list; JSON-string of a list;
+    JSON-string of a {"messages":[...]} / {"conversations":[...]} wrapper."""
+    if isinstance(msgs, list):
+        return msgs
+    if isinstance(msgs, str):
+        try:
+            parsed = json.loads(msgs)
+        except (ValueError, TypeError):
+            return None
+        if isinstance(parsed, dict):
+            parsed = parsed.get("messages") or parsed.get("conversations")
+        return parsed if isinstance(parsed, list) else None
+    return None
+
+
+def messages_to_turns(messages) -> List[Tuple[int, int, str]]:
     """Map a chat 'messages' list ([{role, content}, ...]) to (role_id, persona_id,
-    text) turns. assistant -> SELF/persona 0, system -> SYSTEM/persona 2, else
-    user -> USER/persona 1."""
+    text) turns. Accepts either the native list OR a JSON-string of one (see
+    `_coerce_messages`), and both the `role`/`content` and ShareGPT `from`/`value`
+    key schemes. Unknown roles fall back to USER/persona 1."""
+    msgs = _coerce_messages(messages)
+    if not msgs:
+        return []
     out = []
-    for msg in messages:
-        r = str(msg.get("role", "")).lower()
-        if r == "assistant":
-            role, persona = SELF, 0
-        elif r == "system":
-            role, persona = SYSTEM, 2
-        else:
-            role, persona = USER, 1
-        text = msg.get("content") or ""
-        if text:
+    for msg in msgs:
+        if not isinstance(msg, dict):
+            continue
+        r = str(msg.get("role", msg.get("from", ""))).lower().strip()
+        role, persona = _ROLE_MAP.get(r, (USER, 1))
+        text = msg.get("content", msg.get("value", "")) or ""
+        if not isinstance(text, str):
+            text = str(text)
+        if text.strip():
             out.append((role, persona, text))
     return out
 
@@ -336,18 +369,21 @@ def iter_hf_chat_turns(hf_id: str, split: str = "train", name: Optional[str] = N
                        messages_field: str = "messages", streaming: bool = True,
                        max_docs: Optional[int] = None) -> Iterator[List[Tuple[int, int, str]]]:
     """Stream a chat/instruct dataset that stores a per-example list of messages
-    (role/content) and yield (role_id, persona_id, text) turn lists. Lazy-imports
-    `datasets`."""
+    (role/content, or ShareGPT from/value; native list or JSON string) and yield
+    (role_id, persona_id, text) turn lists. Lazy-imports `datasets`."""
     from datasets import load_dataset
     ds = load_dataset(hf_id, name, split=split, streaming=streaming)
     for i, ex in enumerate(ds):
         if max_docs is not None and i >= max_docs:
             return
+        # try the named field, then fall back to the two common alternates so a
+        # ShareGPT-style dataset works without a flag.
         msgs = ex.get(messages_field)
-        if isinstance(msgs, list) and msgs:
-            turns = messages_to_turns(msgs)
-            if any(r == SELF for r, _, _ in turns):
-                yield turns
+        if msgs is None:
+            msgs = ex.get("messages") or ex.get("conversations")
+        turns = messages_to_turns(msgs)
+        if turns and any(r == SELF for r, _, _ in turns):
+            yield turns
 
 
 def iter_hf_transcript_turns(hf_id: str, text_field: str, target_speaker: str,

@@ -5,14 +5,16 @@ monitoring, see **[`TRAINING.md`](TRAINING.md)** (and [`STRIX_HALO.md`](STRIX_HA
 for gfx1151 setup).
 
 **The pipeline in two halves:**
-- **Foundation (A→E)** — `data_prep.py` → `train_scaled.py`. Steps ① ②. Produces
+- **Foundation (A→E)** — `data_prep.py` → `train_scaled.py`. Produces
   `runs/scaled/model.pt`. **This is the base model; it is NOT a chatbot.**
 - **Chatbot (Stage-F)** — `train_dialogue.py`, a *separate* fine-tune that loads the
   foundation read-only and writes to `runs/dialogue/` (**never touches `runs/scaled`**).
-  Step ③. Optional, and still **experimental** (see [`STAGE_F.md`](STAGE_F.md)).
+  Still **experimental** (see [`STAGE_F.md`](STAGE_F.md)).
 
-Run ① ② first. Let A→E finish and confirm it's healthy **before** ③ — don't fine-tune a
-collapsed foundation.
+Step ② runs the **whole chain in one paste**: prep → A→E → (auto) Stage-F. The chain
+only advances to Stage-F if A→E exits cleanly (a crash won't fine-tune junk), but it
+does **not** judge `val_loss` health for you — if you'd rather inspect the foundation
+first, set `RUN_STAGE_F=0` in ②'s config and run Stage-F later with step ③.
 
 **Assumes** the box is set up per [`STRIX_HALO.md`](STRIX_HALO.md) §1–2: torch in
 `~/hlra/.venv-rocm`, repo at `~/hlra`, corpus available. Edit the venv path at the top
@@ -65,11 +67,12 @@ PREFLIGHT
 
 ---
 
-## ② Foundation run — prep → auto-started A→E training (one paste)
+## ② The whole run — prep → A→E → Stage-F (one paste)
 
-Asks your model size, launches data prep in the background, and queues training to
-**auto-start when prep finishes** — same venv, LayerNorm workaround, all `nohup`'d
-(close SSH freely). Edit the CONFIG block first.
+Asks your model size, launches data prep in the background, and queues the full chain
+to **auto-run when prep finishes**: A→E foundation, then (if `RUN_STAGE_F=1`) the
+Stage-F chatbot fine-tune — same venv, LayerNorm workaround, all `nohup`'d (close SSH
+freely). Edit the CONFIG block first.
 
 ```bash
 bash <<'RUN'
@@ -90,8 +93,15 @@ MAX_TOKENS=1200000000          # 1.2B soft target (0.5-1B is a fine first run)
 PREP_ARGS=(--local-glob "/home/daniel/hlra/fineweb_local/**/*.parquet")   # local parquet (Xet escape)
 # PREP_ARGS=(--dataset HuggingFaceFW/fineweb-edu --name sample-10BT --streaming)   # or stream from HF
 # want it in minutes? add --regex to PREP_ARGS (fast approximate chunker, fine for a first run)
+
+# ---- Stage-F chatbot fine-tune, auto-chained after A→E (set RUN_STAGE_F=0 to stop at the foundation) ----
+RUN_STAGE_F=1
+HF_CHAT=HuggingFaceH4/no_robots   # real chat dataset (messages schema)
+SPLIT=train
+STAGEF_STEPS=3000
+STAGEF_BATCH=8
 #============================================================
-echo "preset=$PRESET batch=$BATCH"
+echo "preset=$PRESET batch=$BATCH  stage-F=$RUN_STAGE_F ($HF_CHAT)"
 
 export LATENT_MANUAL_LAYERNORM=1
 
@@ -105,6 +115,7 @@ echo "PREP started (PID $PREP_PID)"
 cat > ~/run_pipeline.sh <<'WATCHER'
 #!/bin/bash
 PY="__PY__"; BATCH="__BATCH__"; PRESET="__PRESET__"
+RUN_STAGE_F="__RUN_STAGE_F__"; HF_CHAT="__HF_CHAT__"; SPLIT="__SPLIT__"; STAGEF_STEPS="__STAGEF_STEPS__"; STAGEF_BATCH="__STAGEF_BATCH__"
 export LATENT_MANUAL_LAYERNORM=1
 PREP_PID="$1"
 cd ~/hlra/files
@@ -118,43 +129,60 @@ if [ ! -f ~/hlra/chunk_cache/manifest.json ]; then
 fi
 EX=$("$PY" -c "import json,os;print(json.load(open(os.path.expanduser('~/hlra/chunk_cache/manifest.json')))['total'])")
 STAGE_STEPS=$("$PY" -c "u=max(1,($EX//$BATCH)//6);print(f'{u},{u},{u},{u},{2*u},0')")
-log "STATUS: prep done — $EX examples; launching training BATCH=$BATCH STAGE_STEPS=$STAGE_STEPS"
+log "STATUS: prep done — $EX examples; launching A→E training BATCH=$BATCH STAGE_STEPS=$STAGE_STEPS"
 "$PY" train_scaled.py --preset "$PRESET" --cache chunk_cache --device cuda --amp --amp-dtype bf16 \
   --batch-size "$BATCH" --stage-steps "$STAGE_STEPS" --var-weight 3.0 --lr-schedule per-stage \
   --num-workers 8 --log-every 50 --checkpoint-every 1000 --archive-every 5000 --out runs/scaled
-log "STATUS: train_scaled.py exited (rc=$?)"
+RC=$?
+log "STATUS: train_scaled.py exited (rc=$RC) -> runs/scaled/model.pt"
+# --- auto-chain Stage-F, but ONLY if A→E exited cleanly (a crash must not fine-tune junk) ---
+if [ "$RC" -ne 0 ]; then
+  log "STATUS: A→E FAILED (rc=$RC) — NOT starting Stage-F. See the log above."; exit "$RC"
+fi
+if [ "$RUN_STAGE_F" = "1" ]; then
+  log "STATUS: A→E done — starting Stage-F fine-tune on $HF_CHAT (foundation READ-ONLY -> runs/dialogue)"
+  "$PY" train_dialogue.py --ckpt runs/scaled/model.pt --hf-chat "$HF_CHAT" --split "$SPLIT" \
+    --multi-turn --soft-tags --content-tags --trust-gate --vector-gate --persona --gestalt-readout \
+    --steps "$STAGEF_STEPS" --batch-size "$STAGEF_BATCH" --out runs/dialogue
+  log "STATUS: train_dialogue.py exited (rc=$?) -> runs/dialogue/model.pt"
+else
+  log "STATUS: RUN_STAGE_F=0 — stopping at the foundation. Fine-tune later with step ③."
+fi
 WATCHER
 
 # 3) bake the exact interpreter + config into the watcher, then queue it:
 PY="$(command -v python)"                       # the venv python we activated above
-sed -i "s|__PY__|$PY|; s|__BATCH__|$BATCH|; s|__PRESET__|$PRESET|" ~/run_pipeline.sh
+sed -i "s|__PY__|$PY|; s|__BATCH__|$BATCH|; s|__PRESET__|$PRESET|; s|__RUN_STAGE_F__|$RUN_STAGE_F|; s|__HF_CHAT__|$HF_CHAT|; s|__SPLIT__|$SPLIT|; s|__STAGEF_STEPS__|$STAGEF_STEPS|; s|__STAGEF_BATCH__|$STAGEF_BATCH|" ~/run_pipeline.sh
 chmod +x ~/run_pipeline.sh
 nohup ~/run_pipeline.sh "$PREP_PID" > ~/hlra/files/pipeline.log 2>&1 &
 sleep 2
-echo "QUEUED A→E training to auto-start when prep finishes (python=$PY)."
+echo "QUEUED: prep → A→E → $([ "$RUN_STAGE_F" = 1 ] && echo 'Stage-F' || echo '(stop at foundation)')  (python=$PY)."
 echo "--- pipeline.log head (verify torch=...True) ---"; head -2 ~/hlra/files/pipeline.log
 echo "Monitor:  tail -f ~/hlra/files/pipeline.log      (prep: tail -f ~/hlra/files/prep.log)"
 RUN
 ```
 
 `STATUS: … torch=…rocm… True` is your proof the queue will train on the GPU in the
-right venv. **Now you can disconnect SSH.** Output → `pipeline.log`. The result is
-`runs/scaled/model.pt` (the foundation).
+right venv. **Now you can disconnect SSH.** Output → `pipeline.log`. Results:
+`runs/scaled/model.pt` (foundation) and, if `RUN_STAGE_F=1`, `runs/dialogue/model.pt`
+(chatbot) — separate files.
 
 ---
 
-## ③ Chatbot Stage-F — real fine-tune off the foundation (one paste)
+## ③ Stage-F standalone — fine-tune off an existing foundation (one paste)
 
-Run this **only after** ② finished and A→E looked healthy (`val_loss` never jumped at
-Stage B). It loads `runs/scaled/model.pt` **read-only**, fine-tunes on a real dialogue
-dataset, and writes to **`runs/dialogue/`** — a **separate** directory, so your
-foundation is never overwritten.
+**You usually don't need this** — ② auto-runs Stage-F. Use this to fine-tune again
+with **different data**, after setting `RUN_STAGE_F=0`, or if A→E finished earlier. It
+loads `runs/scaled/model.pt` **read-only**, fine-tunes on a real dialogue dataset, and
+writes to **`runs/dialogue/`** — a **separate** directory, so the foundation is never
+overwritten.
 
 Default dataset: **`HuggingFaceH4/no_robots`** (10k high-quality instruct dialogues,
 standard `messages` schema, downloads cleanly — verified). Scale up later with
-`HuggingFaceH4/ultrachat_200k --hf-name default --split train_sft`, or use a
-transcript corpus (debate/courtroom/socratic) via the `--hf-transcript` variant in
-[`TRAINING.md`](TRAINING.md) §6.2.
+`HuggingFaceH4/ultrachat_200k --split train_sft`, or use a transcript corpus
+(debate/courtroom/socratic) via the `--hf-transcript` variant in
+[`TRAINING.md`](TRAINING.md) §6.2. The loader accepts `messages` as a native list **or
+a JSON string**, and both `role`/`content` and ShareGPT `from`/`value` schemas.
 
 ```bash
 bash <<'STAGEF'

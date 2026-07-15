@@ -39,7 +39,7 @@ cd "$PROJECT/files"
 #   LATENT_MANUAL_LAYERNORM=1                 (LN-backward kernel workaround, see STRIX_HALO.md §2)
 #   TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 (flash attention; without it the first TRAIN step
 #                                              JIT-compiles the math fallback for ~45 min)
-LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 python rocm_smoke.py --preset small-w3
+LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 TORCH_BLAS_PREFER_HIPBLASLT=0 python rocm_smoke.py --preset small-w3
 ```
 
 ## 2. Data → chunk cache (one-time)
@@ -88,11 +88,14 @@ nohup python train_scaled.py --preset small-w3 --cache chunk_cache --device cuda
   --out runs/scaled > train.log 2>&1 &
 tail -f train.log
 ```
-On ROCm/gfx1151 **export both** `LATENT_MANUAL_LAYERNORM=1` and
-`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` (the latter enables flash attention —
-without it the first step JIT-compiles the math fallback for ~45 min), and use the
-auto-start queue in [`STRIX_HALO.md`](STRIX_HALO.md) §6. `--num-workers 2` (not 8) — the
-cache loads fully into RAM, so extra workers only fork a multi-GB process for nothing.
+On ROCm/gfx1151 **export all three** env vars — `LATENT_MANUAL_LAYERNORM=1`,
+`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` (flash attention; without it the first step
+JIT-compiles the math fallback for ~45 min), and `TORCH_BLAS_PREFER_HIPBLASLT=0`
+(rocBLAS; skips hipBLASLt's slow GEMM autotune) — and use the auto-start queue in
+[`STRIX_HALO.md`](STRIX_HALO.md) §6. `--num-workers 2` (not 8) — the cache loads fully
+into RAM, so extra workers only fork a multi-GB process for nothing. **The first
+optimizer step compiles GPU kernels and takes 20–40 min on gfx1151 with a silent log —
+that is normal and one-time; do NOT kill it. See [`STRIX_HALO.md`](STRIX_HALO.md) §7.5.**
 
 ## 4. Monitor
 
@@ -107,10 +110,21 @@ ls -l --time-style=+%H:%M runs/scaled/checkpoint.pt   # mtime should keep advanc
 **Healthy startup** (flushed markers, in order): `[data] LOADING cache … 356 shards` →
 `[data] LOADED … in ~3s (cache ready)` → `[trainer] training loop starting …` →
 `[trainer] first optimizer step done in Xs -- LIVE` → `[step 50] stage=A …`. The cache
-load is **seconds**; only the **first optimizer step** takes minutes (GPU kernel
-compile). If the first-step line hasn't printed but `cat /sys/class/drm/card*/device/gpu_busy_percent`
-reads `100`, it's compiling — **wait, don't restart**. (A ~45-min first step means you
-forgot `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` and it's on the slow math attention.)
+load is **seconds**; only the **first optimizer step** takes minutes-to-tens-of-minutes
+(GPU kernel compile), during which the log is **silent by design** (no prints inside a
+compile). **Follow with `tail -F` (capital), not `-f`** — a relaunch recreates
+`train.log` and `-f` follows the dead handle.
+
+**Is it compiling or actually stuck?** (no `rocm-smi`/`py-spy` needed):
+```bash
+PID=$(pgrep -f 'train_scaled.py' | head -1)
+t1=$(awk '{print $14+$15}' /proc/$PID/stat); sleep 20; t2=$(awk '{print $14+$15}' /proc/$PID/stat)
+g=$(cat /sys/class/drm/card*/device/gpu_busy_percent | sort -rn | head -1)
+[ "$((t2-t1))" -gt 200 ] || [ "${g:-0}" -ge 50 ] && echo "✅ WORKING — leave it" || echo "⚠️ STALLED"
+```
+✅ (GPU busy or CPU ticks climbing) → it's compiling; **wait, don't kill** — every kill
+resets the 20–40 min compile (the trap). ⚠️ (GPU 0 **and** ticks flat) → genuinely
+stuck. Full gfx1151 first-step explainer: [`STRIX_HALO.md`](STRIX_HALO.md) §7.5.
 
 Once live you'll see a cheap **`[step N] stage=X … (heartbeat)`** ping every **10 steps**
 (default `--heartbeat-every 10`; no eval, so it's basically free) plus the full metric
@@ -174,7 +188,7 @@ carries the `small-w3` config, so Stage F inherits it — **don't pass `--preset
 
 ### 6.1 Offline smoke (plumbing check — no ckpt, no downloads, ~1 min)
 ```bash
-cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 TORCH_BLAS_PREFER_HIPBLASLT=0
 python train_dialogue.py --offline --preset small-w3 --multi-turn --persona \
   --steps 20 --batch-size 2 --out runs/dlg_sanity && rm -rf ~/hlra/runs/dlg_sanity
 ```
@@ -185,7 +199,7 @@ real fine-tune below loads the trained one via `--ckpt`).
 The foundation (`runs/scaled/model.pt`) is loaded **read-only**; Stage-F writes to a
 **separate** `--out runs/dialogue` — it never overwrites the A→E checkpoint.
 ```bash
-cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
+cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 TORCH_BLAS_PREFER_HIPBLASLT=0
 nohup python train_dialogue.py --ckpt runs/scaled/model.pt \
   --hf-chat HuggingFaceH4/no_robots --split train \
   --multi-turn --soft-tags --content-tags --trust-gate --vector-gate --persona --gestalt-readout \
@@ -236,7 +250,7 @@ setup (install, LayerNorm workaround, Xet-escape) lives in
 ```bash
 source ~/hlra/.venv-rocm/bin/activate
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"   # -> ...rocm... True
-cd ~/hlra/files && LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 python rocm_smoke.py --preset small-w3   # must end PASS
+cd ~/hlra/files && LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 TORCH_BLAS_PREFER_HIPBLASLT=0 python rocm_smoke.py --preset small-w3   # must end PASS
 ```
 
 ### 7.2 Prep the chunk cache (the command that ran)

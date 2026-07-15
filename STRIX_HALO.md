@@ -18,18 +18,20 @@ Paths below assume the repo is at `~/hlra`; adjust if yours differs.
 ```
 1. groups: render + video          (admin, one-time)
 2. pip install torch  from AMD's gfx1151 index  (--no-cache-dir)   — NO HSA_OVERRIDE
-3. export LATENT_MANUAL_LAYERNORM=1  +  TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
-       (LN-backward kernel workaround  +  flash attention: without it the first TRAIN step
-        JIT-compiles a math fallback for ~45 min and looks hung)
-4. rocm_smoke.py  -> PASS
+3. export the THREE gfx1151 env vars (see §0 box below):
+       LATENT_MANUAL_LAYERNORM=1              (LN-backward kernel workaround)
+       TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1  (flash attention; else math fallback = 45-min first step)
+       TORCH_BLAS_PREFER_HIPBLASLT=0          (rocBLAS; skips slow hipBLASLt GEMM autotuning)
+4. rocm_smoke.py  -> PASS   (and read §7.5 "The slow first step" BEFORE you panic at a quiet log)
 5. data: SaT on GPU + get the parquet on-box (HF Xet 403 escape) + data_prep --local-glob
 6. queue training to auto-start after prep
 ```
 
-Three env vars you will keep set (put in `~/.bashrc`):
+Three env vars you will keep set (put in `~/.bashrc` so every shell + nohup'd job has them):
 ```bash
 echo 'export LATENT_MANUAL_LAYERNORM=1' >> ~/.bashrc              # broken LayerNorm-backward kernel (step 3)
 echo 'export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1' >> ~/.bashrc  # flash attention: else first train step ~45min on math fallback
+echo 'export TORCH_BLAS_PREFER_HIPBLASLT=0' >> ~/.bashrc         # rocBLAS: skips hipBLASLt's slow per-shape GEMM autotune
 # (no HSA_OVERRIDE_GFX_VERSION with a native gfx1151 wheel — it BREAKS kernel launch)
 ```
 
@@ -212,6 +214,7 @@ cat > ~/run_pipeline.sh <<'EOF'
 PY="__PY__"                              # the exact interpreter prep used (has the working gfx1151 torch)
 export LATENT_MANUAL_LAYERNORM=1
 export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1   # flash attention (else first step ~45min on math fallback)
+export TORCH_BLAS_PREFER_HIPBLASLT=0               # rocBLAS (skips slow hipBLASLt GEMM autotune)
 PREP_PID="$1"
 cd ~/hlra/files
 log(){ echo "[$(date '+%F %T')] $*"; }
@@ -255,7 +258,7 @@ and run — remember the box-specifics **`LATENT_MANUAL_LAYERNORM=1`,
 `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`, `--preset small-w3`, `--var-weight 3.0`,
 batch 32**:
 ```bash
-cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 && export BATCH=32
+cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 TORCH_BLAS_PREFER_HIPBLASLT=0 && export BATCH=32
 export STAGE_STEPS=$(python3 -c "import json,os;m=json.load(open(os.path.expanduser('~/hlra/chunk_cache/manifest.json')));print(','.join([str(max(1,(m['total']//$BATCH)//6))]*4+[str(2*max(1,(m['total']//$BATCH)//6)),'0']))")
 nohup python train_scaled.py --preset small-w3 --cache chunk_cache --device cuda --amp --amp-dtype bf16 \
   --batch-size "$BATCH" --stage-steps "$STAGE_STEPS" --var-weight 3.0 --lr-schedule per-stage \
@@ -300,6 +303,46 @@ runs/scaled/model.pt --repo <you>/hlra-smallw3 --strip --bf16`** (uploads
 inference-only weights, ~4–8× smaller, no git limit), or `rsync -avP
 daniel@<box>:~/hlra/runs/scaled/model.pt <local>`.
 
+### 7.5 The slow first step (READ THIS before you panic at a quiet log)
+
+On gfx1151 the **first optimizer step of a fresh process compiles/autotunes GPU
+kernels and takes 20–40 minutes**, during which the log is **silent** (there are no
+print statements inside a compile) and the GPU sits at **100%**. This is normal. It is
+a **one-time cost per process** — once it clears, steps run at ~1.6 step/s (~8 h for the
+whole A→E run) and it checkpoints every 1000 steps.
+
+Hard-won facts, so you don't repeat our day:
+- **A quiet log ≠ hung.** The markers are `[data] LOADED … in ~3s` → `[trainer]
+  training loop starting …` → *(silence while it compiles)* → `[trainer] first
+  optimizer step done in Xs` → `[step N … (heartbeat)]`. The gap between the middle two
+  is the compile.
+- **DO NOT KILL IT mid-compile.** Every kill throws the compiled kernels away, so the
+  next process starts the 20–40 min over. Killing repeatedly is the trap that never
+  finishes. If it reached a checkpoint (step ≥1000), a kill loses ≤1000 steps and
+  auto-resumes — but you still re-pay the compile.
+- **`rocm_smoke` warming does NOT transfer.** Kernels are compiled per *shape*;
+  `rocm_smoke` uses a small batch, training uses batch 32 → different shapes → the
+  smoke's 6 s PASS does not pre-bake training's kernels. (It still validates the config
+  and is worth running.)
+- **Use `tail -F`, not `tail -f`** — a relaunch recreates `train.log` and plain `-f`
+  follows the dead file handle and goes silent.
+
+**Is it working or actually stuck?** No `rocm-smi`/`py-spy` needed — the kernel exposes
+it. This samples 20 s and prints a verdict:
+```bash
+PID=$(pgrep -f 'train_scaled.py' | head -1)
+t1=$(awk '{print $14+$15}' /proc/$PID/stat); sleep 20; t2=$(awk '{print $14+$15}' /proc/$PID/stat)
+g=$(cat /sys/class/drm/card*/device/gpu_busy_percent | sort -rn | head -1)
+if [ "$((t2-t1))" -gt 200 ] || [ "${g:-0}" -ge 50 ]; then echo "✅ WORKING (GPU ${g}%, +$((t2-t1)) ticks) — leave it"; else echo "⚠️ STALLED — GPU idle AND ticks flat"; fi
+```
+✅ = compiling/training, wait. ⚠️ (GPU 0 **and** ticks flat) = genuinely stuck, then act.
+
+**Levers if the compile is intolerable** (each needs a relaunch → re-pays the compile,
+so use sparingly): `TORCH_BLAS_PREFER_HIPBLASLT=0` (rocBLAS, skips hipBLASLt's slow
+per-shape GEMM autotune — already in the env vars above); or drop `--batch-size` to 16
+(smaller shapes compile faster, slightly different step). The reliable path is simply
+to **let the batch-32 compile finish once, untouched.**
+
 ---
 
 ## 8. Troubleshooting (everything that bit us, with the fix)
@@ -311,7 +354,7 @@ daniel@<box>:~/hlra/runs/scaled/model.pt <local>`.
 | `cuda? False`, `hipErrorNoDevice` | not in `render`/`video` groups → admin `usermod -aG render,video`, re-login (§1a). |
 | `invalid device function` / `no kernel image` (matmul) | wheel lacks gfx1151 kernels, or you set `HSA_OVERRIDE` → use the gfx1151 wheel, **no override** (§1). |
 | `rocm_smoke.py [3] grads finite: False` (nondeterministic LN params) | broken `native_layer_norm_backward` → **`LATENT_MANUAL_LAYERNORM=1`** (§2). |
-| **First TRAIN step takes ~45 min**, GPU pinned at 100%, no `[step 50]`, last log line is the `scaled_dot_product_attention` warning | flash attention is off → SDPA fell back to the slow math backend, whose first step JIT-compiles forever → **`export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`** (validate with `rocm_smoke.py` → PASS; it's numerically exact). The cache load itself is only seconds (`[data] LOADED … in ~3s`). |
+| **First TRAIN step takes 20–45 min**, GPU pinned at 100%, log silent after `training loop starting` | The first step of a fresh process compiles GPU kernels — normal, one-time, **not hung** (§7.5). Fixes/mitigations, in order: (1) `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` (flash attention — without it the math fallback is worst-case ~45 min); (2) `TORCH_BLAS_PREFER_HIPBLASLT=0` (skip hipBLASLt GEMM autotune). **Do NOT kill it** — that resets the compile. `rocm_smoke`'s fast PASS does NOT pre-warm it (different batch shape). Verdict check + full explanation: §7.5. |
 | The `scaled_dot_product_attention` **warning text** itself | cosmetic → **ignore** (the *warning* is harmless; the slow *math fallback* it implies is the row above). |
 | `amdgpu.ids: No such file` | cosmetic → **ignore** (§1c). |
 | `403 Forbidden … cas-bridge.xethub.hf.co`, "Reconstructing…" hangs | HF **Xet** CDN blocked; `HF_HUB_DISABLE_XET` is ignored → download elsewhere + `rsync` + `--local-glob`, or `pip uninstall hf_xet`, or a non-Xet corpus (§5b). |

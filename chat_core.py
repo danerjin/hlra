@@ -59,6 +59,38 @@ def score_text(model, chunker, cfg, text):
     return _score(model, chunker, cfg, text)
 
 
+def load_dialogue_checkpoint(ckpt_path):
+    """Load a Stage-F chatbot: (model, adapter, chunker, cfg, ckpt_meta). Reuses
+    load_checkpoint for the model/chunker/cfg (the config is read from the
+    checkpoint, so the Stage-F flags it was trained with are honored), then loads
+    the DialogueAdapter (the learned response seed). Works on a plain A→E
+    checkpoint too -- the adapter is then zero-init, i.e. UNTRAINED dialogue."""
+    from dialogue import DialogueAdapter
+    model, chunker, cfg, ckpt = load_checkpoint(ckpt_path)
+    adapter = DialogueAdapter(cfg.d_latent)
+    if "adapter_state" in ckpt:
+        adapter.load_state_dict(ckpt["adapter_state"])
+    adapter.eval()
+    return model, adapter, chunker, cfg, ckpt
+
+
+def new_dialogue_session(model, adapter, chunker, cfg):
+    """A fresh DialogueSession (the full Stage-F two-lane serving: input lane +
+    response seed + cross-turn gestalt memory). One session = one conversation."""
+    from dialogue import DialogueSession
+    return DialogueSession(model, adapter, chunker, cfg, use_act=True)
+
+
+def dialogue_reply(session, text, n_chunks=6, temperature=0.9, greedy=False):
+    """One chatbot turn through the persistent session (memory carries across
+    calls). Returns (reply_chunks: list[str], read_chunks: list[str])."""
+    read = input_chunks(session.chunker, text)
+    joined = session.reply(text, max_chunks=n_chunks, temperature=temperature,
+                           greedy=greedy, separator=_SENT)
+    reply = [c for c in joined.split(_SENT) if c]
+    return reply, read
+
+
 def ckpt_summary(cfg, ckpt):
     """Small dict of checkpoint facts for display/debug."""
     return {

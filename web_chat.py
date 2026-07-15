@@ -22,13 +22,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import chat_core
 
-STATE = {"model": None, "chunker": None, "cfg": None, "meta": None, "path": None}
+STATE = {"model": None, "adapter": None, "session": None,
+         "chunker": None, "cfg": None, "meta": None, "path": None}
 LOCK = threading.Lock()
 
 
 def do_load(path):
-    model, chunker, cfg, ckpt = chat_core.load_checkpoint(path)
-    STATE.update(model=model, chunker=chunker, cfg=cfg,
+    # Load the model AND a DialogueAdapter + a fresh DialogueSession, so the "Chat"
+    # mode's full Stage-F serving (input lane + response seed + cross-turn memory)
+    # is available. On a plain A→E checkpoint the adapter is zero-init (untrained
+    # dialogue) but the Generate/Score modes are unaffected.
+    model, adapter, chunker, cfg, ckpt = chat_core.load_dialogue_checkpoint(path)
+    session = chat_core.new_dialogue_session(model, adapter, chunker, cfg)
+    STATE.update(model=model, adapter=adapter, session=session, chunker=chunker, cfg=cfg,
                  meta=chat_core.ckpt_summary(cfg, ckpt),
                  path=os.path.abspath(os.path.expanduser(path.strip())))
 
@@ -105,8 +111,10 @@ PAGE = r"""<!doctype html>
     <h2>Mode</h2>
     <div class="seg" id="mode">
       <button data-mode="generate" class="on">Generate</button>
-      <button data-mode="score">Score (ppl)</button>
+      <button data-mode="dialogue">Chat</button>
+      <button data-mode="score">Score</button>
     </div>
+    <div class="sub" style="margin-top:2px">Chat = Stage-F two-lane serving (cross-turn memory); Clear resets it.</div>
   </div>
 
   <div class="card">
@@ -162,11 +170,13 @@ function refreshMeta(){fetch("/api/info").then(r=>r.json()).then(m=>{
 
 $("#mode").addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;
   mode=b.dataset.mode;[...$("#mode").children].forEach(x=>x.classList.toggle("on",x===b));
-  box.placeholder = mode==="score" ? "Text to score (perplexity)…" : "Message the model…";});
+  box.placeholder = mode==="score" ? "Text to score (perplexity)…"
+                  : mode==="dialogue" ? "Message the chatbot…" : "Message the model…";});
 
 $("#temp").oninput=e=>$("#tempv").textContent=(+e.target.value).toFixed(2);
 $("#nchunks").oninput=e=>$("#nv").textContent=e.target.value;
-$("#clear").onclick=()=>{thread.innerHTML='<div class="wrap"></div>';};
+$("#clear").onclick=()=>{thread.innerHTML='<div class="wrap"></div>';
+  fetch("/api/dialogue_reset",{method:"POST"});};   // also wipe the chatbot's cross-turn memory
 $("#loadbtn").onclick=()=>{const p=$("#ckpt").value.trim();if(!p)return;
   $("#meta").textContent="loading…";
   api("/api/load",{path:p}).then(m=>{if(m.error){$("#meta").textContent="ERROR: "+m.error;}else{refreshMeta();$("#ckpt").value="";}});};
@@ -204,6 +214,16 @@ function send(){
       if(r.error){bot.appendChild(el("div","txt","error: "+r.error));}
       else{bot.appendChild(el("span","score",`avg NLL/token = ${r.nll.toFixed(3)}   ·   perplexity = ${r.ppl.toFixed(1)}`));
         if(showread){const d=el("div","dbg");d.appendChild(el("div",null,`input → ${r.read.length} chunks`));
+          const rr=el("div","read");renderChunks(rr,r.read,true);d.appendChild(rr);bot.appendChild(d);}}
+      $("#send").disabled=false;box.focus();});
+    return;
+  }
+  if(mode==="dialogue"){
+    api("/api/dialogue",{text,temperature:temp,n_chunks:n}).then(r=>{bot.innerHTML="";
+      if(r.error){bot.appendChild(el("div","txt","error: "+r.error));}
+      else{renderChunks(bot, r.reply.length?r.reply:["(empty)"], viz);
+        if(showread){const d=el("div","dbg");
+          d.appendChild(el("div",null,`you → ${r.read.length} chunks · reply → ${r.reply.length} thoughts`));
           const rr=el("div","read");renderChunks(rr,r.read,true);d.appendChild(rr);bot.appendChild(d);}}
       $("#send").disabled=false;box.focus();});
     return;
@@ -275,6 +295,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._json({"error": str(e)})
 
+        if self.path == "/api/dialogue_reset":
+            with LOCK:
+                s = STATE.get("session")
+                if s is not None:
+                    s.memory.reset(); s.source_memory = None
+            return self._json({"ok": True})
+
         if STATE["model"] is None:
             return self._json({"error": "no checkpoint loaded"})
         text = (body.get("text") or "").strip()
@@ -299,6 +326,12 @@ class Handler(BaseHTTPRequestHandler):
                     if body.get("score"):
                         _, out["ppl"] = chat_core.score_text(m, ch, cfg, text)
                     return self._json(out)
+                if self.path == "/api/dialogue":
+                    n = int(body.get("n_chunks", 6))
+                    temp = float(body.get("temperature", 0.9))
+                    reply, read = chat_core.dialogue_reply(STATE["session"], text,
+                                                           n_chunks=n, temperature=temp)
+                    return self._json({"reply": reply, "read": read})
         except Exception as e:
             return self._json({"error": str(e)})
         self._json({"error": "not found"}, 404)

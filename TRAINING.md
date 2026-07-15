@@ -144,10 +144,10 @@ python push_to_hf.py --ckpt runs/dialogue/model.pt --repo <you>/hlra-chat --stri
 # --- OR rsync the checkpoint back to your laptop (run this ON your laptop) ---
 rsync -avP daniel@<box>:~/hlra/runs/dialogue/model.pt ~/hlra/runs/dialogue/model.pt
 
-# --- chat with it ---
-python chat.py runs/dialogue/model.pt        # quick generation via the A→E path
-#   (the FULL Stage-F two-lane serving — input lane, response seed, cross-turn memory —
-#    is dialogue.DialogueSession; see STAGE_F.md §serving.)
+# --- chat with it (proper Stage-F two-lane serving: input lane + response seed + cross-turn memory) ---
+python dialogue_chat.py runs/dialogue/model.pt     # CLI REPL (:source for RAG · :reset · :temp · :n)
+python web_chat.py runs/dialogue/model.pt          # web UI -> pick the "Chat" mode toggle
+#   (chat.py also loads it, but only runs the plain A→E generation path — no dialogue memory.)
 ```
 
 ---

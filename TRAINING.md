@@ -52,6 +52,15 @@ python data_prep.py --dataset HuggingFaceFW/fineweb-edu --name sample-10BT --str
   (reads local files offline). Full recipe in [`STRIX_HALO.md`](STRIX_HALO.md) §5.
 - `--preset` must match training. `small-w3` needs `--var-weight 3.0` at launch.
 - Prep is **not resumable** → run under `nohup`/`tmux`; it ends `wrote <N> examples`.
+- **Killed/stalled mid-prep?** The manifest is only written at the very end, but every
+  finished `shard_*.pt` is on disk. Reconstruct a valid manifest and train on the
+  **partial** cache (0.5–1 B tokens is a fine first run — the budget has slack):
+  ```bash
+  pkill -f data_prep                                   # stop the stalled prep first
+  python make_manifest.py "$PROJECT/chunk_cache" small-w3   # scans shards -> writes manifest.json
+  ```
+  It skips a half-written trailing shard automatically and stamps the current
+  `chunker_version` so the loader accepts the salvaged cache.
 
 ## 3. Stage budget + launch
 
@@ -77,11 +86,46 @@ On ROCm/gfx1151 prepend `LATENT_MANUAL_LAYERNORM=1` and use the auto-start queue
 
 ## 4. Monitor
 
+Run all of these from `$PROJECT/files` (where `prep.log` / `train.log` are written).
+
+### 4.1 Is it alive, and did the workaround engage?
 ```bash
-grep -E 'stage=(A|B|C)' train.log | tail -3   # val_loss must be flat/lower across A->B
+pgrep -af 'data_prep|train_scaled' || echo "NOT RUNNING"
+grep -m1 "manual LayerNorm active" train.log   # ROCm/gfx1151: MUST print once, else the run is corrupt -> kill & relaunch with LATENT_MANUAL_LAYERNORM=1
+ls -l --time-style=+%H:%M runs/scaled/checkpoint.pt   # mtime should keep advancing (proof it's still writing)
+```
+
+### 4.2 How much time is left?
+**During prep** — reads the live token count from the log (never hardcode it), assumes the 1.2 B target:
+```bash
+T=$(grep -oE '~[0-9]+ tokens' prep.log | tail -1 | grep -oE '[0-9]+')
+S=$(ps -o etimes= -p "$(pgrep -f data_prep | head -1)" | tr -d ' ')
+python3 -c "t=$T;s=$S;b=1.2e9;r=t/s;print(f'{t/1e6:.0f}M tok · {r/1000:.1f}k tok/s · elapsed {s/3600:.1f}h · ETA ~{(b-t)/r/3600:.1f}h to {b/1e9:.1f}B')"
+```
+**During training** — total steps ≈ one epoch (`examples // BATCH`), so % and ETA fall out of the last `[step N]`:
+```bash
+export BATCH=32   # the value you launched with
+TOT=$(python3 -c "import json,os;m=json.load(open(os.path.expanduser('$PROJECT/chunk_cache/manifest.json')));print(m['total']//$BATCH)")
+N=$(grep -oE '\[step [0-9]+\]' train.log | tail -1 | grep -oE '[0-9]+')
+S=$(ps -o etimes= -p "$(pgrep -f train_scaled | head -1)" | tr -d ' ')
+python3 -c "n=$N;tot=$TOT;s=$S;r=n/max(s,1);print(f'step {n}/{tot} ({100*n/tot:.0f}%) · {r:.2f} step/s · elapsed {s/3600:.1f}h · ETA ~{(tot-n)/max(r,1e-9)/3600:.1f}h')"
+```
+ETA is a running average — it's pessimistic early (model-load + warmup are in the elapsed time) and settles after a few hundred steps. Stage E (the `2*u` block) is the longest.
+
+### 4.3 Which stage / what are the losses doing?
+```bash
+grep -E 'stage=(A|B|C|D|E)' train.log | tail -3   # val_loss must be flat/lower across A->B
 ```
 Healthy: `[step N] stage=B ... logs={'nll':6.9,'ssl':0.7,...} val_loss=6.85 lstd=0.42`.
-Collapse = `val_loss` rises at B **and** `ssl`→0 **and** `lstd` craters, together.
+Collapse = `val_loss` rises at B **and** `ssl`→0 **and** `lstd` craters, together (§0).
+
+### 4.4 Is the GPU actually working?
+```bash
+rocm-smi --showuse --showmeminfo vram      # ROCm/gfx1151: GPU% high, VRAM/GTT stable (not climbing to OOM)
+# nvidia-smi                               # CUDA equivalent
+watch -n5 'tail -n2 train.log'             # live step counter without holding a tail -f open
+```
+On Strix Halo the "VRAM" is the shared GTT — watch it stay flat, not creep (a slow climb is the allocator-pool issue the prep fix addresses; training doesn't hit it, but it's the thing to eyeball).
 
 ## 5. Stop / resume / finish
 

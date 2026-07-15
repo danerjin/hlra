@@ -164,14 +164,21 @@ Confirms the path runs and the losses aren't `nan` (a **fresh** `small-w3` model
 real fine-tune below loads the trained one via `--ckpt`).
 
 ### 6.2 Real fine-tune off the small-w3 checkpoint (background)
+The foundation (`runs/scaled/model.pt`) is loaded **read-only**; Stage-F writes to a
+**separate** `--out runs/dialogue` — it never overwrites the A→E checkpoint.
 ```bash
 cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1
 nohup python train_dialogue.py --ckpt runs/scaled/model.pt \
-  --hf-chat <HF_CHAT_DATASET> --hf-name <subset> \
-  --multi-turn --soft-tags --content-tags --trust-gate --persona --gestalt-readout \
-  --batch-size 8 --steps <N> --out runs/dialogue > dialogue.log 2>&1 &
+  --hf-chat HuggingFaceH4/no_robots --split train \
+  --multi-turn --soft-tags --content-tags --trust-gate --vector-gate --persona --gestalt-readout \
+  --batch-size 8 --steps 3000 --out runs/dialogue > dialogue.log 2>&1 &
 tail -f dialogue.log
 ```
+- **Dataset:** `HuggingFaceH4/no_robots` (10k clean instruct dialogues, `messages`
+  schema, downloads without Xet issues — verified). Scale up with
+  `--hf-chat HuggingFaceH4/ultrachat_200k --split train_sft`.
+- **Any `messages`-schema chat dataset works** (role `assistant`→SELF, `user`→USER,
+  `system`→SYSTEM). **Don't pass `--preset` with `--ckpt`** — the checkpoint's config wins.
 - **Transcript data** (you choose who is SELF — the reasoner vs. an advocate):
   swap in `--hf-transcript <ID> --text-field text --target-speaker "SOCRATES" --system-speakers "NARRATOR"`.
 - Add `--rag` for latent RAG. Full flag table: [`STAGE_F.md`](STAGE_F.md) §4–6.

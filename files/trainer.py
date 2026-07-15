@@ -237,6 +237,15 @@ class Trainer:
                 self._bar = None
 
     def _train_loop(self, max_steps: int, accum: int):
+        import time
+        _loop_t0 = time.time()
+        _first_step_logged = False
+        # With log_every=50 the first visible line is step 50; the FIRST optimizer
+        # step also JIT-compiles GPU kernels (minutes on ROCm/gfx1151), so without
+        # these markers a healthy startup looks hung. Emit loop-start + first-step.
+        self._emit(f"[trainer] training loop starting @ step {self.global_step}, "
+                   f"stage={self.curriculum.stage.name}, {max_steps} steps total. "
+                   f"First step JIT-compiles GPU kernels -- minutes on ROCm/gfx1151 is normal.")
         while self.curriculum.stage.value <= Stage.E.value and self.global_step < max_steps:
             flags = self.curriculum.stage_flags()
             plan = self.curriculum.loss_plan()
@@ -292,6 +301,10 @@ class Trainer:
                         f"skipped), so inspect the last checkpoint and the data/LR before resuming.")
             self.ema.update(self.model.chunk_encoder)
             self.global_step += 1
+            if not _first_step_logged:
+                self._emit(f"[trainer] first optimizer step done in {time.time() - _loop_t0:.0f}s "
+                           f"-- training is LIVE (next log at step {self.train_cfg.log_every}).")
+                _first_step_logged = True
             if self._bar is not None:
                 self._bar.update(1)
                 self._bar.set_postfix(stage=self.curriculum.stage.name, lr=f"{lr:.1e}",

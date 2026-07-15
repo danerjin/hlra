@@ -411,20 +411,35 @@ class CachedChunkDataset(Dataset):
                 f"cache at {cache_dir} {detail}; the current chunker is "
                 f"v{CHUNKER_VERSION}. Re-prep with data_prep.py, or set "
                 f"LATENT_ALLOW_STALE_CHUNKER=1 if you are certain this cache is fine.")
+        import time
+        n_shards = len(self.manifest["shards"])
+        total_ex = self.manifest.get("total", "?")
+        # This eagerly loads EVERY shard into RAM (see class note); for a multi-GB
+        # cache that is minutes of silent work before training can start, so log
+        # progress -- otherwise a fresh run looks hung during the load.
+        print(f"[data] LOADING cache {cache_dir}: {n_shards} shards (~{total_ex} examples) into RAM...",
+              flush=True)
+        t0 = time.time()
         cts, cms, ris, rms = [], [], [], []
-        for shard in self.manifest["shards"]:
+        for i, shard in enumerate(self.manifest["shards"], 1):
             d = torch.load(os.path.join(cache_dir, shard))
             cts.append(d["chunk_tensor"]); cms.append(d["chunk_mask"])
             ris.append(d["raw_ids"]); rms.append(d["raw_mask"])
+            if i % 25 == 0 or i == n_shards:
+                print(f"[data]   loaded {i}/{n_shards} shards ({time.time() - t0:.0f}s)", flush=True)
         if not cts:
             raise ValueError(
                 f"cache at {cache_dir} contains no shards -- the prep run kept zero "
                 f"documents (all filtered by min_chunks, or --max-tokens too small). "
                 f"Re-run data_prep.py with looser limits.")
+        print(f"[data] concatenating {n_shards} shards...", flush=True)
         self.chunk_tensor = torch.cat(cts, 0)
         self.chunk_mask = torch.cat(cms, 0)
         self.raw_ids = torch.cat(ris, 0)
         self.raw_mask = torch.cat(rms, 0)
+        del cts, cms, ris, rms   # free the per-shard copies; cat already duplicated them
+        print(f"[data] LOADED {self.chunk_tensor.shape[0]} examples in {time.time() - t0:.0f}s "
+              f"(cache ready).", flush=True)
         # Guard against a stale/mixed cache (e.g. a re-prep into an existing
         # dir that crashed mid-way: the old manifest survives next to a mix of
         # old and new shards, and training would silently use the blend).

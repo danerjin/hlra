@@ -266,9 +266,10 @@ overrides); loud `WARNING: resume schedule differs` if flags differ (fix them).
 python plot_metrics.py runs/scaled                                     # runs/scaled/loss_curves.png
 python generate.py --ckpt ~/hlra/runs/scaled/model.pt --score "a sentence to score"
 ```
-Off-the-server transfer of the checkpoint: strip to inference weights first
-(`model_state`+`model_cfg`, ~4× smaller than the full model+optimizer+EMA), then
-`rsync`/HF-Hub it.
+Off-the-server transfer of the checkpoint: **`python push_to_hf.py --ckpt
+runs/scaled/model.pt --repo <you>/hlra-smallw3 --strip --bf16`** (uploads
+inference-only weights, ~4–8× smaller, no git limit), or `rsync -avP
+daniel@<box>:~/hlra/runs/scaled/model.pt <local>`.
 
 ---
 

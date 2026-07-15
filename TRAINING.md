@@ -95,11 +95,59 @@ re-prep/touch the cache dir mid-run.
 
 ## 6. Stage F — chatbot fine-tuning (optional, UNVALIDATED)
 
-A separate phase off the finished A→E `runs/scaled/model.pt`, via `train_dialogue.py`
-(**not** `train_scaled.py`). Opt-in and byte-identical to A→E when off; smoke-only.
-Design + flags + real-data recipe: **[`STAGE_F.md`](STAGE_F.md)**. One-line smoke:
+Fine-tune the finished A→E **`small-w3`** checkpoint into a chatbot with a separate
+driver (`train_dialogue.py`, **not** `train_scaled.py`). Every feature is opt-in and
+byte-identical to A→E when off; it is **smoke-only** (never trained on real dialogue;
+the 2026-07-14 review found the anti-sycophancy loss doesn't yet reliably train the
+trust gate). Design, flags, and caveats: **[`STAGE_F.md`](STAGE_F.md)**.
+
+**Precondition:** the A→E run finished → `runs/scaled/model.pt` exists on the box. It
+carries the `small-w3` config, so Stage F inherits it — **don't pass `--preset` with
+`--ckpt`** (the checkpoint's config wins). On ROCm/gfx1151 keep
+`LATENT_MANUAL_LAYERNORM=1` exported (Stage F trains → the LayerNorm workaround applies).
+
+### 6.1 Offline smoke (plumbing check — no ckpt, no downloads, ~1 min)
 ```bash
-python train_dialogue.py --offline --preset smoke --multi-turn --persona --steps 20 --batch-size 2 --out runs/dlg_sanity
+cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1
+python train_dialogue.py --offline --preset small-w3 --multi-turn --persona \
+  --steps 20 --batch-size 2 --out runs/dlg_sanity && rm -rf ~/hlra/runs/dlg_sanity
+```
+Confirms the path runs and the losses aren't `nan` (a **fresh** `small-w3` model — the
+real fine-tune below loads the trained one via `--ckpt`).
+
+### 6.2 Real fine-tune off the small-w3 checkpoint (background)
+```bash
+cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1
+nohup python train_dialogue.py --ckpt runs/scaled/model.pt \
+  --hf-chat <HF_CHAT_DATASET> --hf-name <subset> \
+  --multi-turn --soft-tags --content-tags --trust-gate --persona --gestalt-readout \
+  --batch-size 8 --steps <N> --out runs/dialogue > dialogue.log 2>&1 &
+tail -f dialogue.log
+```
+- **Transcript data** (you choose who is SELF — the reasoner vs. an advocate):
+  swap in `--hf-transcript <ID> --text-field text --target-speaker "SOCRATES" --system-speakers "NARRATOR"`.
+- Add `--rag` for latent RAG. Full flag table: [`STAGE_F.md`](STAGE_F.md) §4–6.
+- **Watch:** `nll` (anchor, should hold) · `cos`/`gen` (should fall — `gen` = response
+  quality) · `syco` · `trust=USER:../SELF:..`. Output: `runs/dialogue/model.pt`.
+
+### 6.3 Get the checkpoint back + share it
+Works for **either** checkpoint (`runs/scaled/model.pt` A→E, or `runs/dialogue/model.pt`
+Stage-F).
+
+```bash
+# --- push to HuggingFace (handles multi-GB; no git 100 MB limit) ---
+hf auth login                                            # once; paste a WRITE token
+python push_to_hf.py --ckpt runs/dialogue/model.pt --repo <you>/hlra-chat --strip --bf16
+#   --strip = inference-only weights (~4x smaller); repo is PRIVATE by default (--public to share).
+#   If the push fails on the box (network), rsync the file to your laptop and push from there.
+
+# --- OR rsync the checkpoint back to your laptop (run this ON your laptop) ---
+rsync -avP daniel@<box>:~/hlra/runs/dialogue/model.pt ~/hlra/runs/dialogue/model.pt
+
+# --- chat with it ---
+python chat.py runs/dialogue/model.pt        # quick generation via the A→E path
+#   (the FULL Stage-F two-lane serving — input lane, response seed, cross-turn memory —
+#    is dialogue.DialogueSession; see STAGE_F.md §serving.)
 ```
 
 ---

@@ -199,7 +199,6 @@ Prep takes hours; this waits for it, refuses to train on a half-cache, computes 
 stage budget, and launches the real run — all `nohup`'d, all logged to
 `pipeline.log`. Paste while prep is still running:
 
-```bash
 A nohup'd script does NOT inherit an un-activated shell, so it must not rely on
 bare `python` — it would fall back to whatever interpreter is on the default PATH
 (often a torch-less base python). The robust fix is to reuse **the exact interpreter

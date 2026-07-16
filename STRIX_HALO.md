@@ -22,7 +22,7 @@ Paths below assume the repo is at `~/hlra`; adjust if yours differs.
        LATENT_MANUAL_LAYERNORM=1              (LN-backward kernel workaround)
        TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1  (flash attention; else math fallback = 45-min first step)
        TORCH_BLAS_PREFER_HIPBLASLT=0          (rocBLAS; skips slow hipBLASLt GEMM autotuning)
-4. rocm_smoke.py  -> PASS   (if training later STALLS at GPU 100% -> §7.5: SVM thrash, HSA_XNACK=0)
+4. rocm_smoke.py  -> PASS   (if training later "stalls": §7.5 -- check checkpoint.pt + py-spy, NOT the log)
 5. data: SaT on GPU + get the parquet on-box (HF Xet 403 escape) + data_prep --local-glob
 6. queue training to auto-start after prep
 ```
@@ -302,59 +302,46 @@ runs/scaled/model.pt --repo <you>/hlra-smallw3 --strip --bf16`** (uploads
 inference-only weights, ~4–8× smaller, no git limit), or `rsync -avP
 daniel@<box>:~/hlra/runs/scaled/model.pt <local>`.
 
-### 7.5 Stalls: amdgpu SVM page-migration thrash (NOT a kernel compile)
+### 7.5 "It's stalled!" — first suspect the LOG, not the GPU
 
-> ⚠️ **This section previously said the stall was a 20–40 min "kernel compile — just
-> wait." That was WRONG**, and it cost most of a day. `py-spy` disproved it (see below).
-> There is no compile. Do not wait it out.
+**Root cause, found the hard way (2026-07-16): a logging bug made healthy runs look
+dead for 30-50 minutes.** `Trainer._emit` routed every step line through
+`tqdm.write()` whenever `self._bar is not None` — but `_make_progress_bar` passes
+`disable=None` for `progress="auto"`, which makes tqdm *hide* itself off-TTY while
+still returning a live object. So under `nohup`, `_bar` was not-None, every line went
+through `tqdm.write()` (which does **not** flush), and with stdout block-buffered to a
+file the step lines sat in the ~8 KB buffer — **~1300 steps of lag**. The run trained
+fine the whole time; only the log was frozen. Fixed by checking `.disable` too.
 
-**Symptom.** Training goes silent for tens of minutes (often at the *first step after a
-resume*, but it also hit mid-run at step ~17,900): no `[step N]` lines, **GPU reads
-100%**, CPU burns ~1–1.5 cores, process state `R`, **no disk I/O**, `dmesg` shows **no**
-ring timeout or GPU reset. Nothing is hung, and nothing is compiling.
+**If a run looks stalled, in this order:**
+1. **Is the checkpoint advancing?** This is the only signal that never lied:
+   ```bash
+   ls -l --time-style=+%H:%M:%S ~/hlra/runs/scaled/checkpoint.pt   # should jump every ~1000 steps
+   ```
+   Advancing ⇒ it is training; **the log is behind, not the run.**
+2. **`py-spy` — the only tool that actually answers it** (`pip install py-spy` in the
+   VENV; needs ptrace: `sudo sysctl -w kernel.yama.ptrace_scope=0`):
+   ```bash
+   sudo "$(which py-spy)" dump --pid $(pgrep -f train_scaled.py | head -1)
+   ```
+   Take **two** dumps ~30 s apart:
+   - Frames **move** (`_train_loop:281` ↔ `evaluate`) ⇒ **training normally**.
+     `_train_loop` at the `torch.isfinite(total_norm)` line is the GPU **sync point** —
+     that's where a step legitimately spends its wall time.
+   - Frames **frozen** on one low-level call ⇒ genuinely stuck.
+3. Only then look at the GPU (`dmesg | grep -i "ring.*timeout\|gpu reset"`).
 
-**What it actually is: amdgpu SVM page-migration thrash.** `dmesg` names it:
-```
-workqueue: svm_range_restore_work [amdgpu] hogged CPU for >10000us 4 times
-                                                              ... 19 times
-                                                              ... 67 times      <- counter CLIMBING
-```
-On this APU the CPU and GPU share one memory pool. With **XNACK** on, the GPU
-*page-faults* on host memory and the driver migrates SVM ranges to satisfy it. With a
-big host working set — the **multi-GB chunk cache loaded entirely into RAM**, plus every
-forked DataLoader worker's copy-on-write image of that address space — the driver ends
-up migrating ranges continuously. The GPU shows "100% busy" because the **driver** is
-churning, not because compute is progressing. (The printk is rate-limited, so old
-timestamps do *not* mean it stopped — watch the counter, not the clock.)
-
-**Diagnosis (the two commands that actually settle it — needs sudo):**
-```bash
-PID=$(pgrep -f train_scaled.py | head -1)
-sudo "$(which py-spy)" dump --pid "$PID"       # pip install py-spy in the VENV (PEP 668)
-sudo dmesg | grep -i svm_range_restore | tail  # climbing "hogged CPU ... N times" = thrash
-```
-- **`py-spy` shows real model frames** (e.g. `_encode_real_rows` ← `forward_self_supervised`
-  ← `_loss_on`) → it is **executing model code**, not compiling. A compiler frame
-  (`comgr`/`hipblaslt`/codegen) would be the *only* thing proving a compile — we never
-  saw one.
-- **`svm_range_restore_work` counter climbing** → confirmed migration thrash.
-
-**Remedy** (targets the cause directly):
-```bash
-export HSA_XNACK=0        # no GPU page-faults on host memory -> explicit copies, no SVM migration
-# and launch with:
-  --num-workers 0         # the cache is ALREADY fully in RAM; forked workers only add
-                          # multi-GB COW images for the driver to migrate, and buy nothing
-```
-`--num-workers 0` is strictly correct here regardless: collation is just indexing an
-in-RAM tensor, so workers add fork/COW cost for zero throughput.
-
-**Why the old "compile" story looked plausible** (so nobody re-derives it): a quiet log
-+ GPU 100% + CPU burning genuinely *resembles* a JIT compile, `rocm_smoke` PASSes in 6 s
-(tiny footprint ⇒ no thrash), and one early run did clear a first step in ~3 min (small
-resident set). None of that was evidence of compilation — and `write_bytes` never
-discriminated anything (the tens of GB seen on a long-lived run were just its
-**checkpoint** history).
+**Signals that MISLED us for a full day — do not trust them:**
+- **GPU% = 100** — reads 100 when the *driver* churns, or when a kernel spins. Never proof of progress.
+- **Disk I/O** (`/proc/PID/io write_bytes`) — dominated by *checkpoint* writes (~1.6 GB
+  each), never the compiler. Frozen in every state.
+- **"It's a 20-40 min kernel compile, just wait"** — we asserted this repeatedly; `py-spy`
+  showed **model frames, never a compiler frame**. There was no compile.
+- **`svm_range_restore_work` in dmesg** — real, but its timestamps were **hours stale**
+  (~78k-88k uptime vs ~164k current). It was a red herring; `HSA_XNACK=0` was not the fix.
+- **The log itself** — buffered (above), *and* `>` truncates it on every relaunch, *and*
+  `tail -f` follows the dead handle across a relaunch. Use **`tail -F`**, and confirm the
+  live file with `ls -l /proc/$PID/fd/1`.
 
 **Use `tail -F`, not `tail -f`** — a relaunch recreates `train.log` and plain `-f`
 follows the dead handle and goes silent.
@@ -370,7 +357,7 @@ follows the dead handle and goes silent.
 | `cuda? False`, `hipErrorNoDevice` | not in `render`/`video` groups → admin `usermod -aG render,video`, re-login (§1a). |
 | `invalid device function` / `no kernel image` (matmul) | wheel lacks gfx1151 kernels, or you set `HSA_OVERRIDE` → use the gfx1151 wheel, **no override** (§1). |
 | `rocm_smoke.py [3] grads finite: False` (nondeterministic LN params) | broken `native_layer_norm_backward` → **`LATENT_MANUAL_LAYERNORM=1`** (§2). |
-| **First TRAIN step takes 20–45 min**, GPU pinned at 100%, log silent after `training loop starting` | The first step of a fresh process compiles GPU kernels — normal, one-time, **not hung** (§7.5). Fixes/mitigations, in order: (1) `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` (flash attention — without it the math fallback is worst-case ~45 min); (2) `TORCH_BLAS_PREFER_HIPBLASLT=0` (skip hipBLASLt GEMM autotune). **Do NOT kill it** — that resets the compile. `rocm_smoke`'s fast PASS does NOT pre-warm it (different batch shape). Verdict check + full explanation: §7.5. |
+| **Run looks stalled**: log silent, GPU 100%, no `[step N]` for 30+ min | **Suspect the LOG first (§7.5).** A `tqdm.write()`/buffering bug hid ~1300 steps of output — the run was training fine. Check `checkpoint.pt`'s mtime (advancing ⇒ healthy) and take two `py-spy` dumps (frames moving ⇒ healthy). GPU%, disk I/O, and "it's compiling" are all worthless here. |
 | The `scaled_dot_product_attention` **warning text** itself | cosmetic → **ignore** (the *warning* is harmless; the slow *math fallback* it implies is the row above). |
 | `amdgpu.ids: No such file` | cosmetic → **ignore** (§1c). |
 | `403 Forbidden … cas-bridge.xethub.hf.co`, "Reconstructing…" hangs | HF **Xet** CDN blocked; `HF_HUB_DISABLE_XET` is ignored → download elsewhere + `rsync` + `--local-glob`, or `pip uninstall hf_xet`, or a non-Xet corpus (§5b). |

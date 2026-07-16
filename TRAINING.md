@@ -92,9 +92,8 @@ On ROCm/gfx1151 **export all three** env vars — `LATENT_MANUAL_LAYERNORM=1`,
 it is *not* a fix for stalls, see §8.2), and `TORCH_BLAS_PREFER_HIPBLASLT=0`
 (rocBLAS; skips hipBLASLt's slow GEMM autotune) — and use the auto-start queue in
 [`STRIX_HALO.md`](STRIX_HALO.md) §6. `--num-workers 2` (not 8) — the cache loads fully
-into RAM, so extra workers only fork a multi-GB process for nothing. **If training goes silent at GPU 100%** (no `[step N]` lines, CPU burning, no disk I/O),
-that is **not** a compile — it is amdgpu **SVM page-migration thrash**. Fix:
-`export HSA_XNACK=0` and `--num-workers 0`. See [`STRIX_HALO.md`](STRIX_HALO.md) §7.5.
+into RAM, so extra workers only fork a multi-GB process for nothing. **If it looks silent**, check `runs/scaled/checkpoint.pt`'s mtime before anything else —
+if it's advancing, the run is fine and only the log is behind (§7.5).
 
 ## 4. Monitor
 
@@ -109,14 +108,16 @@ ls -l --time-style=+%H:%M runs/scaled/checkpoint.pt   # mtime should keep advanc
 **Healthy startup** (flushed markers, in order): `[data] LOADING cache … 356 shards` →
 `[data] LOADED … in ~3s (cache ready)` → `[trainer] training loop starting …` →
 `[trainer] first optimizer step done in Xs -- LIVE` → `[step 50] stage=A …`. The cache
-load is **seconds**, and the first step should be **seconds-to-a-couple-minutes**. If it
-goes silent for tens of minutes at GPU 100%, that is **SVM thrash, not a compile** (§8.2).
+load is **seconds**, and the first step should be **seconds-to-a-couple-minutes**. If the
+log goes silent for tens of minutes, suspect the **log**, not the run (§8.2) — check the
+checkpoint mtime first.
 **Follow with `tail -F` (capital), not `-f`** — a relaunch recreates `train.log` and `-f`
 follows the dead handle.
 
-**Stalled at GPU 100%?** → **§8.2**. On the gfx1151 APU this is almost always **amdgpu
-SVM page-migration thrash**, not a compile and not a hang. Do **not** judge by GPU%
-alone — the driver churning reads as 100% busy. Full explainer:
+**Looks stalled?** → **§8.2**. Suspect the **log** before the GPU: a `tqdm.write()`
+buffering bug used to hide ~1300 steps of output under `nohup` (fixed), and `>`
+truncation + `tail -f` on a dead handle each hide output independently. The checkpoint
+mtime and `py-spy` are the only trustworthy signals. Full explainer:
 [`STRIX_HALO.md`](STRIX_HALO.md) §7.5.
 
 Once live you'll see a cheap **`[step N] stage=X … (heartbeat)`** ping every **10 steps**
@@ -349,7 +350,8 @@ sudo dmesg | grep -i svm_range_restore | tail   # "hogged CPU ... N times", N CL
 
 | What you see | Verdict |
 |---|---|
-| `py-spy` shows **model frames** (`_encode_real_rows` ← `forward_self_supervised` ← `_loss_on`) **and** `svm_range_restore_work` climbing | **SVM thrash.** Fix: `export HSA_XNACK=0` + `--num-workers 0` (§7.5). |
+| **`checkpoint.pt` mtime advancing** (every ~1000 steps) | **It's training.** The log is behind, not the run — that's the common case (§7.5). |
+| Two `py-spy` dumps 30 s apart show **different frames** (`_train_loop:281` ↔ `evaluate`) | **Training normally.** `_train_loop` at the `torch.isfinite(total_norm)` line is the GPU **sync point** — where a step legitimately spends its time. |
 | `py-spy` shows a **compiler frame** (`comgr`/`hipblaslt`/codegen) | Actually compiling — wait. (We never once observed this.) |
 | `dmesg` shows **`ring gfx timeout`** / **`GPU reset`** | Real driver-level hang → kill + resume (§8.7). |
 | Process gone | Crashed → read the log tail, resume from checkpoint. |

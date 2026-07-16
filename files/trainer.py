@@ -183,10 +183,17 @@ class Trainer:
     # computation, gradient routing, or curriculum -- they only affect how the
     # run reports progress and how it shuts down.
     def _emit(self, msg: str):
-        # Route log lines through tqdm.write when a bar is live so they don't
-        # shred the progress bar; falls back to a plain flushed print otherwise
-        # (including the non-TTY nohup run, where the bar is auto-disabled).
-        if self._bar is not None:
+        # Route log lines through tqdm.write ONLY when a bar is actually RENDERING,
+        # so they don't shred it; otherwise a plain FLUSHED print.
+        #
+        # The `self._bar is not None` check used to be the whole condition, and it was
+        # a trap: _make_progress_bar passes disable=None for progress="auto", which
+        # makes tqdm hide itself off-TTY but STILL return a live object. So under
+        # nohup, _bar was not-None -> every line went through tqdm.write(), which does
+        # NOT flush -> with stdout block-buffered to a file the step lines sat in the
+        # ~8KB buffer (~1300 steps of lag). A perfectly healthy run then looked stalled
+        # for 30-50 min while its checkpoint quietly advanced. Check .disable too.
+        if self._bar is not None and not getattr(self._bar, "disable", False):
             self._bar.write(msg)
         else:
             print(msg, flush=True)

@@ -363,6 +363,7 @@ t1=$(awk '{print $14+$15}' /proc/$PID/stat); sleep 20; t2=$(awk '{print $14+$15}
 echo "ticks +$((t2-t1))"          # climbing = executing (NOT proof of progress)
 dmesg 2>/dev/null | grep -iE "amdgpu|ring|reset|timeout" | tail   # a ring timeout = definite hang
 py-spy dump --pid $PID            # §8.6 — the ONLY way to truly see which one it is
+```
 
 ### 8.3 GPU / thermal / memory (no `rocm-smi`)
 ```bash

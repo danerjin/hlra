@@ -276,7 +276,7 @@ grep STATUS ~/hlra/files/pipeline.log            # milestones (prep done, traini
 grep -E 'stage=(A|B)' ~/hlra/files/pipeline.log | tail -4
 tail -f ~/hlra/files/pipeline.log                # or train.log for the manual launch
 ```
-Healthy line: `[step 2000] stage=B ... logs={'nll':6.9,'ssl':0.7,...} val_loss=6.85 lstd=0.42`.
+Healthy line: `[step 2000] stage=B ... logs={'nll':6.9,'ssl':0.7,...} val_loss=6.85 latent_std=0.42`.
 
 **Disconnect safely.** `nohup` (and the queue) survive SSH drops / wifi changes /
 laptop close — `Ctrl-C` the `tail` (that only stops the log-follow) and disconnect;
@@ -364,14 +364,14 @@ to **let the batch-32 compile finish once, untouched.**
 | ran out of disk mid-download | shards are 2.15 GB each; you need 1–2 → keep those, `rm -rf ~/fineweb_local/.cache` (partials), prep on the box (§5b). |
 | OOM at batch 64 (`small-w3`) | ~68 GB GTT + manual-LN memory tax → batch 32, or `--grad-accum N` (§4). |
 | `WARNING: non-finite grad norm … skipping` | one NaN grad; trainer skips the step (weights safe), hard-fails after 25 → check LR / re-run `rocm_smoke`. |
-| `val_loss` rises at Stage B + `ssl`→0 + `lstd` craters | **latent collapse** → lower `--ssl-weight` toward 0.5, relaunch from an `--archive-every` snapshot. |
+| `val_loss` rises at Stage B + `ssl`→0 + `latent_std` craters | **latent collapse** → lower `--ssl-weight` toward 0.5, relaunch from an `--archive-every` snapshot. |
 
 ---
 
 ## 9. Caveats carried from review (still true)
 
 - **AMP + gfx1151 were never run in development** — `rocm_smoke.py` PASS is necessary,
-  not sufficient; watch `val_loss`/`lstd` over the first few hundred real steps.
+  not sufficient; watch `val_loss`/`latent_std` over the first few hundred real steps.
 - **Smoke-tuned hyperparameters** (`cosine_loss_k`, `act_ponder_cost`, anti-collapse
   weights) may want eyeballing at scale; `small-w3` already retunes `cosine_loss_k`
   and needs `--var-weight 3.0`.

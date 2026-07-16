@@ -21,7 +21,7 @@ The **no-brainer path** to a trained model. Copy-paste, top to bottom.
 
 `val_loss` = the autoencoder reconstruction (encode a chunk → the Talker decodes it;
 no reasoning loop). It's the anti-collapse anchor. **It must NOT jump up when the
-predictor turns on at Stage B** — a rise there is latent collapse. `lstd` (latent std)
+predictor turns on at Stage B** — a rise there is latent collapse. `latent_std` (latent std)
 is a secondary, width-dependent monitor; judge it against its own Stage-A band, never
 an absolute threshold. Untrained `val_loss` ≈ 10.8; a healthy run drives it well
 below and keeps falling through the A→B boundary.
@@ -115,16 +115,11 @@ load is **seconds**; only the **first optimizer step** takes minutes-to-tens-of-
 compile). **Follow with `tail -F` (capital), not `-f`** — a relaunch recreates
 `train.log` and `-f` follows the dead handle.
 
-**Is it compiling or actually stuck?** (no `rocm-smi`/`py-spy` needed):
-```bash
-PID=$(pgrep -f 'train_scaled.py' | head -1)
-t1=$(awk '{print $14+$15}' /proc/$PID/stat); sleep 20; t2=$(awk '{print $14+$15}' /proc/$PID/stat)
-g=$(cat /sys/class/drm/card*/device/gpu_busy_percent | sort -rn | head -1)
-[ "$((t2-t1))" -gt 200 ] || [ "${g:-0}" -ge 50 ] && echo "✅ WORKING — leave it" || echo "⚠️ STALLED"
-```
-✅ (GPU busy or CPU ticks climbing) → it's compiling; **wait, don't kill** — every kill
-resets the 20–40 min compile (the trap). ⚠️ (GPU 0 **and** ticks flat) → genuinely
-stuck. Full gfx1151 first-step explainer: [`STRIX_HALO.md`](STRIX_HALO.md) §7.5.
+**Is it compiling or actually stuck?** → **§8.2**. ⚠️ Do **not** judge by GPU% alone: a
+*hung* kernel also reads 100% while the CPU spin-waits on it. The reliable
+discriminator is **disk I/O** (a compiler writes; a spin-wait doesn't). While it's
+compiling: **wait, don't kill** — every kill resets the 20–40 min compile (the trap).
+Full gfx1151 explainer: [`STRIX_HALO.md`](STRIX_HALO.md) §7.5.
 
 Once live you'll see a cheap **`[step N] stage=X … (heartbeat)`** ping every **10 steps**
 (default `--heartbeat-every 10`; no eval, so it's basically free) plus the full metric
@@ -152,8 +147,8 @@ ETA is a running average — it's pessimistic early (model-load + warmup are in 
 ```bash
 grep -E 'stage=(A|B|C|D|E)' train.log | tail -3   # val_loss must be flat/lower across A->B
 ```
-Healthy: `[step N] stage=B ... logs={'nll':6.9,'ssl':0.7,...} val_loss=6.85 lstd=0.42`.
-Collapse = `val_loss` rises at B **and** `ssl`→0 **and** `lstd` craters, together (§0).
+Healthy: `[step N] stage=B ... logs={'nll':6.9,'ssl':0.7,...} val_loss=6.85 latent_std=0.42`.
+Collapse = `val_loss` rises at B **and** `ssl`→0 **and** `latent_std` craters, together (§0).
 
 ### 4.4 Is the GPU actually working?
 ```bash
@@ -328,7 +323,110 @@ exit                                                # nohup jobs survive logout
 
 ---
 
+## 8. Debug & forensics (when it looks wrong)
+
+Everything here is **no-sudo, no extra tooling** unless noted — `rocm-smi`/`py-spy` are
+often unavailable on a locked-down box. `PID=$(pgrep -f 'train_scaled.py' | head -1)`.
+
+### 8.1 Is it alive, working, or dead?
+```bash
+PID=$(pgrep -f 'train_scaled.py' | head -1); echo "PID=${PID:-*** NOT RUNNING ***}"
+t1=$(awk '{print $14+$15}' /proc/$PID/stat); sleep 20; t2=$(awk '{print $14+$15}' /proc/$PID/stat)
+echo "CPU ticks +$((t2-t1))   GPU $(cat /sys/class/drm/card*/device/gpu_busy_percent|sort -rn|head -1)%"
+grep State /proc/$PID/status      # R=running  S=sleeping (normal when GPU-bound)  D=stuck in driver
+```
+**CPU ticks climbing = it is executing.** GPU% alone proves nothing (a hung kernel reads
+100%). Ticks flat **and** GPU 0 → dead.
+
+### 8.2 Compiling, or hung? (the one that matters)
+A silent log at GPU 100% is *usually* a kernel compile — normal, one-time, 20–40 min on
+gfx1151. A **hung kernel looks identical** in `ps`/GPU%. The discriminator is **disk
+I/O**: a compiler writes temp objects; a spin-wait writes nothing.
+```bash
+grep write_bytes /proc/$PID/io; sleep 20; grep write_bytes /proc/$PID/io   # climbing = COMPILING
+ls -l /proc/$PID/fd/ | grep -viE "socket|pipe|/dev/|anon_inode" | tail -5  # compiler temp files open?
+ls -lt ~/.cache/comgr /tmp 2>/dev/null | head -6                           # fresh ROCm compile artifacts?
+```
+- **`write_bytes` climbing / fresh `~/.cache/comgr` entries** → compiling. **Wait.**
+- **`write_bytes` frozen + main thread pinned ~100% CPU + zero steps** → the CPU is
+  spin-waiting on a GPU kernel that never returns = **hung**. Kill and resume (§8.7).
+
+### 8.3 GPU / thermal / memory (no `rocm-smi`)
+```bash
+cat /sys/class/drm/card*/device/gpu_busy_percent           # utilisation %
+cat /sys/class/drm/card*/device/hwmon/hwmon*/temp1_input   # millidegrees (82000 = 82 °C)
+cat /sys/class/drm/card*/device/pp_dpm_sclk                # clocks; '*' = active (stuck low = throttling)
+cat /sys/class/drm/card*/device/mem_info_gtt_used          # unified-memory GTT bytes
+free -g                                                    # RAM + swap (swap climbing = thrash)
+dmesg 2>/dev/null | grep -iE "amdgpu|ring|reset|timeout" | tail   # GPU hang/reset (may need sudo)
+```
+
+### 8.4 Threads, process tree, and where the output really goes
+```bash
+pgrep -af 'train_scaled|queue_stage_f'                     # main + N workers + any watcher
+ps -o pid,ppid,etimes,stat -p $(pgrep -f train_scaled.py | tr '\n' ',' | sed 's/,$//')
+#   workers' PPID == the main PID -> ONE run. Different PPIDs -> DUPLICATE runs (bad).
+ps -L -o pid,tid,stat,pcpu,comm -p $PID | head            # per-thread: which one burns CPU
+ls -l /proc/$PID/fd/1                                      # where THIS process's stdout actually goes
+tail -F "$(readlink /proc/$PID/fd/1)"                      # follow the live log, whatever it is
+```
+> Always **`tail -F`** (capital), never `-f`: a relaunch recreates the log and `-f`
+> silently follows the dead handle — the classic "my log stopped updating" trap.
+
+### 8.5 Reading the run history (`metrics.json`)
+`metrics.json` — **not** the text log — is the source of truth. It's saved with each
+checkpoint and restored on resume, so **wiping `train.log` loses nothing.**
+```bash
+M=~/hlra/runs/scaled/metrics.json
+python3 -c "import json;m=json.load(open('$M'));print(len(m),'rows | keys:',sorted(m[-1]));print('last:',m[-1])"
+
+# val_loss across the stage boundaries (still falling AT the flip = that stage was budget-starved):
+python3 -c "
+import json;m=json.load(open('$M'))
+for b,n in [(7577,'A->B'),(15154,'B->C'),(22731,'C->D'),(30308,'D->E')]:
+    r=[x for x in m if x.get('val_loss') is not None and b-800<=x['step']<=b+800]
+    if r: print(n,':',' '.join(f\"{x['step']}:{x['val_loss']:.3f}\" for x in r))
+"
+# one stage's trajectory — does it recover after the boundary perturbation?
+python3 -c "
+import json;m=json.load(open('$M'))
+for x in [x for x in m if x['step']>=15154][::10]:
+    print(f\"  {x['step']}: val={x['val_loss']:.4f} latent_std={x.get('latent_std',float('nan')):.4f}\")
+"
+```
+**Keys:** `step`, `stage`, `val_loss`, **`latent_std`**, `nll`, `ssl` — identical to the
+names printed in the log. If a `.get()` returns `0.0000` for every row you've typo'd a
+key, **not** found a collapse. Expect a **transient rise right after each stage
+boundary** (the new objective perturbs the anchor, then they co-adapt) — that's normal
+as long as it recovers and `latent_std` holds.
+
+### 8.6 Stack dump (`py-spy`)
+```bash
+source ~/hlra/.venv-rocm/bin/activate && pip install py-spy   # VENV pip: no PEP 668, no sudo
+cat /proc/sys/kernel/yama/ptrace_scope                        # 0 = dump works as you; 1 = needs sudo
+py-spy dump --pid $PID
+```
+The top frames name it instantly: a compile frame, vs `_loss_on` /
+`scaled_dot_product_attention` (real work or a stuck kernel), vs `_next_batch` (data starvation).
+
+### 8.7 Checkpoints, graceful stop & recovery
+```bash
+ls -lh --time-style=+%H:%M ~/hlra/runs/scaled/    # checkpoint.pt + checkpoint_NNNNNNN.pt archives
+```
+- `checkpoint.pt` — **rolling**, every `--checkpoint-every`; auto-resume reads it.
+- `checkpoint_0005000.pt`… — numbered **archives** every `--archive-every` (rollback depth).
+  Resume a specific one: `--resume runs/scaled/checkpoint_0015000.pt`.
+- `model.pt` — final. Saves are **atomic** (temp+fsync+rename) — a kill can't corrupt them.
+- **Graceful stop:** `kill <MAIN_PID>` (SIGTERM) → *"will checkpoint and exit after the
+  current step"*. Two catches: (1) if it's **hung mid-step**, that step never finishes so
+  the save never happens; (2) **`pkill -f train_scaled.py` also SIGTERMs the workers**,
+  and the main then dies on `DataLoader worker … killed by signal: Terminated` **before**
+  it can save. Signal the **main only**; if hung, `kill -9` and resume (you lose ≤
+  `--checkpoint-every` steps).
+
+---
+
 **In doubt:** the run is healthy as long as **`val_loss` trends down with no jump when
-Stage B turns the predictor on**, and `lstd` holds its Stage-A band. Watch `val_loss`
+Stage B turns the predictor on**, and `latent_std` holds its Stage-A band. Watch `val_loss`
 above all; keep checkpoints. Full Strix-Halo path + troubleshooting:
 [`STRIX_HALO.md`](STRIX_HALO.md); long-form A→E walkthrough: [`archive/TRAINING.md`](archive/TRAINING.md).

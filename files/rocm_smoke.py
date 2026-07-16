@@ -177,7 +177,7 @@ def main():
     lstd = model.latent_collapse_metric(ct, cm)
     torch.cuda.synchronize()
     lstd_ok = lstd == lstd and abs(lstd) != float("inf")   # finite python float
-    print(f"[6] eval-mode (fused) val path finite: {finite(val)} (val={float(val):.3f}, lstd={lstd:.4f})")
+    print(f"[6] eval-mode (fused) val path finite: {finite(val)} (val={float(val):.3f}, latent_std={lstd:.4f})")
     ok &= finite(val) and lstd_ok
     model.train()
 

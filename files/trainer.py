@@ -317,8 +317,8 @@ class Trainer:
                 self._bar.set_postfix(stage=self.curriculum.stage.name, lr=f"{lr:.1e}",
                                       val=("-" if self._last_val_loss is None
                                            else f"{self._last_val_loss:.3f}"),
-                                      lstd=("-" if self._last_lstd is None
-                                            else f"{self._last_lstd:.3f}"),
+                                      latent_std=("-" if self._last_lstd is None
+                                                  else f"{self._last_lstd:.3f}"),
                                       refresh=False)
 
             val_loss = None
@@ -326,8 +326,12 @@ class Trainer:
                 val_loss = self.evaluate()
                 lstd = self.model.latent_collapse_metric(*last_cc) if last_cc else 0.0
                 self._last_val_loss, self._last_lstd = val_loss, lstd
+                # NOTE: the printed name matches the metrics.json key EXACTLY
+                # ("latent_std"). They used to differ (log said `lstd=`, JSON stored
+                # `latent_std`), so grepping the log for the name you saw in the
+                # curves silently found nothing. Keep them identical.
                 self._emit(f"[step {self.global_step}] stage={self.curriculum.stage.name} lr={lr:.2e} "
-                           f"logs={step_logs} val_loss={val_loss:.4f} lstd={lstd:.4f}")
+                           f"logs={step_logs} val_loss={val_loss:.4f} latent_std={lstd:.4f}")
                 self.metrics.append({"step": self.global_step, "stage": self.curriculum.stage.name,
                                      "val_loss": val_loss, "latent_std": round(lstd, 4), **step_logs})
 

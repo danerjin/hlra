@@ -179,12 +179,16 @@ def train_stages_a_to_e(model, ema, curriculum: Curriculum, model_cfg, train_cfg
         val_loss = None
         if global_step % train_cfg.log_every == 0:
             val_loss = evaluate(model, ema, val_loader, model_cfg, curriculum)
-            logs["lstd"] = round(model.latent_collapse_metric(chunk_tensor, chunk_mask), 4)
+            # Name it "latent_std" everywhere: printed name == metrics.json key ==
+            # what plot_metrics reads. (It used to be logs["lstd"] printed as `lstd`
+            # while ALSO being stored as "latent_std" via the explicit entry below,
+            # so each metrics row carried the same number under BOTH names.)
+            logs["latent_std"] = round(model.latent_collapse_metric(chunk_tensor, chunk_mask), 4)
             print(f"[step {global_step}] stage={curriculum.stage.name} "
                   f"train_logs={logs} val_loss={val_loss:.4f}")
             if metrics is not None:
                 metrics.append({"step": global_step, "stage": curriculum.stage.name,
-                                "val_loss": val_loss, "latent_std": logs["lstd"],
+                                "val_loss": val_loss,
                                 **{k: v for k, v in logs.items() if k != "stage"}})
 
         transitioned = curriculum.advance_step(val_loss)

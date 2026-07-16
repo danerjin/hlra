@@ -143,8 +143,23 @@ class ModelConfig:
     # "supervised" AND use_act is on, so a fixed-depth stage (A-C) is identical
     # in both modes too.
     halt_mode: str = "ponder"
-    halt_epsilon: float = 0.01           # cosine-distance improvement below which "halt now" is the BCE target
+    halt_epsilon: float = 0.01           # tolerance (cosine-distance units) below which "halt now" is the BCE target
     supervised_halt_weight: float = 0.1  # weight on the halt BCE (only when halt_mode == "supervised")
+    # How the BCE halt TARGET is built (only when halt_mode == "supervised"):
+    #   "marginal"      -- (default) halt at cycle c when ONE more cycle improves the
+    #                      SSL cosine distance by < halt_epsilon (local slope). Simple,
+    #                      but on a gently-but-steadily improving curve it halts early
+    #                      (the slope is always small) -- the opposite of "think harder
+    #                      on hard chunks". Kept as the default so prior supervised runs
+    #                      are byte-identical.
+    #   "best_relative" -- halt at cycle c when cos_dist_c is within halt_epsilon of the
+    #                      BEST cos_dist this chunk reaches across all legal cycles, i.e.
+    #                      "keep going until you're near as good as you'll get". Robust to
+    #                      gentle slopes and self-calibrating per row; epsilon is a gap-to-
+    #                      best tolerance, not an absolute per-step floor. On a flat curve
+    #                      (best ~ every cycle) it reduces to halting at the min-depth
+    #                      floor, so it does not force wasted compute where depth is inert.
+    halt_target: str = "marginal"
 
     # ---- role tags for the two-lane input/self separation (§4.2) -------
     role_tags: tuple = ("USER", "SELF", "SYSTEM")
@@ -294,6 +309,8 @@ class ModelConfig:
             warnings.warn("trust_gate_vector has no effect without trust_gate (ignored).")
         if self.halt_mode not in ("ponder", "supervised"):
             raise ValueError(f"halt_mode must be 'ponder' or 'supervised', got {self.halt_mode!r}")
+        if self.halt_target not in ("marginal", "best_relative"):
+            raise ValueError(f"halt_target must be 'marginal' or 'best_relative', got {self.halt_target!r}")
         # The supervised halt gate selects a per-row depth in [h_updates_per_thought,
         # act_max_ponder_steps]; an inverted range would leave no room to halt.
         if self.halt_mode == "supervised" and self.act_max_ponder_steps < self.h_updates_per_thought:

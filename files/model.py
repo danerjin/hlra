@@ -475,7 +475,8 @@ class LatentThoughtModel(nn.Module):
         if halt_logits_all:
             halt = supervised_halt_loss(
                 torch.cat(halt_logits_all, dim=1), torch.cat(cos_dist_all, dim=1),
-                torch.cat(sup_mask_all, dim=1), epsilon=self.cfg.halt_epsilon)
+                torch.cat(sup_mask_all, dim=1), epsilon=self.cfg.halt_epsilon,
+                target_mode=self.cfg.halt_target)
         else:
             halt = torch.zeros((), device=device)
         return cos_weight * cos + var_weight * var, self.cfg.supervised_halt_weight * halt

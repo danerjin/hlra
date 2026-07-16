@@ -56,7 +56,8 @@ def ponder_cost_loss(ponder_cost: torch.Tensor, weight: float) -> torch.Tensor:
 
 
 def supervised_halt_loss(halt_logits: torch.Tensor, cos_dist: torch.Tensor,
-                          supervise_mask: torch.Tensor, epsilon: float = 0.01) -> torch.Tensor:
+                          supervise_mask: torch.Tensor, epsilon: float = 0.01,
+                          target_mode: str = "marginal") -> torch.Tensor:
     """
     TRM-style supervised halt gate (experiments.md #2). Replaces the soft ponder
     cost with a BCE that gives the halting head a *quality-grounded* signal: at
@@ -75,18 +76,37 @@ def supervised_halt_loss(halt_logits: torch.Tensor, cos_dist: torch.Tensor,
                              point (c >= min-depth floor, row has a real t+1
                              target). Rows/cycles outside get no gradient.
 
-    Target: halt_c = 1 when (cos_dist_c - cos_dist_{c+1}) < epsilon (the next
-    cycle barely helps), else 0. The last candidate cycle has no successor, so its
-    target is 1 (must stop at the cap). Self-calibrating: epsilon is in cosine-
-    distance units, and the target adapts to whatever improvement curve the model
-    currently produces. Returns a scalar (mean BCE over supervised entries; 0 if
-    none).
+    Target (selected by `target_mode`):
+      "marginal"      (default) halt_c = 1 when (cos_dist_c - cos_dist_{c+1}) <
+                      epsilon (the next cycle barely helps), else 0. The last
+                      candidate cycle has no successor -> target 1 (stop at cap).
+                      Simple but halts early on a gently-but-steadily improving
+                      curve (the per-step slope is always small), which is the
+                      opposite of "think harder on hard chunks".
+      "best_relative" halt_c = 1 when cos_dist_c is within epsilon of the BEST
+                      cos_dist this chunk reaches across its LEGAL (supervised)
+                      cycles -- "keep going until you're about as good as you'll
+                      get". Robust to gentle slopes; epsilon is a gap-to-best
+                      tolerance. On a flat curve best ~ every cycle -> target ~ all
+                      1 -> halt at the min-depth floor (no wasted compute), so it
+                      does not regress the inert-depth case.
+    Both are self-calibrating (epsilon in cosine-distance units, target adapts to
+    the model's current curve). Returns a scalar (mean BCE over supervised
+    entries; 0 if none).
     """
     C = halt_logits.shape[0]
-    # marginal improvement from doing ONE more cycle; last cycle -> +inf (always halt)
-    nxt = torch.cat([cos_dist[1:], torch.full_like(cos_dist[:1], float("inf"))], dim=0)
-    improvement = cos_dist - nxt                       # >0 means the next cycle helps
-    target = (improvement < epsilon).float()           # halt when it stops helping
+    if target_mode == "best_relative":
+        # Best (min) cos_dist over LEGAL cycles only, per row: a sub-floor cycle
+        # can't be selected, so it must not define "best" (else legal cycles could
+        # all read as "far from best" -> never halt -> forced to the cap).
+        masked_cd = cos_dist.masked_fill(~supervise_mask, float("inf"))
+        best = masked_cd.min(dim=0, keepdim=True).values          # (1, N)
+        target = (cos_dist <= best + epsilon).float()             # within epsilon of best -> halt
+    else:  # "marginal" -- byte-identical to the original
+        # marginal improvement from doing ONE more cycle; last cycle -> +inf (always halt)
+        nxt = torch.cat([cos_dist[1:], torch.full_like(cos_dist[:1], float("inf"))], dim=0)
+        improvement = cos_dist - nxt                   # >0 means the next cycle helps
+        target = (improvement < epsilon).float()       # halt when it stops helping
     bce = F.binary_cross_entropy_with_logits(halt_logits, target, reduction="none")
     m = supervise_mask.float()
     return (bce * m).sum() / m.sum().clamp_min(1.0)

@@ -80,6 +80,11 @@ def main():
                          "validated Graves/PonderNet soft cost, BYTE-IDENTICAL to every prior run. "
                          "'supervised' = the TRM-style per-row BCE halt gate (post-run experiment; "
                          "only affects Stage D+ where ACT is on).")
+    ap.add_argument("--halt-target", default="marginal", choices=["marginal", "best_relative"],
+                    help="BCE halt target when --halt-mode supervised. 'marginal' (default) halts when "
+                         "the next cycle's improvement < halt_epsilon (halts early on gentle slopes); "
+                         "'best_relative' halts when within halt_epsilon of the chunk's best achievable "
+                         "cos_dist (keeps thinking on steadily-improving chunks).")
     ap.add_argument("--out", default="runs/scaled")
     ap.add_argument("--resume", default=None,
                     help="resume from a specific checkpoint path. If omitted and "
@@ -103,7 +108,8 @@ def main():
     total_steps = sum(stage_steps)
     max_steps = args.max_steps if args.max_steps is not None else total_steps
 
-    model_cfg = model_config(args.preset, halt_mode=args.halt_mode)  # default "ponder" == unchanged
+    model_cfg = model_config(args.preset, halt_mode=args.halt_mode,
+                             halt_target=args.halt_target)  # defaults == unchanged
     cache_dir = os.path.join(PROJECT, args.cache)
     ds = CachedChunkDataset(cache_dir, expect={
         "max_chunk_len": model_cfg.max_chunk_len,

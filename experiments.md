@@ -79,6 +79,41 @@ stages A–C are identical in both modes. Pieces:
   trainer logs the second term under the `ponder` key in both modes (a label only). Unvalidated
   at scale — this is a runnable A/B, not a result.
 
+**Measured 2026-07-15 (box-free CPU smoke on the offline chunker-v3 cache) + a target fix.**
+Ran the supervised gate through Stage D and probed the selected depth. Two findings:
+- **It trains clean but sits at the min-depth floor — and here that is *correct*.** A→D→F walks
+  cleanly (`val_loss` 7.50→5.69 through the Stage-B boundary, no collapse). But the trained
+  `halting_head` emits a near-constant P(halt)≈0.95 at every cycle → **100% of rows at the floor**.
+  Root cause is not the gate: the loop's per-cycle cos_dist is **flat** on this data (0.6023 →
+  0.6013 → 0.6011 → … → 0.6010, ~0.0003 total floor→cap). Extra cycles genuinely don't help, so
+  halting at the floor is the right call and `halt_epsilon` is moot (the whole improvement is below
+  any sane epsilon). Smoke has **no depth signal**, so it cannot demonstrate depth-escape either way.
+- **A real design bug in the `marginal` target, now fixed (opt-in `halt_target`).** The marginal
+  target halts at cycle *c* when the *next* cycle's improvement < epsilon — the local slope. On a
+  gently-but-steadily improving curve (each step < epsilon, but large cumulative gain) it halts at
+  the floor even though many more cycles would substantially improve — the opposite of "think harder
+  on hard chunks". Added `ModelConfig.halt_target`: `"marginal"` (default, byte-identical) vs
+  `"best_relative"` — halt when within epsilon of the chunk's **best** achievable cos_dist over its
+  legal cycles ("keep going until you're about as good as you'll get"). Proven on synthetic curves:
+  gently-improving (0.008/cyc) → marginal picks depth 1, best_relative picks depth 4; flat → both
+  pick the floor (no forced compute); steep-then-plateau → both halt right after the drop. Marginal
+  BCE is byte-identical to the pre-change loss (verified to 1e-9). `--halt-target best_relative` on
+  `train_scaled.py`. Still needs real/harder data to show end-to-end depth-escape — the synthetic
+  proof isolates the target, not the loop's flatness.
+
+  **A per-step-gain "frugality floor" was prototyped to cap best_relative over-think, then removed —
+  no benefit.** A min_gain sweep on 3000 synthetic curves found no beneficial regime: on realistic
+  diminishing-returns (exp-decay) curves best_relative already halts at the convergence knee (a small
+  floor is inert; a large one just trades quality for compute linearly, same as lowering the depth
+  budget); on a linear curve (the only genuine over-think regime) it is all-or-nothing (inert below the
+  slope, halt-at-floor above); and it is myopic (halts before a late drop on a non-monotonic curve,
+  depth 7→1). The over-think worry was largely unfounded — best_relative self-limits at the knee — so
+  the knob was pulled rather than carried unused. **Kept the resume guard** (`trainer.load`):
+  halt_mode/halt_target/halt_epsilon are CLI-sourced, so resuming without re-passing them silently
+  reverts the halt policy; the guard warns loudly on any halt-config drift (weights still load; a
+  warning like the schedule guard, since switching may be intentional). Verified: fires on drift, no
+  false-positive on match.
+
 ### 3. Shared L/H transition network (ablation, lowest confidence)
 
 TRM collapses HRM's two networks into one tiny net used for both the z-updates and the

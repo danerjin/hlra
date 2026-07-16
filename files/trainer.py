@@ -438,6 +438,27 @@ class Trainer:
                 print("[trainer] LR curve / stage boundaries will NOT match the "
                       "original run. Continue only if this is intentional.", flush=True)
                 print("[trainer] " + "!" * 60, flush=True)
+        # Guard against a silently-changed HALT config on resume. halt_mode /
+        # halt_target / halt_epsilon are sourced from the CLI at launch (not read
+        # back from the checkpoint), so resuming a supervised best_relative run
+        # WITHOUT re-passing its flags reverts to the marginal defaults and quietly
+        # changes the halt policy mid-run. The weights still load (these fields
+        # don't change tensor shapes), so nothing else catches it. Warn loudly,
+        # like the schedule guard -- switching may be intentional.
+        saved_cfg = ckpt.get("model_cfg") or {}
+        halt_keys = ("halt_mode", "halt_target", "halt_epsilon")
+        halt_diffs = {k: (saved_cfg.get(k), getattr(self.model_cfg, k, None))
+                      for k in halt_keys
+                      if k in saved_cfg and saved_cfg.get(k) != getattr(self.model_cfg, k, None)}
+        if halt_diffs:
+            print("[trainer] " + "!" * 60, flush=True)
+            print("[trainer] WARNING: resume HALT config differs from checkpoint "
+                  "(halt policy changes mid-run; weights still load):", flush=True)
+            for k, (old, new) in halt_diffs.items():
+                print(f"[trainer]   {k}: checkpoint={old!r}  now={new!r}", flush=True)
+            print("[trainer] Re-pass the original --halt-* flags to continue the "
+                  "same policy, or proceed if this switch is intentional.", flush=True)
+            print("[trainer] " + "!" * 60, flush=True)
         # Hard-stop on a changed dataset: the val/train split is a seeded
         # randperm over len(dataset), so if the cache grew/shrank since launch,
         # most of the old val docs land in the new train set -- val_loss (the

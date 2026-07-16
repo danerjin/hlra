@@ -18,20 +18,19 @@ Paths below assume the repo is at `~/hlra`; adjust if yours differs.
 ```
 1. groups: render + video          (admin, one-time)
 2. pip install torch  from AMD's gfx1151 index  (--no-cache-dir)   — NO HSA_OVERRIDE
-3. export the THREE gfx1151 env vars (see §0 box below):
-       LATENT_MANUAL_LAYERNORM=1              (LN-backward kernel workaround)
-       TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1  (flash attention; else math fallback = 45-min first step)
-       TORCH_BLAS_PREFER_HIPBLASLT=0          (rocBLAS; skips slow hipBLASLt GEMM autotuning)
+3. export LATENT_MANUAL_LAYERNORM=1        (REQUIRED: LN-backward kernel writes NaN grads)
+   optional: TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1  (flash attention; smoke-validated)
+                (rocBLAS; skips slow hipBLASLt GEMM autotuning)
 4. rocm_smoke.py  -> PASS   (if training later "stalls": §7.5 -- check checkpoint.pt + py-spy, NOT the log)
 5. data: SaT on GPU + get the parquet on-box (HF Xet 403 escape) + data_prep --local-glob
 6. queue training to auto-start after prep
 ```
 
-Three env vars you will keep set (put in `~/.bashrc` so every shell + nohup'd job has them):
+Env vars to keep set (put in `~/.bashrc` so every shell + nohup'd job has them):
 ```bash
-echo 'export LATENT_MANUAL_LAYERNORM=1' >> ~/.bashrc              # broken LayerNorm-backward kernel (step 3)
-echo 'export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1' >> ~/.bashrc  # flash attention: else first train step ~45min on math fallback
-echo 'export TORCH_BLAS_PREFER_HIPBLASLT=0' >> ~/.bashrc         # rocBLAS: skips hipBLASLt's slow per-shape GEMM autotune
+echo 'export LATENT_MANUAL_LAYERNORM=1' >> ~/.bashrc              # REQUIRED: broken LayerNorm-backward kernel (step 2)
+echo 'export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1' >> ~/.bashrc  # optional: flash attention (rocm_smoke validates it)
+echo 'export' >> ~/.bashrc         # rocBLAS: skips hipBLASLt's slow per-shape GEMM autotune
 # (no HSA_OVERRIDE_GFX_VERSION with a native gfx1151 wheel — it BREAKS kernel launch)
 ```
 
@@ -212,8 +211,7 @@ cat > ~/run_pipeline.sh <<'EOF'
 #!/bin/bash
 PY="__PY__"                              # the exact interpreter prep used (has the working gfx1151 torch)
 export LATENT_MANUAL_LAYERNORM=1
-export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1   # flash attention (else first step ~45min on math fallback)
-export TORCH_BLAS_PREFER_HIPBLASLT=0               # rocBLAS (skips slow hipBLASLt GEMM autotune)
+export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1   # flash attention (optional)
 PREP_PID="$1"
 cd ~/hlra/files
 log(){ echo "[$(date '+%F %T')] $*"; }
@@ -257,7 +255,7 @@ and run — remember the box-specifics **`LATENT_MANUAL_LAYERNORM=1`,
 `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`, `--preset small-w3`, `--var-weight 3.0`,
 batch 32**:
 ```bash
-cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 TORCH_BLAS_PREFER_HIPBLASLT=0 && export BATCH=32
+cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 && export BATCH=32
 export STAGE_STEPS=$(python3 -c "import json,os;m=json.load(open(os.path.expanduser('~/hlra/chunk_cache/manifest.json')));print(','.join([str(max(1,(m['total']//$BATCH)//6))]*4+[str(2*max(1,(m['total']//$BATCH)//6)),'0']))")
 nohup python train_scaled.py --preset small-w3 --cache chunk_cache --device cuda --amp --amp-dtype bf16 \
   --batch-size "$BATCH" --stage-steps "$STAGE_STEPS" --var-weight 3.0 --lr-schedule per-stage \
@@ -312,6 +310,10 @@ still returning a live object. So under `nohup`, `_bar` was not-None, every line
 through `tqdm.write()` (which does **not** flush), and with stdout block-buffered to a
 file the step lines sat in the ~8 KB buffer — **~1300 steps of lag**. The run trained
 fine the whole time; only the log was frozen. Fixed by checking `.disable` too.
+
+**The real numbers:** the first optimizer step pays a one-off **~3 min** GPU kernel
+warmup; after that it's **~1.6 step/s** (~8 h for a 45k-step A→E run), with a checkpoint
+every 1000 steps. Anything that looks like a 30-50 min "stall" is the log, not the run.
 
 **If a run looks stalled, in this order:**
 1. **Is the checkpoint advancing?** This is the only signal that never lied:

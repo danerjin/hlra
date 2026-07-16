@@ -247,12 +247,12 @@ class Trainer:
         import time
         _loop_t0 = time.time()
         _first_step_logged = False
-        # With log_every=50 the first visible line is step 50; the FIRST optimizer
-        # step also JIT-compiles GPU kernels (minutes on ROCm/gfx1151), so without
+        # With log_every=50 the first visible line is step 50, and the FIRST optimizer
+        # step pays a one-off GPU kernel warmup (~3 min on ROCm/gfx1151), so without
         # these markers a healthy startup looks hung. Emit loop-start + first-step.
         self._emit(f"[trainer] training loop starting @ step {self.global_step}, "
                    f"stage={self.curriculum.stage.name}, {max_steps} steps total. "
-                   f"First step JIT-compiles GPU kernels -- minutes on ROCm/gfx1151 is normal.")
+                   f"First step warms up GPU kernels (~3 min on ROCm/gfx1151).")
         while self.curriculum.stage.value <= Stage.E.value and self.global_step < max_steps:
             flags = self.curriculum.stage_flags()
             plan = self.curriculum.loss_plan()

@@ -38,7 +38,7 @@ cd "$PROJECT/files"
 # GPU sanity (must PASS). ROCm/gfx1151: prepend BOTH env vars --
 #   LATENT_MANUAL_LAYERNORM=1                 (LN-backward kernel workaround, see STRIX_HALO.md §2)
 #   TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 (flash attention; the recommended SDPA path here)
-LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 TORCH_BLAS_PREFER_HIPBLASLT=0 python rocm_smoke.py --preset small-w3
+LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 python rocm_smoke.py --preset small-w3
 ```
 
 ## 2. Data → chunk cache (one-time)
@@ -87,13 +87,17 @@ nohup python train_scaled.py --preset small-w3 --cache chunk_cache --device cuda
   --out runs/scaled > train.log 2>&1 &
 tail -f train.log
 ```
-On ROCm/gfx1151 **export all three** env vars — `LATENT_MANUAL_LAYERNORM=1`,
-`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` (flash attention — the recommended SDPA path;
-it is *not* a fix for stalls, see §8.2), and `TORCH_BLAS_PREFER_HIPBLASLT=0`
-(rocBLAS; skips hipBLASLt's slow GEMM autotune) — and use the auto-start queue in
+On ROCm/gfx1151 **`LATENT_MANUAL_LAYERNORM=1` is REQUIRED** (the stock LN-backward
+kernel writes NaN grads — `rocm_smoke` `[3]` FAILs without it).
+`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` (flash attention) is **optional** and
+validated by `rocm_smoke`. Use the auto-start queue in
 [`STRIX_HALO.md`](STRIX_HALO.md) §6. `--num-workers 2` (not 8) — the cache loads fully
-into RAM, so extra workers only fork a multi-GB process for nothing. **If it looks silent**, check `runs/scaled/checkpoint.pt`'s mtime before anything else —
-if it's advancing, the run is fine and only the log is behind (§7.5).
+into RAM, so extra workers only fork a multi-GB process for nothing.
+
+The first optimizer step pays a one-off **~3 min** GPU kernel warmup; after that it's
+~1.6 step/s. **If the log looks silent for longer, check `runs/scaled/checkpoint.pt`'s
+mtime before anything else** — if it's advancing, the run is fine and only the log is
+behind (§8.2).
 
 ## 4. Monitor
 
@@ -182,7 +186,7 @@ carries the `small-w3` config, so Stage F inherits it — **don't pass `--preset
 
 ### 6.1 Offline smoke (plumbing check — no ckpt, no downloads, ~1 min)
 ```bash
-cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 TORCH_BLAS_PREFER_HIPBLASLT=0
+cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
 python train_dialogue.py --offline --preset small-w3 --multi-turn --persona \
   --steps 20 --batch-size 2 --out runs/dlg_sanity && rm -rf ~/hlra/runs/dlg_sanity
 ```
@@ -193,7 +197,7 @@ real fine-tune below loads the trained one via `--ckpt`).
 The foundation (`runs/scaled/model.pt`) is loaded **read-only**; Stage-F writes to a
 **separate** `--out runs/dialogue` — it never overwrites the A→E checkpoint.
 ```bash
-cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 TORCH_BLAS_PREFER_HIPBLASLT=0
+cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
 nohup python train_dialogue.py --ckpt runs/scaled/model.pt \
   --hf-chat HuggingFaceH4/no_robots --split train \
   --multi-turn --soft-tags --content-tags --trust-gate --vector-gate --persona --gestalt-readout \
@@ -244,7 +248,7 @@ setup (install, LayerNorm workaround, Xet-escape) lives in
 ```bash
 source ~/hlra/.venv-rocm/bin/activate
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"   # -> ...rocm... True
-cd ~/hlra/files && LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 TORCH_BLAS_PREFER_HIPBLASLT=0 python rocm_smoke.py --preset small-w3   # must end PASS
+cd ~/hlra/files && LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 python rocm_smoke.py --preset small-w3   # must end PASS
 ```
 
 ### 7.2 Prep the chunk cache (the command that ran)
@@ -338,33 +342,33 @@ grep State /proc/$PID/status      # R=running  S=sleeping (normal when GPU-bound
 100%). Ticks flat **and** GPU 0 → dead.
 
 ### 8.2 Compiling, or hung? (the one that matters)
-**On the gfx1151 APU, a silent log at GPU 100% is almost always `amdgpu` SVM
-page-migration thrash** — *not* a kernel compile and *not* a hung kernel. Full
-explanation: [`STRIX_HALO.md`](STRIX_HALO.md) §7.5. Confirm it in two commands:
+**First suspect the LOG, not the GPU.** A `tqdm.write()` buffering bug (fixed
+2026-07-16) hid ~1300 steps of output under `nohup`, and `>` truncation + `tail -f` on a
+dead handle each hide output independently. Runs that looked stalled for 30–50 min were
+training the whole time. Check, in this order:
 
 ```bash
+# 1. THE signal that never lied: is the checkpoint advancing?
+ls -l --time-style=+%H:%M:%S ~/hlra/runs/scaled/checkpoint.pt    # jumps every ~1000 steps
+# 2. the only tool that truly answers it (VENV pip; sudo sysctl -w kernel.yama.ptrace_scope=0)
 PID=$(pgrep -f train_scaled.py | head -1)
-sudo "$(which py-spy)" dump --pid "$PID"        # pip install py-spy in the VENV (PEP 668)
-sudo dmesg | grep -i svm_range_restore | tail   # "hogged CPU ... N times", N CLIMBING = thrash
+sudo "$(which py-spy)" dump --pid "$PID"; sleep 30; sudo "$(which py-spy)" dump --pid "$PID"
+# 3. only now, the GPU:
+sudo dmesg | grep -iE "ring.*timeout|gpu reset" | tail
 ```
 
 | What you see | Verdict |
 |---|---|
-| **`checkpoint.pt` mtime advancing** (every ~1000 steps) | **It's training.** The log is behind, not the run — that's the common case (§7.5). |
-| Two `py-spy` dumps 30 s apart show **different frames** (`_train_loop:281` ↔ `evaluate`) | **Training normally.** `_train_loop` at the `torch.isfinite(total_norm)` line is the GPU **sync point** — where a step legitimately spends its time. |
-| `py-spy` shows a **compiler frame** (`comgr`/`hipblaslt`/codegen) | Actually compiling — wait. (We never once observed this.) |
-| `dmesg` shows **`ring gfx timeout`** / **`GPU reset`** | Real driver-level hang → kill + resume (§8.7). |
-| Process gone | Crashed → read the log tail, resume from checkpoint. |
+| `checkpoint.pt` mtime **advancing** | **Training.** The log is behind, not the run. |
+| Two `py-spy` dumps show **different frames** (`_train_loop:281` ↔ `evaluate`) | **Training.** `_train_loop` at `torch.isfinite(total_norm)` is the GPU **sync point** — where a step legitimately spends its wall time. |
+| Frames **frozen** on one low-level call **and** checkpoint not advancing | Genuinely stuck → kill + resume (§8.7). |
+| `dmesg`: `ring gfx timeout` / `GPU reset` | Real driver hang → kill + resume. |
 
-> **Two discriminators that DON'T work — we tried both and they misled us for hours:**
-> - **GPU%** — the driver churning on page migration reads as **100% busy**. Not proof of progress.
-> - **Disk I/O** (`/proc/PID/io write_bytes`) — dominated by **checkpoint writes** (~1.6 GB
->   every `--checkpoint-every`), never by the compiler. It is frozen during a thrash, a
->   compile, *and* a hang. Tens of GB on a long-lived run is just its checkpoint history.
->
-> **`py-spy` is the only thing that actually answers it.** If `ptrace_scope` is 1 you need
-> sudo (`sudo sysctl -w kernel.yama.ptrace_scope=0` to fix permanently) — get it, rather
-> than inferring from indirect signals for hours the way we did.
+> **Signals that misled us for a full day — do not trust them:**
+> - **GPU% = 100** — reads 100 for a churning driver *or* a spinning kernel. Never proof of progress.
+> - **Disk I/O** (`write_bytes`) — that's *checkpoint* history (~1.6 GB each), not compiler output. Frozen in every state.
+> - **"It's a 20–40 min kernel compile, just wait"** — there is no such compile; the first step is a **~3 min** one-off warmup. `py-spy` showed model frames every single time.
+> - **`svm_range_restore_work` in dmesg** — real, but its timestamps were **hours stale**. A red herring; `HSA_XNACK=0` was not the fix.
 
 ### 8.3 GPU / thermal / memory (no `rocm-smi`)
 ```bash

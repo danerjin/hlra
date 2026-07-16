@@ -34,8 +34,7 @@ set -eo pipefail
 cd ~/hlra/files
 source ~/hlra/.venv-rocm/bin/activate          # <-- edit if your venv path differs
 export LATENT_MANUAL_LAYERNORM=1               # gfx1151 LayerNorm-backward workaround
-export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1   # gfx1151 fast (flash) attention -- WITHOUT it the math fallback makes the first step take ~45 min
-export TORCH_BLAS_PREFER_HIPBLASLT=0   # rocBLAS: skips hipBLASLt GEMM autotune (gfx1151 slow first step)
+export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1   # gfx1151 flash attention (optional; validated by rocm_smoke)
 
 read -rp "Model size to smoke [small-w3] (small-w3 base-w3 large-w3 xl-w3 …): " PRESET </dev/tty || true
 PRESET=${PRESET:-small-w3}
@@ -106,8 +105,7 @@ STAGEF_BATCH=8
 echo "preset=$PRESET batch=$BATCH  stage-F=$RUN_STAGE_F ($HF_CHAT)"
 
 export LATENT_MANUAL_LAYERNORM=1
-export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1   # fast attention (see note under the block)
-export TORCH_BLAS_PREFER_HIPBLASLT=0   # rocBLAS: skips hipBLASLt GEMM autotune (gfx1151 slow first step)
+export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1   # flash attention (optional)
 
 # 1) launch prep (background, survives logout):
 nohup python data_prep.py "${PREP_ARGS[@]}" --preset "$PRESET" --max-tokens "$MAX_TOKENS" \
@@ -122,7 +120,6 @@ PY="__PY__"; BATCH="__BATCH__"; PRESET="__PRESET__"
 RUN_STAGE_F="__RUN_STAGE_F__"; HF_CHAT="__HF_CHAT__"; SPLIT="__SPLIT__"; STAGEF_STEPS="__STAGEF_STEPS__"; STAGEF_BATCH="__STAGEF_BATCH__"
 export LATENT_MANUAL_LAYERNORM=1
 export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
-export TORCH_BLAS_PREFER_HIPBLASLT=0   # rocBLAS: skips hipBLASLt GEMM autotune (gfx1151 slow first step)
 PREP_PID="$1"
 cd ~/hlra/files
 log(){ echo "[$(date '+%F %T')] $*"; }
@@ -173,23 +170,22 @@ right venv. **Now you can disconnect SSH.** Output → `pipeline.log`. Results:
 `runs/scaled/model.pt` (foundation) and, if `RUN_STAGE_F=1`, `runs/dialogue/model.pt`
 (chatbot) — separate files.
 
-> **gfx1151 must-knows baked into the blocks above** (full detail: [`STRIX_HALO.md`](STRIX_HALO.md) §7.5):
-> - **Three env vars** are exported for you: `LATENT_MANUAL_LAYERNORM=1` (LN-backward
->   kernel), `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` (flash attention — without it the
->   first step JIT-compiles a math fallback for ~45 min), `TORCH_BLAS_PREFER_HIPBLASLT=0`
->   (rocBLAS — skips hipBLASLt's slow GEMM autotune). `--num-workers 2` (not 8) because
->   the cache is already fully in RAM.
+> **gfx1151 must-knows** (full detail: [`STRIX_HALO.md`](STRIX_HALO.md) §7.5):
+> - **`LATENT_MANUAL_LAYERNORM=1` is REQUIRED** — the stock LayerNorm-backward kernel
+>   writes NaN grads (`rocm_smoke` `[3]` FAILs without it).
+>   `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` (flash attention) is **optional** — the
+>   smoke validates it. `--num-workers 2` (not 8): the cache is already fully in RAM, so
+>   extra workers just fork a multi-GB process for nothing.
 > - **Healthy startup**: `[data] LOADING cache … 356 shards` → `[data] LOADED … in ~3s` →
->   `[trainer] training loop starting …` → *(silent while it compiles)* →
->   `[trainer] first optimizer step done in Xs -- LIVE` → `[step 50] stage=A …`.
-> - **THE FIRST STEP TAKES 20–40 MIN on gfx1151 (silent log, GPU 100%). This is normal,
->   one-time, and NOT hung — do NOT kill it.** Every kill resets the compile; that loop
->   never finishes. Follow with **`tail -F`** (not `-f`). Verdict check when anxious:
+>   `[trainer] training loop starting …` → `[trainer] first optimizer step done in ~3min`
+>   (one-off kernel warmup) → `[step N … (heartbeat)]` every 10 steps.
+> - **If the log looks frozen, check the CHECKPOINT, not the GPU:**
 >   ```bash
->   PID=$(pgrep -f train_scaled.py|head -1); t1=$(awk '{print $14+$15}' /proc/$PID/stat); sleep 20
->   t2=$(awk '{print $14+$15}' /proc/$PID/stat); g=$(cat /sys/class/drm/card*/device/gpu_busy_percent|sort -rn|head -1)
->   [ "$((t2-t1))" -gt 200 ] || [ "${g:-0}" -ge 50 ] && echo "✅ WORKING — leave it" || echo "⚠️ STALLED"
+>   ls -l --time-style=+%H:%M:%S ~/hlra/runs/scaled/checkpoint.pt   # advancing = training fine
 >   ```
+>   A `tqdm.write()` buffering bug used to hide ~1300 steps of output under `nohup`
+>   (fixed 2026-07-16) — the run was always healthy, the log lied. GPU% and disk I/O are
+>   **worthless** here; `checkpoint.pt` mtime and `py-spy` are the only honest signals.
 
 ---
 
@@ -213,8 +209,7 @@ bash <<'STAGEF'
 cd ~/hlra/files
 source ~/hlra/.venv-rocm/bin/activate
 export LATENT_MANUAL_LAYERNORM=1
-export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1   # fast attention (gfx1151)
-export TORCH_BLAS_PREFER_HIPBLASLT=0   # rocBLAS: skips hipBLASLt GEMM autotune (gfx1151 slow first step)
+export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1   # flash attention (optional)
 
 #==================== CONFIG — edit these ====================
 FOUNDATION=runs/scaled/model.pt          # finished A→E model (loaded READ-ONLY; config inherited)

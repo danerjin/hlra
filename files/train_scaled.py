@@ -75,6 +75,13 @@ def main():
                     help="override ssl_var_weight (default 2.0, the VICReg-style per-dim variance "
                          "floor that resists latent collapse). At wider d_latent the latent starts "
                          "closer to the floor -- recommended ~3.0 for the -w3 presets (small-w3).")
+    ap.add_argument("--norm", default="layer", choices=["layer", "rms"],
+                    help="token-level normalization. 'layer' (default) = nn.LayerNorm, byte-identical to "
+                         "every existing checkpoint. 'rms' = RMSNorm, which SIDESTEPS the broken gfx1151 "
+                         "native_layer_norm_backward kernel entirely -- so you can drop "
+                         "LATENT_MANUAL_LAYERNORM=1 and its speed/memory tax (see STRIX_HALO.md §2/§4). "
+                         "WARNING: changes the architecture (RMSNorm has no bias), so a 'rms' run CANNOT "
+                         "resume a 'layer' checkpoint or vice versa -- choose it at the START of a run.")
     ap.add_argument("--halt-mode", default="ponder", choices=["ponder", "supervised"],
                     help="ACT depth training (experiments.md #2). 'ponder' (default) = the "
                          "validated Graves/PonderNet soft cost, BYTE-IDENTICAL to every prior run. "
@@ -109,7 +116,8 @@ def main():
     max_steps = args.max_steps if args.max_steps is not None else total_steps
 
     model_cfg = model_config(args.preset, halt_mode=args.halt_mode,
-                             halt_target=args.halt_target)  # defaults == unchanged
+                             halt_target=args.halt_target,
+                             norm=args.norm)                # defaults == unchanged
     cache_dir = os.path.join(PROJECT, args.cache)
     ds = CachedChunkDataset(cache_dir, expect={
         "max_chunk_len": model_cfg.max_chunk_len,

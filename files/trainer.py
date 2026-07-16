@@ -427,6 +427,24 @@ class Trainer:
         # (not plain tensors), which torch>=2.6's weights_only=True default refuses
         # to unpickle -- an explicit False keeps resume working across torch versions.
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        # HARD-stop on a changed architecture -- BEFORE load_state_dict, so the user
+        # gets one readable line instead of a 200-key missing/unexpected wall.
+        # norm/rope/qk_norm/ffn/n_kv_heads come from the CLI+preset at launch, NOT from
+        # the checkpoint, so `--norm rms` against a LayerNorm checkpoint rebuilds a
+        # different MODULE FAMILY (modern.py: q_proj/k_proj/v_proj + SwiGLU-style ffn,
+        # vs stock in_proj_weight + linear1/linear2). The weights are simply not
+        # interchangeable -- there is no valid override. Pick the arch at run START.
+        _arch_keys = ("norm", "rope", "qk_norm", "ffn", "n_kv_heads")
+        _saved = ckpt.get("model_cfg") or {}
+        _diffs = {k: (_saved.get(k), getattr(self.model_cfg, k, None))
+                  for k in _arch_keys
+                  if k in _saved and _saved.get(k) != getattr(self.model_cfg, k, None)}
+        if _diffs:
+            raise RuntimeError(
+                f"resume ARCHITECTURE differs from checkpoint {path}: {_diffs}. The weights "
+                f"are NOT interchangeable (a different module family is built). Re-pass the "
+                f"original arch flags (e.g. --norm layer), or start a FRESH run with a new "
+                f"--out to train the new architecture from scratch.")
         self.model.load_state_dict(ckpt["model_state"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.ema.load_state_dict(ckpt["ema"])

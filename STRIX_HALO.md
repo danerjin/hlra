@@ -311,9 +311,11 @@ through `tqdm.write()` (which does **not** flush), and with stdout block-buffere
 file the step lines sat in the ~8 KB buffer — **~1300 steps of lag**. The run trained
 fine the whole time; only the log was frozen. Fixed by checking `.disable` too.
 
-**The real numbers:** the first optimizer step pays a one-off **~3 min** GPU kernel
-warmup; after that it's **~1.6 step/s** (~8 h for a 45k-step A→E run), with a checkpoint
-every 1000 steps. Anything that looks like a 30-50 min "stall" is the log, not the run.
+**The real numbers (measured, `small-w3` @ batch 32):** the first optimizer step pays a
+one-off **~3 min** kernel warmup; after that **~0.2 step/s**, so a 45k-step A→E run is a
+**~2.5 day** job, checkpointing every 1000 steps (~83 min). That is the architecture's
+cost here — the per-chunk HRM loop is sequential by design and launch-overhead-bound
+(§4) — not a fault. Anything that looks like a 30-50 min "stall" is the log, not the run.
 
 **If a run looks stalled, in this order:**
 1. **Is the checkpoint advancing?** This is the only signal that never lied:

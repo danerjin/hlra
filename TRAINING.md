@@ -94,10 +94,13 @@ validated by `rocm_smoke`. Use the auto-start queue in
 [`STRIX_HALO.md`](STRIX_HALO.md) §6. `--num-workers 2` (not 8) — the cache loads fully
 into RAM, so extra workers only fork a multi-GB process for nothing.
 
-The first optimizer step pays a one-off **~3 min** GPU kernel warmup; after that it's
-~1.6 step/s. **If the log looks silent for longer, check `runs/scaled/checkpoint.pt`'s
-mtime before anything else** — if it's advancing, the run is fine and only the log is
-behind (§8.2).
+The first optimizer step pays a one-off **~3 min** GPU kernel warmup. After that,
+**measured on the reference gfx1151 box (`small-w3`, batch 32): ~0.2 step/s** — i.e. a
+45k-step A→E run is a **~2.5 day** job. That is the architecture's real cost here (the
+per-chunk HRM loop is sequential by design and launch-overhead-bound, §4 of
+[`STRIX_HALO.md`](STRIX_HALO.md)), not a fault. **If the log looks silent, check
+`runs/scaled/checkpoint.pt`'s mtime before anything else** — if it's advancing, the run
+is fine and only the log is behind (§8.2).
 
 ## 4. Monitor
 
@@ -199,14 +202,19 @@ The foundation (`runs/scaled/model.pt`) is loaded **read-only**; Stage-F writes 
 ```bash
 cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
 nohup python train_dialogue.py --ckpt runs/scaled/model.pt \
-  --hf-chat HuggingFaceH4/no_robots --split train \
+  --hf-chat HuggingFaceH4/ultrachat_200k --split train_sft \
   --multi-turn --soft-tags --content-tags --trust-gate --vector-gate --persona --gestalt-readout \
   --batch-size 8 --steps 3000 --out runs/dialogue > dialogue.log 2>&1 &
 tail -f dialogue.log
 ```
-- **Dataset:** `HuggingFaceH4/no_robots` (10k clean instruct dialogues, `messages`
-  schema, downloads without Xet issues — verified). Scale up with
-  `--hf-chat HuggingFaceH4/ultrachat_200k --split train_sft`.
+- **Dataset:** `HuggingFaceH4/ultrachat_200k` (`--split train_sft`) — **measured 100%
+  multi-turn**, which is what Stage F needs. `messages` schema; streams without Xet
+  trouble.
+- **Do NOT default to `HuggingFaceH4/no_robots` for the multi-turn features** — measured
+  **only 8% multi-turn** (370/400 sampled docs are a single user→assistant pair). For a
+  2-turn example the SELF turn is at index 1, so `tensorize_dialogue_sft`'s context is
+  `turns[:0]` = **empty** → `--multi-turn`, `--persona` and `--gestalt-readout` train on
+  nothing for ~92% of the data. `no_robots` is fine only for plain single-turn instruct.
 - **Any `messages`-schema chat dataset works** (role `assistant`→SELF, `user`→USER,
   `system`→SYSTEM). **Don't pass `--preset` with `--ckpt`** — the checkpoint's config wins.
 - **Transcript data** (you choose who is SELF — the reasoner vs. an advocate):

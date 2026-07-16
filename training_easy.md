@@ -97,8 +97,8 @@ PREP_ARGS=(--local-glob "/home/daniel/hlra/fineweb_local/**/*.parquet")   # loca
 
 # ---- Stage-F chatbot fine-tune, auto-chained after A→E (set RUN_STAGE_F=0 to stop at the foundation) ----
 RUN_STAGE_F=1
-HF_CHAT=HuggingFaceH4/no_robots   # real chat dataset (messages schema)
-SPLIT=train
+HF_CHAT=HuggingFaceH4/ultrachat_200k   # 100% multi-turn (what Stage F needs)
+SPLIT=train_sft
 STAGEF_STEPS=3000
 STAGEF_BATCH=8
 #============================================================
@@ -197,9 +197,10 @@ loads `runs/scaled/model.pt` **read-only**, fine-tunes on a real dialogue datase
 writes to **`runs/dialogue/`** — a **separate** directory, so the foundation is never
 overwritten.
 
-Default dataset: **`HuggingFaceH4/no_robots`** (10k high-quality instruct dialogues,
-standard `messages` schema, downloads cleanly — verified). Scale up later with
-`HuggingFaceH4/ultrachat_200k --split train_sft`, or use a transcript corpus
+Default dataset: **`HuggingFaceH4/ultrachat_200k`** (`--split train_sft`) — **measured
+100% multi-turn**, which is what Stage F's cross-turn memory needs. (**Not** `no_robots`:
+measured only **8%** multi-turn, so `--multi-turn`/`--persona`/`--gestalt-readout` would
+train on empty context for ~92% of it.) Or use a transcript corpus
 (debate/courtroom/socratic) via the `--hf-transcript` variant in
 [`TRAINING.md`](TRAINING.md) §6.2. The loader accepts `messages` as a native list **or
 a JSON string**, and both `role`/`content` and ShareGPT `from`/`value` schemas.
@@ -214,8 +215,8 @@ export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1   # flash attention (optional)
 #==================== CONFIG — edit these ====================
 FOUNDATION=runs/scaled/model.pt          # finished A→E model (loaded READ-ONLY; config inherited)
 OUT=runs/dialogue                         # Stage-F checkpoints -> SEPARATE dir (never touches the foundation)
-HF_CHAT=HuggingFaceH4/no_robots           # real chat dataset (messages schema)
-SPLIT=train
+HF_CHAT=HuggingFaceH4/ultrachat_200k      # 100% multi-turn (what Stage F needs)
+SPLIT=train_sft
 STEPS=3000
 BATCH=8
 #============================================================

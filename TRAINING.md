@@ -339,17 +339,30 @@ grep State /proc/$PID/status      # R=running  S=sleeping (normal when GPU-bound
 100%). Ticks flat **and** GPU 0 → dead.
 
 ### 8.2 Compiling, or hung? (the one that matters)
-A silent log at GPU 100% is *usually* a kernel compile — normal, one-time, 20–40 min on
-gfx1151. A **hung kernel looks identical** in `ps`/GPU%. The discriminator is **disk
-I/O**: a compiler writes temp objects; a spin-wait writes nothing.
+A silent log at GPU 100% with the CPU burning ~1 core is **either** the normal one-time
+kernel compile (20–40 min on gfx1151, §7.5 of [`STRIX_HALO.md`](STRIX_HALO.md)) **or** a
+hung kernel the CPU is spin-waiting on. They are **indistinguishable** by `ps`, GPU%,
+thread state, or disk I/O — so use **position + elapsed time**:
+
+| What the log's last line says | Verdict |
+|---|---|
+| `[trainer] training loop starting …` (first step of a fresh process), GPU ~100%, CPU ticks climbing | **Compiling.** Wait up to ~45 min. **Do not kill** — a kill restarts the compile from zero. |
+| Steps *were* flowing (`[step N]`/heartbeats), then stopped dead | **Hung.** Kill (§8.7) and resume from the last checkpoint. |
+| First step still going past ~45 min | Treat as **hung**. |
+
+> **Do NOT use disk I/O as the discriminator.** It's tempting and it's wrong:
+> `/proc/PID/io write_bytes` on this path is dominated by **checkpoint writes** (~1.6 GB
+> every `--checkpoint-every`), not the compiler — the ROCm compile is in-memory/mmap and
+> writes nothing the counter sees, and `~/.cache/comgr` stays untouched. So `write_bytes`
+> is **frozen during a compile AND during a hang**. (A long-lived process showing tens of
+> GB written is just its checkpoint history.)
+
+Useful supporting signals (none are decisive alone):
 ```bash
-grep write_bytes /proc/$PID/io; sleep 20; grep write_bytes /proc/$PID/io   # climbing = COMPILING
-ls -l /proc/$PID/fd/ | grep -viE "socket|pipe|/dev/|anon_inode" | tail -5  # compiler temp files open?
-ls -lt ~/.cache/comgr /tmp 2>/dev/null | head -6                           # fresh ROCm compile artifacts?
-```
-- **`write_bytes` climbing / fresh `~/.cache/comgr` entries** → compiling. **Wait.**
-- **`write_bytes` frozen + main thread pinned ~100% CPU + zero steps** → the CPU is
-  spin-waiting on a GPU kernel that never returns = **hung**. Kill and resume (§8.7).
+t1=$(awk '{print $14+$15}' /proc/$PID/stat); sleep 20; t2=$(awk '{print $14+$15}' /proc/$PID/stat)
+echo "ticks +$((t2-t1))"          # climbing = executing (NOT proof of progress)
+dmesg 2>/dev/null | grep -iE "amdgpu|ring|reset|timeout" | tail   # a ring timeout = definite hang
+py-spy dump --pid $PID            # §8.6 — the ONLY way to truly see which one it is
 
 ### 8.3 GPU / thermal / memory (no `rocm-smi`)
 ```bash

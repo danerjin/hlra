@@ -37,8 +37,7 @@ pip install -r training.txt                # datasets transformers wtpsplit tqdm
 cd "$PROJECT/files"
 # GPU sanity (must PASS). ROCm/gfx1151: prepend BOTH env vars --
 #   LATENT_MANUAL_LAYERNORM=1                 (LN-backward kernel workaround, see STRIX_HALO.md §2)
-#   TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 (flash attention; without it the first TRAIN step
-#                                              JIT-compiles the math fallback for ~45 min)
+#   TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 (flash attention; the recommended SDPA path here)
 LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 TORCH_BLAS_PREFER_HIPBLASLT=0 python rocm_smoke.py --preset small-w3
 ```
 
@@ -89,13 +88,13 @@ nohup python train_scaled.py --preset small-w3 --cache chunk_cache --device cuda
 tail -f train.log
 ```
 On ROCm/gfx1151 **export all three** env vars — `LATENT_MANUAL_LAYERNORM=1`,
-`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` (flash attention; without it the first step
-JIT-compiles the math fallback for ~45 min), and `TORCH_BLAS_PREFER_HIPBLASLT=0`
+`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` (flash attention — the recommended SDPA path;
+it is *not* a fix for stalls, see §8.2), and `TORCH_BLAS_PREFER_HIPBLASLT=0`
 (rocBLAS; skips hipBLASLt's slow GEMM autotune) — and use the auto-start queue in
 [`STRIX_HALO.md`](STRIX_HALO.md) §6. `--num-workers 2` (not 8) — the cache loads fully
-into RAM, so extra workers only fork a multi-GB process for nothing. **The first
-optimizer step compiles GPU kernels and takes 20–40 min on gfx1151 with a silent log —
-that is normal and one-time; do NOT kill it. See [`STRIX_HALO.md`](STRIX_HALO.md) §7.5.**
+into RAM, so extra workers only fork a multi-GB process for nothing. **If training goes silent at GPU 100%** (no `[step N]` lines, CPU burning, no disk I/O),
+that is **not** a compile — it is amdgpu **SVM page-migration thrash**. Fix:
+`export HSA_XNACK=0` and `--num-workers 0`. See [`STRIX_HALO.md`](STRIX_HALO.md) §7.5.
 
 ## 4. Monitor
 
@@ -110,16 +109,15 @@ ls -l --time-style=+%H:%M runs/scaled/checkpoint.pt   # mtime should keep advanc
 **Healthy startup** (flushed markers, in order): `[data] LOADING cache … 356 shards` →
 `[data] LOADED … in ~3s (cache ready)` → `[trainer] training loop starting …` →
 `[trainer] first optimizer step done in Xs -- LIVE` → `[step 50] stage=A …`. The cache
-load is **seconds**; only the **first optimizer step** takes minutes-to-tens-of-minutes
-(GPU kernel compile), during which the log is **silent by design** (no prints inside a
-compile). **Follow with `tail -F` (capital), not `-f`** — a relaunch recreates
-`train.log` and `-f` follows the dead handle.
+load is **seconds**, and the first step should be **seconds-to-a-couple-minutes**. If it
+goes silent for tens of minutes at GPU 100%, that is **SVM thrash, not a compile** (§8.2).
+**Follow with `tail -F` (capital), not `-f`** — a relaunch recreates `train.log` and `-f`
+follows the dead handle.
 
-**Is it compiling or actually stuck?** → **§8.2**. ⚠️ Do **not** judge by GPU% alone: a
-*hung* kernel also reads 100% while the CPU spin-waits on it. The reliable
-discriminator is **disk I/O** (a compiler writes; a spin-wait doesn't). While it's
-compiling: **wait, don't kill** — every kill resets the 20–40 min compile (the trap).
-Full gfx1151 explainer: [`STRIX_HALO.md`](STRIX_HALO.md) §7.5.
+**Stalled at GPU 100%?** → **§8.2**. On the gfx1151 APU this is almost always **amdgpu
+SVM page-migration thrash**, not a compile and not a hang. Do **not** judge by GPU%
+alone — the driver churning reads as 100% busy. Full explainer:
+[`STRIX_HALO.md`](STRIX_HALO.md) §7.5.
 
 Once live you'll see a cheap **`[step N] stage=X … (heartbeat)`** ping every **10 steps**
 (default `--heartbeat-every 10`; no eval, so it's basically free) plus the full metric
@@ -339,31 +337,32 @@ grep State /proc/$PID/status      # R=running  S=sleeping (normal when GPU-bound
 100%). Ticks flat **and** GPU 0 → dead.
 
 ### 8.2 Compiling, or hung? (the one that matters)
-A silent log at GPU 100% with the CPU burning ~1 core is **either** the normal one-time
-kernel compile (20–40 min on gfx1151, §7.5 of [`STRIX_HALO.md`](STRIX_HALO.md)) **or** a
-hung kernel the CPU is spin-waiting on. They are **indistinguishable** by `ps`, GPU%,
-thread state, or disk I/O — so use **position + elapsed time**:
+**On the gfx1151 APU, a silent log at GPU 100% is almost always `amdgpu` SVM
+page-migration thrash** — *not* a kernel compile and *not* a hung kernel. Full
+explanation: [`STRIX_HALO.md`](STRIX_HALO.md) §7.5. Confirm it in two commands:
 
-| What the log's last line says | Verdict |
-|---|---|
-| `[trainer] training loop starting …` (first step of a fresh process), GPU ~100%, CPU ticks climbing | **Compiling.** Wait up to ~45 min. **Do not kill** — a kill restarts the compile from zero. |
-| Steps *were* flowing (`[step N]`/heartbeats), then stopped dead | **Hung.** Kill (§8.7) and resume from the last checkpoint. |
-| First step still going past ~45 min | Treat as **hung**. |
-
-> **Do NOT use disk I/O as the discriminator.** It's tempting and it's wrong:
-> `/proc/PID/io write_bytes` on this path is dominated by **checkpoint writes** (~1.6 GB
-> every `--checkpoint-every`), not the compiler — the ROCm compile is in-memory/mmap and
-> writes nothing the counter sees, and `~/.cache/comgr` stays untouched. So `write_bytes`
-> is **frozen during a compile AND during a hang**. (A long-lived process showing tens of
-> GB written is just its checkpoint history.)
-
-Useful supporting signals (none are decisive alone):
 ```bash
-t1=$(awk '{print $14+$15}' /proc/$PID/stat); sleep 20; t2=$(awk '{print $14+$15}' /proc/$PID/stat)
-echo "ticks +$((t2-t1))"          # climbing = executing (NOT proof of progress)
-dmesg 2>/dev/null | grep -iE "amdgpu|ring|reset|timeout" | tail   # a ring timeout = definite hang
-py-spy dump --pid $PID            # §8.6 — the ONLY way to truly see which one it is
+PID=$(pgrep -f train_scaled.py | head -1)
+sudo "$(which py-spy)" dump --pid "$PID"        # pip install py-spy in the VENV (PEP 668)
+sudo dmesg | grep -i svm_range_restore | tail   # "hogged CPU ... N times", N CLIMBING = thrash
 ```
+
+| What you see | Verdict |
+|---|---|
+| `py-spy` shows **model frames** (`_encode_real_rows` ← `forward_self_supervised` ← `_loss_on`) **and** `svm_range_restore_work` climbing | **SVM thrash.** Fix: `export HSA_XNACK=0` + `--num-workers 0` (§7.5). |
+| `py-spy` shows a **compiler frame** (`comgr`/`hipblaslt`/codegen) | Actually compiling — wait. (We never once observed this.) |
+| `dmesg` shows **`ring gfx timeout`** / **`GPU reset`** | Real driver-level hang → kill + resume (§8.7). |
+| Process gone | Crashed → read the log tail, resume from checkpoint. |
+
+> **Two discriminators that DON'T work — we tried both and they misled us for hours:**
+> - **GPU%** — the driver churning on page migration reads as **100% busy**. Not proof of progress.
+> - **Disk I/O** (`/proc/PID/io write_bytes`) — dominated by **checkpoint writes** (~1.6 GB
+>   every `--checkpoint-every`), never by the compiler. It is frozen during a thrash, a
+>   compile, *and* a hang. Tens of GB on a long-lived run is just its checkpoint history.
+>
+> **`py-spy` is the only thing that actually answers it.** If `ptrace_scope` is 1 you need
+> sudo (`sudo sysctl -w kernel.yama.ptrace_scope=0` to fix permanently) — get it, rather
+> than inferring from indirect signals for hours the way we did.
 
 ### 8.3 GPU / thermal / memory (no `rocm-smi`)
 ```bash

@@ -22,7 +22,7 @@ Paths below assume the repo is at `~/hlra`; adjust if yours differs.
        LATENT_MANUAL_LAYERNORM=1              (LN-backward kernel workaround)
        TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1  (flash attention; else math fallback = 45-min first step)
        TORCH_BLAS_PREFER_HIPBLASLT=0          (rocBLAS; skips slow hipBLASLt GEMM autotuning)
-4. rocm_smoke.py  -> PASS   (and read §7.5 "The slow first step" BEFORE you panic at a quiet log)
+4. rocm_smoke.py  -> PASS   (if training later STALLS at GPU 100% -> §7.5: SVM thrash, HSA_XNACK=0)
 5. data: SaT on GPU + get the parquet on-box (HF Xet 403 escape) + data_prep --local-glob
 6. queue training to auto-start after prep
 ```
@@ -303,45 +303,62 @@ runs/scaled/model.pt --repo <you>/hlra-smallw3 --strip --bf16`** (uploads
 inference-only weights, ~4–8× smaller, no git limit), or `rsync -avP
 daniel@<box>:~/hlra/runs/scaled/model.pt <local>`.
 
-### 7.5 The slow first step (READ THIS before you panic at a quiet log)
+### 7.5 Stalls: amdgpu SVM page-migration thrash (NOT a kernel compile)
 
-On gfx1151 the **first optimizer step of a fresh process compiles/autotunes GPU
-kernels and takes 20–40 minutes**, during which the log is **silent** (there are no
-print statements inside a compile) and the GPU sits at **100%**. This is normal. It is
-a **one-time cost per process** — once it clears, steps run at ~1.6 step/s (~8 h for the
-whole A→E run) and it checkpoints every 1000 steps.
+> ⚠️ **This section previously said the stall was a 20–40 min "kernel compile — just
+> wait." That was WRONG**, and it cost most of a day. `py-spy` disproved it (see below).
+> There is no compile. Do not wait it out.
 
-Hard-won facts, so you don't repeat our day:
-- **A quiet log ≠ hung.** The markers are `[data] LOADED … in ~3s` → `[trainer]
-  training loop starting …` → *(silence while it compiles)* → `[trainer] first
-  optimizer step done in Xs` → `[step N … (heartbeat)]`. The gap between the middle two
-  is the compile.
-- **DO NOT KILL IT mid-compile.** Every kill throws the compiled kernels away, so the
-  next process starts the 20–40 min over. Killing repeatedly is the trap that never
-  finishes. If it reached a checkpoint (step ≥1000), a kill loses ≤1000 steps and
-  auto-resumes — but you still re-pay the compile.
-- **`rocm_smoke` warming does NOT transfer.** Kernels are compiled per *shape*;
-  `rocm_smoke` uses a small batch, training uses batch 32 → different shapes → the
-  smoke's 6 s PASS does not pre-bake training's kernels. (It still validates the config
-  and is worth running.)
-- **Use `tail -F`, not `tail -f`** — a relaunch recreates `train.log` and plain `-f`
-  follows the dead file handle and goes silent.
+**Symptom.** Training goes silent for tens of minutes (often at the *first step after a
+resume*, but it also hit mid-run at step ~17,900): no `[step N]` lines, **GPU reads
+100%**, CPU burns ~1–1.5 cores, process state `R`, **no disk I/O**, `dmesg` shows **no**
+ring timeout or GPU reset. Nothing is hung, and nothing is compiling.
 
-**Is it working or actually stuck?** No `rocm-smi`/`py-spy` needed — the kernel exposes
-it. This samples 20 s and prints a verdict:
-```bash
-PID=$(pgrep -f 'train_scaled.py' | head -1)
-t1=$(awk '{print $14+$15}' /proc/$PID/stat); sleep 20; t2=$(awk '{print $14+$15}' /proc/$PID/stat)
-g=$(cat /sys/class/drm/card*/device/gpu_busy_percent | sort -rn | head -1)
-if [ "$((t2-t1))" -gt 200 ] || [ "${g:-0}" -ge 50 ]; then echo "✅ WORKING (GPU ${g}%, +$((t2-t1)) ticks) — leave it"; else echo "⚠️ STALLED — GPU idle AND ticks flat"; fi
+**What it actually is: amdgpu SVM page-migration thrash.** `dmesg` names it:
 ```
-✅ = compiling/training, wait. ⚠️ (GPU 0 **and** ticks flat) = genuinely stuck, then act.
+workqueue: svm_range_restore_work [amdgpu] hogged CPU for >10000us 4 times
+                                                              ... 19 times
+                                                              ... 67 times      <- counter CLIMBING
+```
+On this APU the CPU and GPU share one memory pool. With **XNACK** on, the GPU
+*page-faults* on host memory and the driver migrates SVM ranges to satisfy it. With a
+big host working set — the **multi-GB chunk cache loaded entirely into RAM**, plus every
+forked DataLoader worker's copy-on-write image of that address space — the driver ends
+up migrating ranges continuously. The GPU shows "100% busy" because the **driver** is
+churning, not because compute is progressing. (The printk is rate-limited, so old
+timestamps do *not* mean it stopped — watch the counter, not the clock.)
 
-**Levers if the compile is intolerable** (each needs a relaunch → re-pays the compile,
-so use sparingly): `TORCH_BLAS_PREFER_HIPBLASLT=0` (rocBLAS, skips hipBLASLt's slow
-per-shape GEMM autotune — already in the env vars above); or drop `--batch-size` to 16
-(smaller shapes compile faster, slightly different step). The reliable path is simply
-to **let the batch-32 compile finish once, untouched.**
+**Diagnosis (the two commands that actually settle it — needs sudo):**
+```bash
+PID=$(pgrep -f train_scaled.py | head -1)
+sudo "$(which py-spy)" dump --pid "$PID"       # pip install py-spy in the VENV (PEP 668)
+sudo dmesg | grep -i svm_range_restore | tail  # climbing "hogged CPU ... N times" = thrash
+```
+- **`py-spy` shows real model frames** (e.g. `_encode_real_rows` ← `forward_self_supervised`
+  ← `_loss_on`) → it is **executing model code**, not compiling. A compiler frame
+  (`comgr`/`hipblaslt`/codegen) would be the *only* thing proving a compile — we never
+  saw one.
+- **`svm_range_restore_work` counter climbing** → confirmed migration thrash.
+
+**Remedy** (targets the cause directly):
+```bash
+export HSA_XNACK=0        # no GPU page-faults on host memory -> explicit copies, no SVM migration
+# and launch with:
+  --num-workers 0         # the cache is ALREADY fully in RAM; forked workers only add
+                          # multi-GB COW images for the driver to migrate, and buy nothing
+```
+`--num-workers 0` is strictly correct here regardless: collation is just indexing an
+in-RAM tensor, so workers add fork/COW cost for zero throughput.
+
+**Why the old "compile" story looked plausible** (so nobody re-derives it): a quiet log
++ GPU 100% + CPU burning genuinely *resembles* a JIT compile, `rocm_smoke` PASSes in 6 s
+(tiny footprint ⇒ no thrash), and one early run did clear a first step in ~3 min (small
+resident set). None of that was evidence of compilation — and `write_bytes` never
+discriminated anything (the tens of GB seen on a long-lived run were just its
+**checkpoint** history).
+
+**Use `tail -F`, not `tail -f`** — a relaunch recreates `train.log` and plain `-f`
+follows the dead handle and goes silent.
 
 ---
 

@@ -245,8 +245,10 @@ feed only dead paths"*. True for A→E — and false the moment they are written
 
 **Measured on the real corpus** (ultrachat — `training_easy.md`'s recommended Stage-F
 data, not a code default; `--hf-chat` defaults to the offline synthetic corpus — via
-`iter_hf_chat_turns`, preset `small`, B=8; independently reproduced at 45.4% / 27.5%): **45.7%** of every row's context memory was fabricated, and **28% of rows
-had zero real context — 100% phantom**. It made a row's `h_t` a function of its
+`iter_hf_chat_turns`, preset `small`, B=8): **~45%** of every row's context memory was fabricated, and **~28% of rows
+had zero real context — 100% phantom**. (Two independent draws: 45.7/28.0 and
+45.4/27.5 — a sampling distribution over batches, so read them as ~45/~28, not to
+three significant figures.) It made a row's `h_t` a function of its
 batchmates' context *length* — so it corrupted the `h_t` that `cos`/`gen` are computed
 from, not just the gate's input (the *sign* of the effect on those losses at random
 init is not measured, and inferring one would be the same mistake as §2.1's withdrawn
@@ -265,8 +267,12 @@ overstates the fix:
 - `inject_source` — **unreachable**: its only caller is `DialogueSession.add_source`
   (B=1 serving), where the column is always all-True. Marked so a future *batched*
   caller cannot reintroduce it.
-- `forward_dialogue`'s SELF write — **a bit-exact no-op** (verified: every output
-  identical to 0.0e+00 with the argument removed). `resp_mask` is a left-packed
+- `forward_dialogue`'s SELF write — **semantically inert** (its junk slots are per-row,
+  feed no loss, and `resp_mask`'s left-packing means a row never reactivates; verified
+  0.0e+00 on ragged-context batches). Removing it is *not universally* bit-exact: where
+  it is the bank's only validity source (every `_write_context` column all-True, which
+  now collapses to `None`), the reader falls back to its unmasked branch and outputs
+  move ~5e-7 — float32 noise, the same floor check [5] measures. `resp_mask` is a left-packed
   contiguous prefix, so a row never reactivates, contributes to no loss after its last
   chunk, and its junk slots are per-row — unobservable. Kept so the invariant holds by
   construction rather than by luck of left-packing. (An earlier draft justified it as
@@ -283,15 +289,19 @@ zeroed explicitly — matching the reader's existing "no memory yet" branch.
 a batchmate's context length changes. It is verified *sensitive* — stubbing `valid_mask`
 to `None` makes it fail (drift 6.6e-2 vs 4.8e-7 of float32 batch-shape noise). **It
 guards `_write_context` only**: reverting either of the other two `valid=` arguments
-leaves the suite green, because both are inert (below).
+leaves the suite green, because both are inert (below). Check [6] guards the round-3
+fixes (persona, the all-True collapse, the non-tensor guard), which shipped with no
+coverage at all — each is verified to turn the suite red when reverted.
 
 **Two latent hazards this does NOT close**, both measured, neither reachable today:
 - **FIFO eviction is still batch-coupled.** `valid` marks a slot dead; it does not
   protect it from `write`'s `pop(0)`. If `memory_capacity` were below the slots written
   per example, a long batchmate's writes would evict a *short* row's real context — the
   same coupling at the same magnitude (1.43 vs the unfixed 1.39). Safe on every shipped
-  preset (capacity is 4–8× `max_chunks_per_doc`), so this is a config invariant, not a
-  guarantee.
+  preset, but the real headroom is **2×, not the 4–8× the capacity ratio suggests**:
+  `forward_dialogue` writes context **plus** SELF, up to `2 × max_chunks_per_doc` slots
+  per example, against a capacity of 4–8× — so `small` (the recommended preset) has
+  exactly 2.0× margin. A config invariant, not a guarantee.
 - **`filtered_stacked` ignores validity.** Its only callers are A→E (whose banks never
   carry validity), and `_write_context`'s per-element roles are unfilterable by
   construction — so no phantom can reach it. A future Stage-F path reading the input
@@ -395,11 +405,15 @@ MMLU-style continuations are the degenerate worst case; LAMBADA/cloze map best.
 - **Unvalidated** — smoke-only on synthetic data; no real dialogue run.
 - **Cross-turn memory has a train/serve granularity mismatch** (pre-existing, not
   fixed). Training's `_write_context` writes **one slot per chunk** of each prior turn,
-  each with its own role/persona. Serving's `_age_user_turn` writes **one mean-pooled
-  slot per user turn**, and pools *before* `_gestalt` — which is non-linear, so the two
-  do not commute. A checkpoint trained against per-chunk USER gestalts is served
-  against pooled ones. Same class as the bugs §2.2 fixed; left as a design decision
-  (per-chunk aging would grow the bank fast) rather than patched blind.
+  each with its own role/persona; serving's `_age_user_turn` writes **one mean-pooled
+  slot per user turn**. A checkpoint trained against per-chunk USER gestalts is served
+  against pooled ones — real in **every** config. Under `--gestalt-readout`
+  (TRAINING.md's recommended command) it is worse: serving pools *before* `_gestalt`,
+  which is then a `Linear`+`hard_normalize` and does **not** commute with the mean
+  (measured 1.13 vs 0.0e+00). With the readout **off — the default —** `_gestalt` is the
+  identity and commutes exactly, so the mismatch there is purely one of granularity.
+  Same class as the bugs §2.2 fixed; left as a design decision (per-chunk aging would
+  grow the bank fast) rather than patched blind.
 - **The turn-end gate is OFF by default** (`end_weight=0`) and, when on, is
   unvalidated: there is **no evidence it extracts signal at all** (§2.1 — the earlier
   "learns only weakly" reading was withdrawn as an invalid inference). `--end-grad` is
@@ -416,7 +430,10 @@ MMLU-style continuations are the degenerate worst case; LAMBADA/cloze map best.
 - **Real HF loaders are coded but barely exercised.** The ultrachat stream has been
   read for *measurement* (§2.2's context-length statistics; `TRAINING.md` reports it
   100% multi-turn) — but never *trained* on.
-- **Multi-party persona** assumes ≤ `n_personas` distinct speakers per conversation.
+- **Multi-party persona** assumes ≤ `n_personas` distinct speakers per conversation —
+  and *serving cannot express a third speaker at all*: `DialogueSession` tags every
+  user turn persona 1 (the two-party case), so a multi-party conversation trained
+  with distinct speaker ids is served as if it had one user.
 
 **2026-07-14 review (4 adversarial audits) — no target leak, no garbage-training, halt gate
 clean.** Fixes landed off the frozen A→E path: Stage-F resume now restores the response

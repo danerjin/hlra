@@ -756,7 +756,8 @@ re-validate anti-collapse at width before turning any on.
   **wrong**: an inactive row does NOT keep a stale `h` — `active_mask` gates only the
   ponder cost and halt vote, so those rows *keep evolving on pad-chunk latents*
   (`hrm_loop.py:320`) and write fresh garbage. Gotcha: attention over a fully-masked row
-  is **NaN, not zero** — those rows are zeroed explicitly. Guarded by `files/dialogue.py` check [5], verified sensitive (6.6e-2 drift without the
+  is **NaN, not zero** — those rows are zeroed explicitly. Guarded by `files/dialogue.py` check
+  [5], verified sensitive (6.6e-2 drift without the
   fix vs 4.8e-7 float32 noise with it) — but it guards **`_write_context` only**. Two
   latent hazards remain, both measured, neither reachable: FIFO eviction is still
   batch-coupled (`valid` marks a slot dead, it does not protect it from `pop(0)`; safe

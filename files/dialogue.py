@@ -45,7 +45,7 @@ from data import PAD
 # That is NOT inert, and an earlier version of this comment claimed it was ("it
 # degrades to today's fixed-length behavior rather than truncating replies at
 # random") -- self-refuting, since a 6-chunk reply has 5 chances to stop early and
-# 1 - 0.982^5 = 8.7% of them would (18.1% for 12 chunks). Stopping 9% of replies at
+# 1 - 0.982^5 = 8.7% of them would (18.1% for 12 chunks). Stopping 8.7% of replies at
 # random IS truncating at random. The bias only makes an untrained gate quiet, never
 # safe; what actually makes it safe is DialogueSession(use_end_head=False) by
 # default, driven by the checkpoint's `end_gate_trained` flag.
@@ -270,12 +270,21 @@ class DialogueSession:
         # persona (model.forward_dialogue: `self_persona = 0`, "reserved for SELF"),
         # so omitting it made a served USER turn indistinguishable from the model's
         # own thought -- memory asserting the user's turn was spoken by the model.
-        # Training tags it 1 (dialogue_data._ROLE_MAP: "user" -> (USER, 1)); match it,
-        # or the gate is read off an h_t training never produced. Inert while
-        # persona_embed is zero-init, live under --persona (TRAINING.md's recommended
-        # fine-tune passes it). Mirrors the SELF write above, which does pass 0.
+        #
+        # 1 matches the paths that matter: dialogue_data._ROLE_MAP ("user" -> (USER, 1)),
+        # used by --hf-chat/ultrachat (TRAINING.md's recommended data) and the offline
+        # synthetic corpus. It does NOT match transcript_to_turns, which numbers speakers
+        # by FIRST APPEARANCE, not by role: with --hf-transcript --system-speakers, a
+        # leading moderator takes persona 1 and the user becomes 2 (measured). A served
+        # session is two-party and cannot express that anyway -- see §9's multi-party
+        # limit. Clamped like dialogue_data.py:259 so a small n_personas cannot index
+        # past the embedding.
+        # Inert while persona_embed is zero-init, live under --persona (TRAINING.md's
+        # recommended fine-tune passes it). Mirrors the SELF write above, which passes 0.
+        # NB: a served conversation cannot express a THIRD speaker -- every user turn is
+        # persona 1 regardless (see §9's multi-party limit).
         self.memory.write(self.model._gestalt(summary.unsqueeze(0)), USER,
-                          1 if self.cfg.persona_tags else None)
+                          min(1, self.cfg.n_personas - 1) if self.cfg.persona_tags else None)
 
     @torch.no_grad()
     def add_source(self, source_text: str, ground_talker: bool = False) -> int:
@@ -303,13 +312,14 @@ def _decode_ids(tok, ids) -> str:
 # Self-test for the turn-end gate. Runs offline, no checkpoint, no downloads:
 #   .venv/bin/python files/dialogue.py
 #
-# These five checks exist because each one is a mistake that was actually MADE
+# These six checks exist because each one is a mistake that was actually MADE
 # and shipped during this feature's review (see STAGE_F.md 2.1, notes.md):
 #   [1] the RNG trap      -- constructing the head shifted every dropout mask
 #   [2] the label mask    -- correct, incl. the truncation confound
 #   [3] the LYING metric  -- end_n stays healthy while the gate learns "never end"
 #   [4] the NULL control  -- beating base-rate entropy is NOT evidence of signal
 #   [5] phantom slots    -- a row's thought depended on its batchmates' context
+#   [6] the round-3 fixes themselves -- all three shipped with NO coverage
 # ======================================================================
 def _self_test() -> int:
     import torch.nn.functional as F
@@ -443,7 +453,7 @@ def _self_test() -> int:
     chk(len(solo) > 0 and drift < 1e-4,
         f"row 0's own P(end) is unchanged by a batchmate with LONGER context "
         f"(max drift {drift:.2e}) -- a batch-level `.any()` once forced phantom "
-        f"all-zero USER slots onto shorter rows (45.7% of context memory on the "
+        f"all-zero USER slots onto shorter rows (~45% of context memory on the "
         f"real corpus), which moved this by ~6e-2")
     cz, mz = _ctx(0)
     cc = torch.stack([cz, _ctx(4)[0]]); cm = torch.stack([mz, _ctx(4)[1]])
@@ -456,6 +466,46 @@ def _self_test() -> int:
     chk(bool(torch.isfinite(o["cos"])),
         "a row with ZERO real context stays finite -- attention over a fully-masked "
         "row is NaN, not zero, so those rows are zeroed explicitly")
+
+    print("[6] round-3 fixes -- each of these was shipped UNGUARDED and could be")
+    print("    silently reverted with the suite green (round-4 finding)")
+    from gestalt_memory import GestaltMemoryBank
+
+    # (a) persona: a served USER turn must NOT carry SELF's persona 0.
+    torch.manual_seed(0)
+    cfg6 = model_config("smoke"); cfg6.vocab_size = 64; cfg6.persona_tags = True
+    bank = GestaltMemoryBank(8, cfg6.d_latent)
+    bank.write(torch.randn(1, cfg6.d_latent), SELF, 0)                      # a self thought
+    bank.write(torch.randn(1, cfg6.d_latent), USER,
+               min(1, cfg6.n_personas - 1))                                # an aged user turn
+    pid = bank.persona_id_tensor("cpu").tolist()
+    chk(pid == [0, 1],
+        f"aged USER turn keeps its own persona {pid} != SELF's -- omitting it let "
+        f"persona_id_tensor map None->0, i.e. memory asserting the user's turn was "
+        f"spoken by the model")
+
+    # (b) all-True `valid` must collapse to None, so an all-valid bank keeps the
+    #     reader's ORIGINAL unmasked attention (byte-identity for B=1 serving).
+    b2 = GestaltMemoryBank(8, 4)
+    b2.write(torch.randn(3, 4), 0, valid=torch.tensor([True, True, True]))
+    chk(b2.valid_mask("cpu") is None,
+        "an all-True valid collapses to None -- otherwise every later read takes the "
+        "masked branch for nothing and byte-identity is not absolute")
+    b2.write(torch.randn(3, 4), 0, valid=torch.tensor([True, False, True]))
+    chk(b2.valid_mask("cpu") is not None, "a genuinely mixed valid still masks")
+
+    # (c) a non-tensor `valid` must RAISE. The broadcast turns any non-tensor into an
+    #     all-True column, so a bare False would silently UNMASK -- worse than an error.
+    for bad, label in ((False, "bare False"), (True, "bare True")):
+        b3 = GestaltMemoryBank(8, 4)
+        b3.write(torch.randn(3, 4), 0, valid=torch.tensor([True, False, True]))
+        b3.write(torch.randn(3, 4), 0, valid=bad)
+        try:
+            b3.valid_mask("cpu")
+            chk(False, f"{label} mixed with tensors must raise, not silently unmask")
+        except TypeError:
+            chk(True, f"{label} mixed with tensors raises TypeError (was silently "
+                      f"treated as ALL-TRUE)")
 
     print("\n[self-test] " + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1

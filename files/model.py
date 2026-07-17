@@ -60,6 +60,10 @@ USER, SELF, SYSTEM = 0, 1, 2  # role-tag ids, matching config.role_tags order
 # "SYSTEM","RETRIEVED"); A-E ships 3 roles, so RETRIEVED is opt-in and never
 # referenced on the validated path.
 RETRIEVED = 3
+# Conversation-local persona for a RETRIEVED slot. A source has no speaker, but None
+# maps to 0 == SELF's persona, so it needs SOME distinct id; no training convention
+# exists (RAG is untrained), hence arbitrary-but-not-SELF. Clamped at use.
+_RETRIEVED_PERSONA = 3
 
 
 @dataclass
@@ -658,8 +662,8 @@ class LatentThoughtModel(nn.Module):
             # `valid=col`: this guard is a batch-level ANY, so one row having context
             # at j forces a slot on EVERY row. Rows without it get _encode_real_rows'
             # exact-zero latent, and a zero vector plus a real role tag is a fully
-            # attendable "the user said <nothing>" slot -- 45.7% of context memory on
-            # the real corpus, with 28% of rows entirely fabricated, making a row's
+            # attendable "the user said <nothing>" slot -- ~45% of context memory on
+            # the real corpus, with ~28% of rows entirely fabricated, making a row's
             # h_t depend on its batchmates' context LENGTH. Mark the real rows.
             memory.write(self._gestalt(z[:, j]).detach(), role, persona, valid=col)
 
@@ -691,11 +695,21 @@ class LatentThoughtModel(nn.Module):
             col = source_mask[:, j]
             if not bool(col.any()):
                 continue
-            # DEFENSIVE: same batch-level-ANY hazard as _write_context, but currently
-            # unreachable -- the only caller is DialogueSession.add_source (B=1), where
-            # `col` is always all-True (and write() then collapses it back to None).
-            # Marked so a future batched caller cannot reintroduce the phantom.
-            memory.write(self._gestalt(z[:, j]), role, valid=col)
+            # `valid=col` is DEFENSIVE: same batch-level-ANY hazard as _write_context,
+            # but currently unreachable -- the only caller is DialogueSession.add_source
+            # (B=1), where `col` is always all-True (and write() then collapses it back
+            # to None). Marked so a future batched caller cannot reintroduce the phantom.
+            #
+            # `persona`: a retrieved source has NO speaker, but omitting it is not
+            # neutral -- persona_id_tensor maps None -> 0, and 0 is SELF's persona, so
+            # the bank would assert the source was the model's own thought (the same bug
+            # just fixed in _age_user_turn, which survived here because this line was
+            # edited without noticing it). No training convention exists for RETRIEVED
+            # (RAG is mechanism-only, never trained), so this id is arbitrary -- it only
+            # has to not be SELF's. Clamped like dialogue_data.py:259 does.
+            persona = (min(_RETRIEVED_PERSONA, self.cfg.n_personas - 1)
+                       if self.cfg.persona_tags else None)
+            memory.write(self._gestalt(z[:, j]), role, persona, valid=col)
             n += 1
         return n
 

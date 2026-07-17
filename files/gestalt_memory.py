@@ -73,15 +73,16 @@ class GestaltMemoryBank:
         latent, tagged with a real role. That is not inert: the reader computes
         `kv = stacked + tags`, so a zero vector plus the USER tag is a fully
         attendable "the user said <nothing>" slot. Measured on the real dialogue
-        corpus, 45.7% of every row's context memory was fabricated this way and 28%
-        of rows had NO real context at all -- and it made a row's h_t depend on its
+        corpus, ~45% of every row's context memory was fabricated this way and ~28%
+        of rows had NO real context at all (two draws: 45.7/28.0, 45.4/27.5) -- and it made a row's h_t depend on its
         batchmates' context length. Pass `valid` so the reader can ignore them."""
         if valid is not None and torch.is_tensor(valid) and bool(valid.all()):
             # Real for every row => nothing to mask. Collapsing to None here keeps
             # `valid_mask()` returning None for an all-valid bank, so the reader takes
             # its original unmasked attention and stays byte-identical -- which
             # matters for the B=1 serving paths (inject_source always passes an
-            # all-True column), where a mask would otherwise cost ~3e-8 for nothing.
+            # all-True column), where the masked branch would otherwise cost a
+            # float32-noise diff (~1e-7) for nothing and falsify an absolute claim.
             valid = None
         self.vectors.append(vector)
         self.role_ids.append(role_id)
@@ -146,13 +147,18 @@ class GestaltMemoryBank:
         alongside masked slots broadcasts to all-True (it IS real for every row)."""
         if not self.valids or all(v is None for v in self.valids):
             return None
-        # A non-tensor, non-None `valid` (e.g. a bare bool) would otherwise fall
-        # through to a bare StopIteration out of the generator below -- which python
-        # can swallow rather than raise. No shipped caller does it; fail loudly if one
-        # ever does, rather than silently.
-        if not any(torch.is_tensor(v) for v in self.valids):
+        # Every non-None `valid` must be a tensor. A bare bool is worse than an error:
+        # the broadcast below turns ANY non-tensor into an all-True column, so a bare
+        # `False` would silently UNMASK the slot -- the exact failure this class exists
+        # to prevent -- and `True`/`False` would be indistinguishable. (Checking only
+        # `any(is_tensor)` missed the mixed case, which is the likelier mistake; an
+        # all-bare-bool bank instead fell through to a bare StopIteration, which python
+        # can swallow rather than raise.)
+        bad = [type(v).__name__ for v in self.valids
+               if v is not None and not torch.is_tensor(v)]
+        if bad:
             raise TypeError("GestaltMemoryBank.write(valid=) takes a (batch,) bool "
-                            f"tensor or None; got {[type(v).__name__ for v in self.valids]}")
+                            f"tensor or None; got {bad}")
         batch = next(v.shape[0] for v in self.valids if torch.is_tensor(v))
         cols = [v.to(device).bool() if torch.is_tensor(v)
                 else torch.ones(batch, device=device, dtype=torch.bool)

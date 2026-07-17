@@ -43,8 +43,9 @@ class GestaltMemoryBank:
         self.vectors: List[torch.Tensor] = []   # each: (batch, d_model)
         self.role_ids: List[int] = []            # parallel list of role ids
         self.persona_ids: List = []              # parallel per-speaker ids (or None)
+        self.valids: List = []                   # parallel per-row validity (or None = all rows)
 
-    def write(self, vector: torch.Tensor, role_id, persona_id=None) -> None:
+    def write(self, vector: torch.Tensor, role_id, persona_id=None, valid=None) -> None:
         """Push a new thought vector (and its role tag) into the FIFO.
 
         `role_id` is either a python int (one role for the whole batch -- the
@@ -57,14 +58,33 @@ class GestaltMemoryBank:
         `persona_id` (optional, int or (batch,) tensor) is the conversation-local
         SPEAKER id for personalized tags; None means "no persona" (the A-E and
         single-turn paths). It is stored in parallel and only consumed when the
-        reader has persona_tags enabled."""
+        reader has persona_tags enabled.
+
+        `valid` (optional, (batch,) bool tensor) marks WHICH ROWS this slot is real
+        for. None (the default, and the whole A-E path) means "real for every row"
+        -- and while EVERY slot is None the reader takes its original unmasked
+        attention, byte-identical.
+
+        Why this exists: a write puts ONE slot into the bank for the WHOLE batch,
+        because the bank is (batch, n_slots, d). A caller that writes per-position
+        in a loop guarded by a batch-level `.any()` therefore forces a slot onto
+        rows that had no content at that position -- those rows get whatever
+        `vector[b]` happens to be, which for `_encode_real_rows` is an exact ZERO
+        latent, tagged with a real role. That is not inert: the reader computes
+        `kv = stacked + tags`, so a zero vector plus the USER tag is a fully
+        attendable "the user said <nothing>" slot. Measured on the real dialogue
+        corpus, 45.7% of every row's context memory was fabricated this way and 28%
+        of rows had NO real context at all -- and it made a row's h_t depend on its
+        batchmates' context length. Pass `valid` so the reader can ignore them."""
         self.vectors.append(vector)
         self.role_ids.append(role_id)
         self.persona_ids.append(persona_id)
+        self.valids.append(valid)
         if len(self.vectors) > self.capacity:
             self.vectors.pop(0)
             self.role_ids.pop(0)
             self.persona_ids.pop(0)
+            self.valids.pop(0)
 
     def apply_grad_truncation(self, window: int) -> None:
         """
@@ -110,6 +130,21 @@ class GestaltMemoryBank:
                 for p in ps]
         return torch.stack(cols, dim=1)                                          # (batch, n_slots)
 
+    def valid_mask(self, device) -> Optional[torch.Tensor]:
+        """(batch, n_slots) bool, True where the slot is REAL for that row.
+
+        Returns **None** when no slot carries a validity -- the A-E convention and
+        every B=1 serving path -- so the reader keeps its original unmasked
+        attention and stays byte-identical. A slot written with `valid=None`
+        alongside masked slots broadcasts to all-True (it IS real for every row)."""
+        if not self.valids or all(v is None for v in self.valids):
+            return None
+        batch = next(v.shape[0] for v in self.valids if torch.is_tensor(v))
+        cols = [v.to(device).bool() if torch.is_tensor(v)
+                else torch.ones(batch, device=device, dtype=torch.bool)
+                for v in self.valids]
+        return torch.stack(cols, dim=1)                                           # (batch, n_slots)
+
     def filtered_stacked(self, role_ids_wanted: List[int]):
         """
         Return the subset of stored slots whose role id is in
@@ -131,6 +166,7 @@ class GestaltMemoryBank:
         self.vectors = []
         self.role_ids = []
         self.persona_ids = []
+        self.valids = []
 
     def __len__(self) -> int:
         return len(self.vectors)
@@ -283,10 +319,27 @@ class GestaltCrossAttentionReader(nn.Module):
         if self.trust_gate:
             g = torch.sigmoid(self.trust_proj(tags))           # (…, n_slots, 1 or d)
             value = kv * g
+        # Per-row slot validity: a slot is written for the WHOLE batch, so a caller
+        # writing per-position can force a slot onto rows that had nothing there
+        # (see GestaltMemoryBank.write). None => no slot is masked => the original
+        # unmasked call, byte-identical (the A-E path and every B=1 serve).
+        kpm, dead = None, None
+        vmask = memory.valid_mask(query.device)                # (batch, n_slots) True=real
+        if vmask is not None:
+            # A row with NO valid slot would be fully masked, and attention over a
+            # fully-masked row is NaN, not zero. Leave such rows unmasked (their
+            # attention is meaningless either way) and zero their output afterwards
+            # -- matching the `stacked is None` branch above, which is the same
+            # situation one level up: nothing to attend to.
+            dead = ~vmask.any(dim=1)                           # (batch,)
+            kpm = (~vmask) & (~dead).unsqueeze(1)              # True = IGNORE this slot
         if self.core_qk_norm:
-            out = self.attn(self.norm_q(q), kv=kv, value=value)
+            out = self.attn(self.norm_q(q), kv=kv, value=value, key_padding_mask=kpm)
         else:
-            out, _ = self.attn(self.norm_q(q), kv, value, need_weights=False)
+            out, _ = self.attn(self.norm_q(q), kv, value, need_weights=False,
+                               key_padding_mask=kpm)
+        if dead is not None and bool(dead.any()):
+            out = out.masked_fill(dead.view(-1, 1, 1), 0.0)
         return out.squeeze(1) if single_vector else out
 
     def trust_by_role(self, n_roles: int, device) -> Optional[torch.Tensor]:

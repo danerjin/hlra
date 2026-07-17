@@ -355,6 +355,98 @@ def _self_test() -> int:
         f"{H:.3f} base-rate entropy -- so 'beats H(p)' is NOT evidence the gate learns "
         f"({N} points in {D}-d separate any labeling). Signal needs a HELD-OUT split.")
 
+    print("[5] a row's thought must NOT depend on its batchmates' context length")
+    from config import model_config
+    from model import StageFlags
+    from ema_target import EMATargetEncoder
+
+    class _Stub:
+        def __init__(self, c):
+            self.tokenizer = None
+            self.max_chunk_len = c.max_chunk_len
+            self.max_chunks_per_doc = c.max_chunks_per_doc
+
+    torch.manual_seed(0)
+    cfg = model_config("smoke"); cfg.vocab_size = 64
+    mdl = LatentThoughtModel(cfg, _Stub(cfg)); mdl.eval()
+    em = EMATargetEncoder(mdl.chunk_encoder, momentum=0.996)
+    adp = DialogueAdapter(cfg.d_latent)
+    # end_head.weight is ZERO-init, so end_head(h) == bias for ANY h -- a probe using
+    # it as shipped cannot detect a change in h at all (this check was vacuous once,
+    # passing even with the mask disabled). Perturb the weight so the head reads h.
+    nn.init.normal_(adp.end_head.weight, std=0.05)
+    fl = StageFlags(use_hrm_loop=True, detach_memory=False, inner_loop_grad_window=5,
+                    memory_grad_window=5, use_act=False, use_input_lanes=True)
+    # Record ROW 0's OWN P(end): a batch-mean loss also moves when the batchmate's
+    # content changes, which would confound this with a real coupling.
+    seen = []
+
+    class _Rec(nn.Module):
+        def __init__(self, inner):
+            super().__init__(); self.inner = inner
+
+        def forward(self, x):
+            seen.append(float(self.inner(x).squeeze(-1)[0])); return self.inner(x)
+
+    rec = _Rec(adp.end_head)
+    gg = torch.Generator().manual_seed(5)
+    Mx, Lx, Ax = cfg.max_chunks_per_doc, cfg.max_chunk_len, 8
+
+    def _ctx(n):
+        cc = torch.zeros(Ax, Lx, dtype=torch.long); cm = torch.zeros(Ax, dtype=torch.bool)
+        if n:
+            cc[:n] = torch.randint(1, cfg.vocab_size, (n, Lx), generator=gg); cm[:n] = True
+        return cc, cm
+
+    rsp = torch.randint(1, cfg.vocab_size, (1, Mx, Lx), generator=gg); rsp[0, 2:] = 0
+    rmk = torch.zeros(1, Mx, dtype=torch.bool); rmk[0, :2] = True
+    Wx = cfg.recent_token_window
+    ui = torch.randint(1, cfg.vocab_size, (1, Wx), generator=gg)
+    umk = torch.ones(1, Wx, dtype=torch.bool)
+    c0, m0 = _ctx(2)
+
+    def _row0(mate, head=None):
+        seen.clear()
+        if mate is None:
+            cc, cm = c0.unsqueeze(0), m0.unsqueeze(0); R, U, UM, RM = rsp, ui, umk, rmk
+        else:
+            c1, m1 = _ctx(mate)
+            cc = torch.stack([c0, c1]); cm = torch.stack([m0, m1])
+            R, U, UM, RM = (torch.cat([rsp] * 2), torch.cat([ui] * 2),
+                            torch.cat([umk] * 2), torch.cat([rmk] * 2))
+        with torch.no_grad():
+            o = mdl.forward_dialogue(R, RM, U, UM, em, adp.response_seed, fl,
+                                     context_chunks=cc, context_mask=cm,
+                                     context_roles=torch.zeros(cc.shape[0], Ax, dtype=torch.long),
+                                     end_head=head if head is not None else rec)
+        return list(seen), o
+
+    solo, _ = _row0(None)
+    same, _ = _row0(2)
+    longer, _ = _row0(6)
+    # Tolerance, not equality: B=1 vs B=2 take different attention reductions, so
+    # float32 noise is ~5e-7. The bug this guards moves the logit by ~6e-2 -- five
+    # orders of magnitude larger -- so 1e-4 separates them with room to spare.
+    # (Verified sensitive: stubbing valid_mask -> None makes this FAIL.)
+    drift = max(abs(a - b) for a, b in zip(solo, longer)) if solo and longer else 1.0
+    drift = max(drift, max(abs(a - b) for a, b in zip(solo, same)) if same else 0.0)
+    chk(len(solo) > 0 and drift < 1e-4,
+        f"row 0's own P(end) is unchanged by a batchmate with LONGER context "
+        f"(max drift {drift:.2e}) -- a batch-level `.any()` once forced phantom "
+        f"all-zero USER slots onto shorter rows (45.7% of context memory on the "
+        f"real corpus), which moved this by ~6e-2")
+    cz, mz = _ctx(0)
+    cc = torch.stack([cz, _ctx(4)[0]]); cm = torch.stack([mz, _ctx(4)[1]])
+    with torch.no_grad():
+        o = mdl.forward_dialogue(torch.cat([rsp] * 2), torch.cat([rmk] * 2),
+                                 torch.cat([ui] * 2), torch.cat([umk] * 2), em,
+                                 adp.response_seed, fl, context_chunks=cc, context_mask=cm,
+                                 context_roles=torch.zeros(2, Ax, dtype=torch.long),
+                                 end_head=adp.end_head)
+    chk(bool(torch.isfinite(o["cos"])),
+        "a row with ZERO real context stays finite -- attention over a fully-masked "
+        "row is NaN, not zero, so those rows are zeroed explicitly")
+
     print("\n[self-test] " + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 

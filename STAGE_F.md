@@ -216,6 +216,47 @@ works:
   `end_gate_trained` flag says it was really trained (`DialogueSession(use_end_head=)`,
   set by `chat_core.new_dialogue_session`). Off = exactly the pre-gate behavior.
 
+## 2.2 Phantom memory slots (`GestaltMemoryBank.write(valid=)`)
+
+Found by the 2026-07-16 cross-review, **pre-existing and independent of the turn-end
+gate** — the gate merely exposed it.
+
+**The bug.** A `memory.write` puts ONE slot into the bank for the WHOLE batch (the bank
+is `(batch, n_slots, d)`). `_write_context` looped per context position guarded by a
+**batch-level `.any()`**, so one row having context at position *j* forced a slot onto
+*every* row. Rows without it got `_encode_real_rows`' **exact-zero latent**, tagged with
+a real role — and `context_roles` defaults to `torch.zeros`, i.e. **`USER`**. That slot
+is not inert: the reader computes `kv = stacked + tags`, so a zero vector plus the USER
+tag is a fully attendable *"the user said ⟨nothing⟩"* memory.
+
+Note what it violated: `_encode_real_rows`' own docstring promises *"pad-row latents
+feed only dead paths"*. True for A→E — and false the moment they are written to memory.
+
+**Measured on the real default corpus** (ultrachat via `iter_hf_chat_turns`, preset
+`small`, B=8): **45.7%** of every row's context memory was fabricated, and **28% of rows
+had zero real context — 100% phantom**. It made a row's `h_t` a function of its
+batchmates' context *length*, it degraded `cos`/`gen` (not just the gate), and it was
+**not** mitigated by `--no-act` — the ACT halt-vote skew documented in §2.1 is a
+*different*, and measurably benign, coupling. Serving (B=1) never reproduced it.
+
+**The fix.** `GestaltMemoryBank.write(..., valid=)` takes an optional `(batch,)` bool
+marking which rows the slot is real for; `valid_mask()` returns `(batch, n_slots)`, or
+**`None` when no slot carries one** — in which case the reader takes its original
+unmasked attention, byte-identical. That is the whole A→E path and every B=1 serve, so
+**A→E is untouched** (verified: losses + every per-parameter grad norm, float64).
+Three Stage-F writers now pass their real per-row mask: `_write_context`,
+`inject_source` (identical `.any()` pattern for RAG), and `forward_dialogue`'s SELF
+write — where an *inactive* row keeps a stale `h` and would re-write it once per
+remaining column, the same batch-coupling in a subtler form.
+
+One trap worth knowing: attention over a **fully-masked row is NaN, not zero**, and 28%
+of real rows have no context at all. Those rows are left unmasked and their output
+zeroed explicitly — matching the reader's existing "no memory yet" branch.
+
+`python files/dialogue.py` check [5] guards this: row 0's own P(end) must not move when
+a batchmate's context length changes. It is verified *sensitive* — stubbing `valid_mask`
+to `None` makes it fail (drift 6.6e-2 vs 4.8e-7 of float32 batch-shape noise).
+
 ## 3. Anti-sycophancy (`forward_anti_sycophancy` + `losses.anti_sycophancy_loss`)
 
 Two user turns that differ ONLY in an asserted premise (asserts X vs. not-X); the

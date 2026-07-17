@@ -736,6 +736,24 @@ re-validate anti-collapse at width before turning any on.
   any cache not stamped `chunker_version == CHUNKER_VERSION` (currently 3), so a stale cache
   can't be trained by mistake — re-prep, or `LATENT_ALLOW_STALE_CHUNKER=1` to override.
 
+- **Phantom memory slots (2026-07-16, pre-existing, Stage-F only, FIXED).** A
+  `memory.write` writes one slot for the WHOLE batch, so `_write_context`'s batch-level
+  `.any()` guard forced slots onto rows with no context there — they got
+  `_encode_real_rows`' exact-zero latent tagged role 0 (**USER**), a fully attendable
+  "the user said nothing" memory (`kv = stacked + tags`). It violated
+  `_encode_real_rows`' own documented invariant ("pad-row latents feed only dead
+  paths" — true until you write them to memory). Measured on the real corpus: **45.7%
+  of context memory fabricated, 28% of rows 100% phantom**; a row's `h_t` depended on
+  its batchmates' context LENGTH; it degraded `cos`/`gen`, not just the turn-end gate;
+  and `--no-act` did NOT mitigate it (the ACT skew is a different, benign coupling).
+  Fix: `GestaltMemoryBank.write(valid=)` + `valid_mask()` → a reader `key_padding_mask`,
+  returning None when no slot carries a validity so **A→E keeps its original unmasked
+  attention, byte-identical**. Applied at all three Stage-F writers (`_write_context`,
+  `inject_source`, and `forward_dialogue`'s SELF write, where an inactive row re-wrote a
+  stale `h` per remaining column). Gotcha: attention over a fully-masked row is **NaN,
+  not zero** — those rows are zeroed explicitly. Guarded by `files/dialogue.py` check [5],
+  verified sensitive (6.6e-2 drift without the fix vs 4.8e-7 float32 noise with it).
+
 ## Eval-tooling dry-run (2026-07-16)
 
 Exercised the whole post-run eval path CPU-only against `runs/model.pt`, before the A→E

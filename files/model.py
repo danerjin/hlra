@@ -647,14 +647,21 @@ class LatentThoughtModel(nn.Module):
         flat = context_chunks.reshape(B * A, L)
         z = self._encode_real_rows(flat, self.chunk_encoder).reshape(B, A, -1)
         for j in range(A):
-            if not bool(context_mask[:, j].any()):
+            col = context_mask[:, j]
+            if not bool(col.any()):
                 continue
             role = context_roles[:, j] if context_roles.dim() == 2 else int(context_roles[j])
             persona = None
             if context_personas is not None:
                 persona = (context_personas[:, j] if context_personas.dim() == 2
                            else int(context_personas[j]))
-            memory.write(self._gestalt(z[:, j]).detach(), role, persona)
+            # `valid=col`: this guard is a batch-level ANY, so one row having context
+            # at j forces a slot on EVERY row. Rows without it get _encode_real_rows'
+            # exact-zero latent, and a zero vector plus a real role tag is a fully
+            # attendable "the user said <nothing>" slot -- 45.7% of context memory on
+            # the real corpus, with 28% of rows entirely fabricated, making a row's
+            # h_t depend on its batchmates' context LENGTH. Mark the real rows.
+            memory.write(self._gestalt(z[:, j]).detach(), role, persona, valid=col)
 
     @torch.no_grad()
     def inject_source(self, memory: GestaltMemoryBank, source_chunks: torch.Tensor,
@@ -681,9 +688,12 @@ class LatentThoughtModel(nn.Module):
         z = self._encode_real_rows(flat, self.chunk_encoder).reshape(B, A, -1)
         n = 0
         for j in range(A):
-            if not bool(source_mask[:, j].any()):
+            col = source_mask[:, j]
+            if not bool(col.any()):
                 continue
-            memory.write(self._gestalt(z[:, j]), role)
+            # Same batch-level-ANY hazard as _write_context: mark the real rows so a
+            # shorter source does not get phantom RETRIEVED slots from a longer one.
+            memory.write(self._gestalt(z[:, j]), role, valid=col)
             n += 1
         return n
 
@@ -828,7 +838,13 @@ class LatentThoughtModel(nn.Module):
             # Self-thought written through the same gestalt-readout as context, so
             # the bank stays homogeneous (§4/Q2). Identity when readout is off.
             write_vec = self._gestalt(h)
-            memory.write(write_vec.detach() if stage.detach_memory else write_vec, SELF, self_persona)
+            # `valid=active`: hrm_loop leaves an INACTIVE row's h unchanged, so a row
+            # whose response already ended would write a duplicate of its own last
+            # thought once per remaining column -- again making its memory depend on
+            # how long its batchmates' responses are. Not zeros like _write_context,
+            # but the same batch-coupling class.
+            memory.write(write_vec.detach() if stage.detach_memory else write_vec,
+                         SELF, self_persona, valid=active)
             memory.apply_grad_truncation(stage.memory_grad_window)
             prev_thought = h
             # Turn-end: `h` here is the thought formed AFTER ingesting chunk t --

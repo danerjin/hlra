@@ -38,28 +38,30 @@ Rewriting the benchmark with an LLM is powerful and dangerous:
     opt-in refinement; any ollama failure falls back to the deterministic
     template for that item rather than crashing the run.
 
-OBSERVED with phi3 (2026-07-17, why this is a PROTOTYPE, not a result)
----------------------------------------------------------------------
-On a live run, phi3 was too loose a rewriter: it flipped the correct
-"an infectious, cell-cycle disease" to "a non-infectious, immune system
-disorder" (label corruption -- caught by `is_faithful`). But the guard needed to
-stop that ALSO rejects meaning-faithful synonym rewrites ("planetary gravity will
-become stronger" -> "the planet's gravitational pull might intensify": gravity ->
-gravitational, stronger -> intensify), because a cheap lexical check cannot tell
-a synonym from a drift. Net: with phi3 the guard falls back to `deterministic`
-for most options, so the ollama path buys little over the rule-based template.
-The likely fix (NOT built here -- a design decision to make first) is to stop
-letting the LLM touch the option at all: have it declarativize only the QUESTION
-STEM into a frame with a slot, once per question, and fill the VERBATIM option
-in ("The most likely effect ... is that ___"). That preserves the option by
-construction and needs no faithfulness guard. Until then, treat an ollama number
-here as exploratory, and prefer a stronger/instruction-tighter model if you do
-use this path.
+MODEL CHOICE MATTERS A LOT (measured 2026-07-17, `--compare`)
+-------------------------------------------------------------
+The rewriter's capability is the whole ballgame. On 24 real ARC-C options, with
+the acceptance gate below (faithful AND not editorializing AND not over-long):
+
+  * phi3   -- 46% accepted. Too loose: it paraphrases (synonym drift), rambles
+              (too-long), and once flipped the correct "an infectious, cell-cycle
+              disease" to "a non-infectious, immune system disorder" (a LABEL
+              CORRUPTION the guard caught). Not usable for this.
+  * gemma4 -- 100% accepted. It follows "reuse the exact words, only reorder"
+              and produces the intended form verbatim: "The most likely effect
+              of this increase in rotation is that planetary days will become
+              shorter." This is why gemma4 is the default ollama model.
+
+So the ollama path DOES work -- with a capable instruction-follower. Use gemma4
+(or better); phi3 mostly falls back to the deterministic template and buys
+nothing. (Small sample -- spot-check the cache at scale before trusting a
+headline number.) Re-run the bake-off any time with
+`--compare modelA,modelB --n N`.
 
 Config is read from the environment (set by `run_lm_eval.py --arc-templater ...`,
 or exported by hand):
   ARC_TEMPLATER_BACKEND  deterministic (default) | ollama
-  ARC_TEMPLATER_MODEL    ollama model tag (default: phi3)
+  ARC_TEMPLATER_MODEL    ollama model tag (default: gemma4; phi3 rejects ~half)
   ARC_TEMPLATER_CACHE    cache json path (default: poster_data/arc_statements_cache.json)
   ARC_TEMPLATER_LIMIT    if set, only rewrite+keep the first N docs (keeps
                          --limit dry-runs cheap; matches lm-eval's "first N").
@@ -158,6 +160,42 @@ def is_faithful(option: str, rewrite: str, min_overlap: float = 0.5) -> bool:
     return (len(kept) / len(opt)) >= min_overlap
 
 
+# Judgment/hedge cues: phi3 sometimes appends a correctness verdict ("...is not
+# necessarily accurate") that the word-level faithfulness check lets through
+# because the option's words are still present. That commentary is asymmetric
+# signal (it editorializes about THIS option), so reject it.
+import re as _re
+_JUDGE_RE = _re.compile(
+    r"\b(correct|incorrect|accurate|inaccurate|not necessarily|is true|is false|"
+    r"is wrong|the right answer|best answer|however|therefore|in conclusion)\b",
+    _re.IGNORECASE)
+
+
+def editorializes(rewrite: str) -> bool:
+    """True if the rewrite injects a correctness judgment or hedge -- a rule-4
+    violation the faithfulness guard can miss."""
+    return bool(_JUDGE_RE.search(rewrite))
+
+
+def within_length(question: str, option: str, rewrite: str, slack: int = 6) -> bool:
+    """A restatement should be about as long as the question plus the option, not
+    an expansion. Reject rewrites that balloon (the other way phi3 drifts:
+    padding the option with an explanatory clause)."""
+    return len(rewrite.split()) <= len(question.split()) + len(option.split()) + slack
+
+
+def reject_reason(question: str, option: str, rewrite: str):
+    """None if the rewrite is acceptable, else a short reason string. One gate for
+    all three failure modes so statement() and the comparison tool agree."""
+    if not is_faithful(option, rewrite):
+        return "content-drift"
+    if editorializes(rewrite):
+        return "editorializes"
+    if not within_length(question, option, rewrite):
+        return "too-long"
+    return None
+
+
 def ollama(question: str, option: str, model: str, url: str, timeout: float = 90.0) -> str:
     """One temp-0 ollama generation. Returns the rewritten sentence, or raises on
     any transport/parse failure (the caller falls back to `deterministic`)."""
@@ -219,12 +257,12 @@ def statement(question: str, option: str, *, backend: str, model: str,
     if backend == "ollama":
         try:
             s = _ollama(question, option, model, url)
-            if not is_faithful(option, s):
-                # The rewrite dropped the option's content -> label drift. Reject
-                # it for the verbatim-safe template rather than score a corrupted
-                # option (see is_faithful).
-                print("[arc_templater] UNFAITHFUL rewrite rejected for %r -> %r; "
-                      "deterministic fallback" % (option, s))
+            reason = reject_reason(question, option, s)
+            if reason:
+                # Content drift, editorializing, or ballooning -> don't score a
+                # corrupted/biased option; fall back to the verbatim template.
+                print("[arc_templater] rewrite rejected (%s) for %r -> %r; "
+                      "deterministic fallback" % (reason, option, s))
                 s = deterministic(question, option)
         except Exception as e:  # noqa: BLE001 -- any failure -> deterministic floor
             s = deterministic(question, option)
@@ -245,7 +283,7 @@ def process_docs(dataset):
     option, aligned to `choices.text`). Config comes from the environment so the
     bare-function signature lm-eval requires can still be parameterised."""
     backend = os.environ.get("ARC_TEMPLATER_BACKEND", "deterministic")
-    model = os.environ.get("ARC_TEMPLATER_MODEL", "phi3")
+    model = os.environ.get("ARC_TEMPLATER_MODEL", "gemma4")
     cache_path = os.environ.get("ARC_TEMPLATER_CACHE", _DEFAULT_CACHE)
     url = os.environ.get("ARC_TEMPLATER_OLLAMA_URL",
                          "http://localhost:11434/api/generate")
@@ -254,6 +292,19 @@ def process_docs(dataset):
     if limit:
         n = min(int(limit), len(dataset))
         dataset = dataset.select(range(n))
+
+    # Preflight: a missing/unreachable ollama model would silently fall back to
+    # deterministic for EVERY option (a whole run quietly not-templated). Probe
+    # once and warn loudly instead of burying it in per-item fallback logs.
+    if backend == "ollama":
+        try:
+            ollama("Which is a test?", "a test", model, url, timeout=30.0)
+        except Exception as e:  # noqa: BLE001
+            print("[arc_templater] WARNING: ollama model %r unreachable (%s: %s). "
+                  "EVERY option will fall back to the deterministic template -- "
+                  "this run is NOT LLM-templated. Pull the model / start ollama, "
+                  "or pass --arc-templater deterministic to silence this."
+                  % (model, type(e).__name__, str(e)[:80]))
 
     cache = _load_cache(cache_path)
     n_before = len(cache)
@@ -279,6 +330,59 @@ def process_docs(dataset):
         print("[arc_templater] cache now %d entries (+%d) -> %s"
               % (len(cache), len(cache) - n_before, cache_path))
     return dataset
+
+
+# ----------------------------------------------------------------------
+# Backend comparison: which ollama model produces the most ACCEPTED rewrites
+# (faithful, non-editorializing, not over-long) on real ARC-C? A diagnostic to
+# pick a model, not part of the eval path.
+#   .venv/bin/python files/tasks/arc_templater.py --compare phi3,gemma4 --n 6
+# ----------------------------------------------------------------------
+def compare_backends(models, n: int = 6, url: str = None) -> int:
+    url = url or os.environ.get("ARC_TEMPLATER_OLLAMA_URL",
+                                "http://localhost:11434/api/generate")
+    # ARC-C is already cached locally (lm-eval downloaded it); force offline so
+    # this diagnostic never depends on the Hub.
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    os.environ.setdefault("HF_HOME", os.path.join(PROJECT, ".hf_cache"))
+    from datasets import load_dataset
+    ds = load_dataset("allenai/ai2_arc", "ARC-Challenge", split="test")
+    docs = [ds[i] for i in range(min(n, len(ds)))]
+    n_opts = sum(len(d["choices"]["text"]) for d in docs)
+    print("Comparing %r on %d ARC-C questions (%d options).\n"
+          "Accepted = faithful AND not editorializing AND not over-long.\n"
+          % (models, len(docs), n_opts))
+
+    for model in models:
+        accepted, total, reasons, samples = 0, 0, {}, []
+        for d in docs:
+            q = d["question"]
+            for opt in d["choices"]["text"]:
+                total += 1
+                try:
+                    rw = ollama(q, opt, model, url)
+                except Exception as e:  # noqa: BLE001
+                    reasons["error"] = reasons.get("error", 0) + 1
+                    continue
+                r = reject_reason(q, opt, rw)
+                if r is None:
+                    accepted += 1
+                    if sum(t == "OK" for _, _, t in samples) < 3:
+                        samples.append((opt, rw, "OK"))
+                else:
+                    reasons[r] = reasons.get(r, 0) + 1
+                    if sum(t != "OK" for _, _, t in samples) < 3:
+                        samples.append((opt, rw, r))
+        pct = 100.0 * accepted / total if total else 0.0
+        print("=== %s ===" % model)
+        print("  accepted %d/%d (%.0f%%)   rejects: %s"
+              % (accepted, total, pct, reasons or "none"))
+        for opt, rw, tag in samples:
+            print("   [%-13s] %r" % (tag, rw))
+            print("   %15s option: %r" % ("", opt))
+        print()
+    return 0
 
 
 # ----------------------------------------------------------------------
@@ -350,6 +454,28 @@ def _self_test() -> int:
         print("[self-test] FAIL: unfaithful rewrite was not replaced by deterministic")
         ok = False
 
+    # 3c. anti-editorializing + length filters (the live phi3 failures where the
+    #     option's words survive but commentary/padding is bolted on).
+    q_g = ("An astronomer observes that a planet rotates faster after a meteorite "
+           "impact. Which is the most likely effect of this increase in rotation?")
+    opt_g = "Planetary gravity will become stronger."
+    editorial = ("However, the statement Planetary gravity will become stronger is "
+                 "not necessarily accurate.")
+    if reject_reason(q_g, opt_g, editorial) != "editorializes":
+        print("[self-test] FAIL: editorializing rewrite not rejected (got %r)"
+              % reject_reason(q_g, opt_g, editorial))
+        ok = False
+    clean = "Planetary gravity will become stronger after the impact."
+    if reject_reason(q_g, opt_g, clean) is not None:
+        print("[self-test] FAIL: a clean rewrite was rejected (%r)"
+              % reject_reason(q_g, opt_g, clean))
+        ok = False
+    balloon = ("Planetary gravity will become stronger " + "and heavier " * 20).strip()
+    if reject_reason(q_g, opt_g, balloon) != "too-long":
+        print("[self-test] FAIL: over-long rewrite not rejected (got %r)"
+              % reject_reason(q_g, opt_g, balloon))
+        ok = False
+
     # 4. disk cache persists and reloads.
     with tempfile.TemporaryDirectory() as td:
         p = os.path.join(td, "c.json")
@@ -374,4 +500,12 @@ def _self_test() -> int:
 
 
 if __name__ == "__main__":
+    import sys
+    argv = sys.argv[1:]
+    if "--compare" in argv:
+        i = argv.index("--compare")
+        models = (argv[i + 1].split(",") if i + 1 < len(argv)
+                  and not argv[i + 1].startswith("--") else ["phi3", "gemma4"])
+        n = int(argv[argv.index("--n") + 1]) if "--n" in argv else 6
+        raise SystemExit(compare_backends(models, n))
     raise SystemExit(_self_test())

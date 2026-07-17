@@ -161,12 +161,14 @@ HF Hub on first run.
 **Opt-in ARC "statement" variant** (`--tasks arc_challenge_statement`) rewrites each answer option
 into a full declarative sentence — a longer, more differentiated span than ARC-C's short phrases —
 via `files/tasks/arc_templater.py`. `--arc-templater deterministic` (default) is a reproducible
-rule-based template; `--arc-templater ollama` (with `--arc-templater-model`) is a temp-0 LLM rewrite,
-cached to disk and guarded against content drift (a rewrite that drops the option's meaning falls back
-to the verbatim template). It is a **distinct, clearly-labelled** task, never a substitute for standard
-`arc_challenge` — report it as "ARC-C (statement-rewritten)". See the module docstring for the honest
-limits (a small local model + the faithfulness guard tend to collapse back to the deterministic
-template; the robust design slots the verbatim option into an LLM-declarativized stem).
+rule-based template; `--arc-templater ollama` (with `--arc-templater-model`, default `gemma4`) is a
+temp-0 LLM rewrite, cached to disk and gated by three guards — content-drift, editorializing, and
+length — any of which falls back to the verbatim-safe template. It is a **distinct, clearly-labelled**
+task, never a substitute for standard `arc_challenge` — report it as "ARC-C (statement-rewritten by
+&lt;model&gt;)". **Model choice dominates:** on a 24-option bake-off, `gemma4` produced faithful,
+on-template rewrites 100% of the time while `phi3` passed only 46% (paraphrase drift, rambling, one
+label flip) — run `python files/tasks/arc_templater.py --compare modelA,modelB --n N` to re-measure.
+Rewrites can only be validated as *helpful* on the trained checkpoint.
 
 ## Status and honest limits
 

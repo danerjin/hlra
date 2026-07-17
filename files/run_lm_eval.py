@@ -115,8 +115,10 @@ def main(argv=None) -> int:
                         "deterministic (default) = rule-based, no LLM. "
                         "ollama = temp-0 LLM rewrite, cached to disk. Only used "
                         "when arc_challenge_statement is among --tasks.")
-    p.add_argument("--arc-templater-model", default="phi3",
-                   help="ollama model tag for --arc-templater ollama (default: phi3)")
+    p.add_argument("--arc-templater-model", default="gemma4",
+                   help="ollama model tag for --arc-templater ollama (default: "
+                        "gemma4 -- measured 100%% faithful vs phi3's 46%% on a "
+                        "24-option bake-off; see arc_templater.py --compare)")
     p.add_argument("--limit", type=int, default=None,
                    help="cap examples per task (omit for the full task; "
                         "use e.g. 200 for a fast dry-run)")

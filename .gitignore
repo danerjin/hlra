@@ -14,6 +14,25 @@ wiki_cache/
 # runs/ keeps its metrics.json + *.png plots tracked; only the .pt is ignored.
 *.pt
 
+# Conference submission material (BayLearn abstract, poster, slides) -- kept
+# on disk, out of the repo. The generators (poster.py, tile.py, poster_figs.py,
+# build_deck.py) stay tracked; their output does not.
+baylearn_abstract.tex
+baylearn_abstract.pdf
+neurips_2023.sty
+HLRA_Poster.*
+HLRA_Poster_PrintTiles.*
+HLRA_Poster_reference.png
+Hierarchical_Latent_Reasoning_Architecture.pptx
+poster_figs/
+poster_data/
+
+# LaTeX build cruft
+*.aux
+*.log
+*.out
+*.synctex.gz
+
 # OS / editor cruft
 .DS_Store
 

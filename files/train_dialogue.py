@@ -49,6 +49,7 @@ os.environ.setdefault("HF_HOME", os.path.join(PROJECT, ".hf_cache"))
 
 import argparse
 import dataclasses
+from contextlib import nullcontext
 
 import torch
 from torch.utils.data import DataLoader
@@ -270,6 +271,10 @@ def main():
     ap.add_argument("--preset", default="small", choices=list(MODEL_PRESETS),
                     help="only used to size a FRESH model when --ckpt is omitted")
     ap.add_argument("--device", default="auto")
+    ap.add_argument("--amp", action="store_true",
+                    help="mixed precision on CUDA/ROCm (the A-E driver's --amp; without it "
+                         "Stage F runs fp32 while the foundation trained bf16)")
+    ap.add_argument("--amp-dtype", default="bf16", choices=["bf16", "fp16"])
     ap.add_argument("--offline", action="store_true", help="stub chunker, no downloads (smoke)")
     ap.add_argument("--soft-tags", action="store_true",
                     help="enable soft learned role tags (§4.2); off = discrete tags")
@@ -482,6 +487,31 @@ def main():
     optimizer = torch.optim.AdamW(list(model.parameters()) + list(adapter.parameters()),
                                   lr=sf.lr, weight_decay=sf.weight_decay)
 
+    # Mixed precision, mirroring trainer.py's contract exactly (this driver is
+    # standalone and does not use trainer.Trainer, so it had NO autocast at all --
+    # Stage F ran fp32 while the A-E foundation it fine-tunes trained under bf16).
+    # CUDA (incl. ROCm, which presents as cuda) only: CPU gains nothing, and MPS
+    # autocast either raises (torch<=2.2) or re-exposes the §18.1 eval-mode-encoder
+    # dtype mix. A GradScaler is only needed for CUDA fp16.
+    # NB `device` is a STRING here ("cuda"/"cpu"/"mps"), not trainer.py's torch.device --
+    # so compare the string, and hand autocast the device TYPE explicitly.
+    dev_type = torch.device(device).type
+    use_amp = bool(args.amp) and dev_type == "cuda"
+    if bool(args.amp) and not use_amp:
+        print(f"[train_dialogue] --amp requested but device is {dev_type}; "
+              f"running full precision.", flush=True)
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
+    scaler = (torch.cuda.amp.GradScaler()
+              if use_amp and dev_type == "cuda" and amp_dtype == torch.float16
+              else None)
+    if use_amp:
+        print(f"[train_dialogue] AMP ON ({args.amp_dtype})"
+              + (" + GradScaler" if scaler is not None else ""), flush=True)
+
+    def _autocast():
+        return (torch.autocast(device_type=dev_type, dtype=amp_dtype)
+                if use_amp else nullcontext())
+
     # Resume a prior Stage-F run: restore the trained response seed, the EMA
     # target, and the optimizer moments (all written by save() but previously
     # never read back -- a resumed run silently re-zeroed the seed and restarted
@@ -578,40 +608,41 @@ def main():
                 context_chunks = context_mask = context_roles = context_personas = None
             optimizer.zero_grad(set_to_none=True)
 
-            # One shared online-encoder pass, reused by the anchor and the
-            # dialogue branch (the A-E trainer's single-encode convention).
-            chunk_vecs = model.encode_chunks(resp_chunks)
-            # Reconstruction anchor (encoder + Talker codec) on the assistant chunks.
-            nll = model.forward_grounded(resp_chunks, resp_mask, chunk_vecs=chunk_vecs)
-            dlg = model.forward_dialogue(resp_chunks, resp_mask, user_ids, user_mask,
-                                         ema, adapter.response_seed, flags,
-                                         context_chunks=context_chunks, context_mask=context_mask,
-                                         context_roles=context_roles, context_personas=context_personas,
-                                         var_weight=sf.var_weight, chunk_vecs=chunk_vecs,
-                                         end_head=(adapter.end_head if end_on else None),
-                                         end_grad=sf.end_grad)
-            loss = (sf.grounded_weight * nll
-                    + sf.cos_weight * dlg["cos"]
-                    + sf.gen_weight * dlg["gen"]
-                    + sf.var_weight * dlg["var"]
-                    + sf.ponder_weight * dlg["ponder"])
-            if end_on:
-                loss = loss + sf.end_weight * dlg["end"]
-                # A batch whose responses all fill max_chunks_per_doc has every
-                # positive masked away (only its final label says "end", and that
-                # is the ambiguous one). The BCE then trains "never end" on pure
-                # negatives while end/end_acc/end_n all look healthy. Count the
-                # dry batches and say so -- this failure is otherwise invisible.
-                end_dry = end_dry + 1 if int(dlg["end_pos"]) == 0 else 0
-                if end_dry == 50:
-                    print(f"[train_dialogue] WARNING: 50 consecutive batches with "
-                          f"end_pos=0 -- NO turn-end positives are surviving the "
-                          f"truncation mask, so the gate is learning 'never end' "
-                          f"regardless of what end/end_acc say. Your responses are "
-                          f"filling max_chunks_per_doc={cfg.max_chunks_per_doc}; "
-                          f"raise it, or use shorter-response data. (If end_n is also "
-                          f"0 the batch simply had no response chunks -- a data bug, "
-                          f"not a masking one.)", flush=True)
+            with _autocast():
+                # One shared online-encoder pass, reused by the anchor and the
+                # dialogue branch (the A-E trainer's single-encode convention).
+                chunk_vecs = model.encode_chunks(resp_chunks)
+                # Reconstruction anchor (encoder + Talker codec) on the assistant chunks.
+                nll = model.forward_grounded(resp_chunks, resp_mask, chunk_vecs=chunk_vecs)
+                dlg = model.forward_dialogue(resp_chunks, resp_mask, user_ids, user_mask,
+                                             ema, adapter.response_seed, flags,
+                                             context_chunks=context_chunks, context_mask=context_mask,
+                                             context_roles=context_roles, context_personas=context_personas,
+                                             var_weight=sf.var_weight, chunk_vecs=chunk_vecs,
+                                             end_head=(adapter.end_head if end_on else None),
+                                             end_grad=sf.end_grad)
+                loss = (sf.grounded_weight * nll
+                        + sf.cos_weight * dlg["cos"]
+                        + sf.gen_weight * dlg["gen"]
+                        + sf.var_weight * dlg["var"]
+                        + sf.ponder_weight * dlg["ponder"])
+                if end_on:
+                    loss = loss + sf.end_weight * dlg["end"]
+                    # A batch whose responses all fill max_chunks_per_doc has every
+                    # positive masked away (only its final label says "end", and that
+                    # is the ambiguous one). The BCE then trains "never end" on pure
+                    # negatives while end/end_acc/end_n all look healthy. Count the
+                    # dry batches and say so -- this failure is otherwise invisible.
+                    end_dry = end_dry + 1 if int(dlg["end_pos"]) == 0 else 0
+                    if end_dry == 50:
+                        print(f"[train_dialogue] WARNING: 50 consecutive batches with "
+                              f"end_pos=0 -- NO turn-end positives are surviving the "
+                              f"truncation mask, so the gate is learning 'never end' "
+                              f"regardless of what end/end_acc say. Your responses are "
+                              f"filling max_chunks_per_doc={cfg.max_chunks_per_doc}; "
+                              f"raise it, or use shorter-response data. (If end_n is also "
+                              f"0 the batch simply had no response chunks -- a data bug, "
+                              f"not a masking one.)", flush=True)
 
             syco_val = None
             if sf.syco_every and (step % sf.syco_every == 0):
@@ -620,10 +651,11 @@ def main():
                 except StopIteration:
                     con_iter = iter(con_loader); cb = next(con_iter)
                 pa, pam, pb, pbm, ac, am = (t.to(device) for t in cb)
-                syco = model.forward_anti_sycophancy(pa, pam, pb, pbm, ac, am, ema,
-                                                     adapter.response_seed, flags,
-                                                     agree_weight=sf.syco_agree_weight,
-                                                     freeze_escape=args.syco_freeze)
+                with _autocast():
+                    syco = model.forward_anti_sycophancy(pa, pam, pb, pbm, ac, am, ema,
+                                                         adapter.response_seed, flags,
+                                                         agree_weight=sf.syco_agree_weight,
+                                                         freeze_escape=args.syco_freeze)
                 loss = loss + sf.syco_weight * syco
                 syco_val = float(syco)
 
@@ -640,12 +672,20 @@ def main():
                 loss = loss + sf.trust_prior_weight * tp
                 tp_val = float(tp)
 
-            loss.backward()
+            (scaler.scale(loss).backward() if scaler is not None else loss.backward())
+            if scaler is not None:
+                # Unscale BEFORE clipping, or the clip threshold is applied to
+                # scaled grads and is meaningless (trainer.py:283).
+                scaler.unscale_(optimizer)
             total_norm = torch.nn.utils.clip_grad_norm_(
                 list(model.parameters()) + list(adapter.parameters()), sf.grad_clip)
             # Same non-finite guard as trainer.py: a single NaN grad makes the
             # global clip coefficient NaN and one step would destroy all weights.
-            if bool(torch.isfinite(total_norm)):
+            if scaler is not None:
+                # The fp16 scaler already skips the step on inf/nan grads.
+                scaler.step(optimizer); scaler.update()
+                nonfinite_streak = 0
+            elif bool(torch.isfinite(total_norm)):
                 optimizer.step()
                 nonfinite_streak = 0
             else:

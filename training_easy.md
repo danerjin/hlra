@@ -144,7 +144,8 @@ if [ "$RC" -ne 0 ]; then
 fi
 if [ "$RUN_STAGE_F" = "1" ]; then
   log "STATUS: A→E done — starting Stage-F fine-tune on $HF_CHAT (foundation READ-ONLY -> runs/dialogue)"
-  "$PY" train_dialogue.py --ckpt runs/scaled/model.pt --hf-chat "$HF_CHAT" --split "$SPLIT" \
+  "$PY" train_dialogue.py --ckpt runs/scaled/model.pt --amp --amp-dtype bf16 \
+    --hf-chat "$HF_CHAT" --split "$SPLIT" \
     --multi-turn --soft-tags --content-tags --trust-gate --vector-gate --trust-prior --persona --gestalt-readout --end-weight 0.5 \
     --steps "$STAGEF_STEPS" --batch-size "$STAGEF_BATCH" --out runs/dialogue
   log "STATUS: train_dialogue.py exited (rc=$?) -> runs/dialogue/model.pt"
@@ -224,7 +225,7 @@ BATCH=8
 test -f ~/hlra/"$FOUNDATION" || { echo "no foundation at $FOUNDATION — finish ② first"; exit 1; }
 
 # NOTE: do NOT pass --preset with --ckpt — the checkpoint's config wins.
-nohup python train_dialogue.py --ckpt "$FOUNDATION" \
+nohup python train_dialogue.py --ckpt "$FOUNDATION" --amp --amp-dtype bf16 \
   --hf-chat "$HF_CHAT" --split "$SPLIT" \
   --multi-turn --soft-tags --content-tags --trust-gate --vector-gate --trust-prior --persona --gestalt-readout --end-weight 0.5 \
   --steps "$STEPS" --batch-size "$BATCH" --out "$OUT" > dialogue.log 2>&1 &

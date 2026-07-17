@@ -188,6 +188,14 @@ python train_dialogue.py ... --end-weight 0.5 --end-grad    # the A/B (see limit
 python train_dialogue.py ... --end-weight 0.5 --no-act      # DIAGNOSTIC only: isolates
                                                             # the gate from ACT's depth
 ```
+**Mixed precision.** `--amp --amp-dtype bf16`, mirroring the A→E driver. This driver is
+standalone (it does not use `trainer.Trainer`), so it had **no autocast at all** — Stage F
+ran fp32 while the very foundation it fine-tunes was trained under bf16. Same contract as
+`trainer.py`: CUDA/ROCm only (CPU gains nothing; MPS autocast raises or re-exposes the
+§18.1 dtype mix, so `--amp` there warns and falls back), and a `GradScaler` only for CUDA
+fp16 — unscale before clipping, and the scaler's own inf/nan skip replaces the non-finite
+guard on that path.
+
 `save()` records both `end_gate_trained` and `stage_f_use_act`; `chat_core.new_dialogue_session(..., ckpt)`
 reads them, and both dialogue front-ends (`dialogue_chat.py`, `web_chat.py`) pass `ckpt`
 — so serving runs the loop the way training did instead of guessing. (`chat.py` has no

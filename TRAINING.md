@@ -201,7 +201,7 @@ The foundation (`runs/scaled/model.pt`) is loaded **read-only**; Stage-F writes 
 **separate** `--out runs/dialogue` — it never overwrites the A→E checkpoint.
 ```bash
 cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
-nohup python train_dialogue.py --ckpt runs/scaled/model.pt \
+nohup python train_dialogue.py --ckpt runs/scaled/model.pt --amp --amp-dtype bf16 \
   --hf-chat HuggingFaceH4/ultrachat_200k --split train_sft \
   --multi-turn --soft-tags --content-tags --trust-gate --vector-gate --trust-prior --persona --gestalt-readout --end-weight 0.5 \
   --batch-size 8 --steps 3000 --out runs/dialogue > dialogue.log 2>&1 &

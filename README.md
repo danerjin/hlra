@@ -52,6 +52,7 @@ loop to reason forward. See the design doc §2.3.
 | `baseline_gpt.py` | Standard GPT baseline for a matched-scale comparison. |
 | `rocm_smoke.py` / `bench_throughput.py` / `profile_transition.py` | GPU finiteness check, throughput/ETA sweep, L-gate profiler. |
 | `plot_metrics.py` / `plot_comparison.py` | Render training curves / the baseline comparison. |
+| `../poster_figs.py` | Poster-grade figures from a run's `metrics.json`, sized to the exact slots in `poster.py` (4.8×2.55 in, so font points are printed points). ARC-C data comes from `poster_data/arc_c.json`, which you fill in — no benchmark numbers are invented. |
 
 ## Running it
 
@@ -131,6 +132,13 @@ doc §1.1.
 - **`ssl_loss_weight`** (co-equal with reconstruction) is validated collapse-free but may want tuning
   at full scale.
 - **Stage F** (two-lane dialogue, anti-sycophancy loss) is designed but not yet exercised.
+- **Termination:** end-of-**chunk** is properly trained (PAD is a supervised stop, §19.2 —
+  measured: only ~0.9% of real-text chunks hit the length cap and so go unsupervised).
+  End-of-**turn** is a Stage-F head (`--end-weight`, **off by default**, unvalidated — see
+  `STAGE_F.md` §2.1). End-of-**document** does *not* exist: there is no EOS token and
+  `generate.py` emits a caller-supplied chunk count. Benign for A→E (the objective is
+  next-chunk prediction and docs truncate at `max_chunks_per_doc` anyway); it matters only
+  for free-running generation. See `experiments.md` #5.
 - The `--amp` path is implemented; sanity-check it on the first CUDA run (`rocm_smoke.py`,
   6 checks covering the training-mode and eval-mode/monitoring paths — it must end `PASS`).
 - A 2026-07-10 pre-flight review (gradient-routing audit, truncation severance, A→E walk,

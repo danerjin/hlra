@@ -215,6 +215,13 @@ def main():
     ap.add_argument("--trust-prior", action="store_true",
                     help="explicit provenance prior: a hinge driving trust(USER) below "
                          "trust(SELF), trained every step (review #2, option 3; needs --trust-gate)")
+    ap.add_argument("--end-weight", type=float, default=None,
+                    help="learned turn-end BCE weight (STAGE_F.md §2.1). 0 = off (default): the "
+                         "model CANNOT end its own turn and reply() emits a fixed chunk count. "
+                         "Use ~0.5 for a chatbot you intend to serve.")
+    ap.add_argument("--end-grad", action="store_true",
+                    help="let the turn-end BCE shape the thought instead of training only the "
+                         "head (default: detached, the supervised-halt-gate convention)")
     ap.add_argument("--content-tags", action="store_true",
                     help="content-condition the soft tags (implies --soft-tags)")
     ap.add_argument("--gestalt-readout", action="store_true",
@@ -252,6 +259,8 @@ def main():
     if args.steps is not None: sf.steps = args.steps
     if args.batch_size is not None: sf.batch_size = args.batch_size
     if args.lr is not None: sf.lr = args.lr
+    if args.end_weight is not None: sf.end_weight = args.end_weight
+    if args.end_grad: sf.end_grad = True
     set_seed(sf.seed)
 
     model, cfg, resume = load_base_model(args.ckpt, args.preset, device,
@@ -272,6 +281,22 @@ def main():
     # is correctly equipped and observable: require a gate, recommend the vector
     # gate. A warning, not an error, so the scalar-vs-vector A/B stays runnable.
     # See antisycophancy_trust_gate_note.md.
+    # Learned turn-end (§2.1). OFF (end_weight=0) reproduces Stage F exactly as it
+    # was; ON is what a served chatbot needs -- without it reply() emits a constant
+    # number of chunks. Warn loudly when it is off, because the failure is silent:
+    # the run trains fine and the checkpoint simply can never end a turn.
+    end_on = bool(sf.end_weight > 0)
+    if end_on:
+        print(f"[train_dialogue] turn-end gate ON (end_weight={sf.end_weight}, "
+              f"end_grad={sf.end_grad}): the reply learns to stop. Watch end_acc "
+              f"and end_n in the log -- end_n is how many turn-end labels the batch "
+              f"actually carried after truncation masking.", flush=True)
+    else:
+        print("[train_dialogue] NOTE: turn-end gate OFF (end_weight=0). The model "
+              "cannot end its own turn -- DialogueSession.reply will emit exactly "
+              "max_chunks chunks every time. Pass --end-weight 0.5 for a chatbot "
+              "you intend to serve. See STAGE_F.md §2.1.", flush=True)
+
     syco_on = bool(sf.syco_weight > 0 and sf.syco_every)
     if syco_on and not cfg.trust_gate:
         print(f"[train_dialogue] WARNING: anti-sycophancy loss is ON (syco_weight="
@@ -394,12 +419,16 @@ def main():
                                          ema, adapter.response_seed, flags,
                                          context_chunks=context_chunks, context_mask=context_mask,
                                          context_roles=context_roles, context_personas=context_personas,
-                                         var_weight=sf.var_weight, chunk_vecs=chunk_vecs)
+                                         var_weight=sf.var_weight, chunk_vecs=chunk_vecs,
+                                         end_head=(adapter.end_head if end_on else None),
+                                         end_grad=sf.end_grad)
             loss = (sf.grounded_weight * nll
                     + sf.cos_weight * dlg["cos"]
                     + sf.gen_weight * dlg["gen"]
                     + sf.var_weight * dlg["var"]
                     + sf.ponder_weight * dlg["ponder"])
+            if end_on:
+                loss = loss + sf.end_weight * dlg["end"]
 
             syco_val = None
             if sf.syco_every and (step % sf.syco_every == 0):
@@ -452,7 +481,12 @@ def main():
                        f"gen={float(dlg['gen']):.4f} var={float(dlg['var']):.4f} "
                        f"ponder={float(dlg['ponder']):.4f}"
                        + (f" syco={syco_val:.4f}" if syco_val is not None else "")
-                       + (f" tprior={tp_val:.4f}" if tp_val is not None else ""))
+                       + (f" tprior={tp_val:.4f}" if tp_val is not None else "")
+                       # end_acc is imbalanced (~1 'end' per turn): a head that
+                       # always says "continue" scores ~1-1/M. Read it WITH the
+                       # BCE, and with end_n (labels surviving truncation masking).
+                       + (f" end={float(dlg['end']):.4f} end_acc={float(dlg['end_acc']):.3f}"
+                          f" end_n={int(dlg['end_n'])}" if end_on else ""))
                 # Watch trust(USER) fall relative to trust(SELF) as anti-sycophancy trains.
                 reader = model.hrm_loop.memory_reader
                 trust = reader.trust_by_role(len(cfg.role_tags), device)

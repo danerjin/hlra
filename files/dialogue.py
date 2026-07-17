@@ -38,6 +38,14 @@ from model import USER, SELF, SYSTEM, RETRIEVED
 from data import PAD
 
 
+# An untrained end head must never fire: sigmoid(-4) ~= 0.018, so with a
+# zero-init weight the head is a constant P(end) ~= 1.8% and a 6-chunk reply stops
+# early ~10% of the time -- i.e. it degrades to today's fixed-length behavior
+# rather than truncating replies at random. Same rationale as response_seed's
+# zero-init: an untrained adapter degrades gracefully.
+_END_BIAS_INIT = -4.0
+
+
 class DialogueAdapter(nn.Module):
     """
     Stage-F-only learned parameters, held apart from the base model.
@@ -47,11 +55,21 @@ class DialogueAdapter(nn.Module):
     start vector); at zero the loop still conditions on the user turn via the
     input lane, so an untrained adapter degrades gracefully rather than
     catastrophically. Trained jointly with the base model in Stage F.
+
+    `end_head` (d_latent -> 1): the learned TURN-end gate (STAGE_F.md §2.1).
+    P(the turn ends at this thought), read off the thought h_t formed after
+    ingesting response chunk t. This is what lets a reply stop on its own; PAD
+    (§19.2) only ends a CHUNK. Lives HERE, not in the base model, for the same
+    reason response_seed does: the A-E `state_dict` stays byte-identical, so an
+    A-E checkpoint loads strict into Stage F and an A-E run is untouched.
     """
 
     def __init__(self, d_latent: int):
         super().__init__()
         self.response_seed = nn.Parameter(torch.zeros(d_latent))
+        self.end_head = nn.Linear(d_latent, 1)
+        nn.init.zeros_(self.end_head.weight)
+        nn.init.constant_(self.end_head.bias, _END_BIAS_INIT)
 
 
 def _encode_user_turn(chunker, cfg, text: str, device) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -135,7 +153,16 @@ class DialogueSession:
     @torch.no_grad()
     def reply(self, user_text: str, max_chunks: int = 6,
               temperature: float = 0.9, greedy: bool = False,
-              separator: str = " ") -> str:
+              separator: str = " ", end_threshold: float = 0.5,
+              use_end_head: bool = True) -> str:
+        """Generate one assistant turn.
+
+        `max_chunks` is a HARD CAP, not the reply length: with a trained end head
+        (StageFConfig.end_weight > 0) the reply stops when P(end) > `end_threshold`.
+        With an untrained head the gate is a constant P ~= 0.018 (see
+        _END_BIAS_INIT) so it effectively never fires and this degrades to the
+        old fixed-length behavior. `use_end_head=False` restores that exactly.
+        """
         model, cfg = self.model, self.cfg
         model.eval()
         # 1. Current user turn -> input lane ONLY (raw tokens, read-only).
@@ -161,6 +188,8 @@ class DialogueSession:
             ids = _decode_chunk(model, pred, cfg, temperature, greedy,
                                 ground_memory=self.source_memory)
             if not ids:
+                # Unreachable while _decode_chunk bans PAD at position 0 (it
+                # always returns >=1 id); kept as a guard if that ever changes.
                 break
             out_chunks.append(_decode_ids(self.chunker.tokenizer, ids))
             gen = torch.zeros(1, cfg.max_chunk_len, dtype=torch.long, device=self.device)
@@ -177,6 +206,15 @@ class DialogueSession:
             # gestalt_readout / persona_tags sees a homogeneous bank at serve time.
             self.memory.write(self.model._gestalt(h.detach()), SELF,
                               0 if self.cfg.persona_tags else None)
+
+            # Turn-end gate: `h` is the thought after ingesting the chunk just
+            # emitted -- the SAME tensor forward_dialogue supervises the head on,
+            # so train and serve agree by construction. This is the only thing
+            # that makes `max_chunks` a cap rather than the reply's length.
+            if use_end_head and getattr(self.adapter, "end_head", None) is not None:
+                p_end = torch.sigmoid(self.adapter.end_head(h)).item()
+                if p_end > end_threshold:
+                    break
 
         # 4. Age the finished user turn into a USER-tagged gestalt (a compressed
         #    summary) so later turns can recall it -- cross-turn memory (§4.2).

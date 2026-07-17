@@ -81,12 +81,19 @@ def new_dialogue_session(model, adapter, chunker, cfg):
     return DialogueSession(model, adapter, chunker, cfg, use_act=True)
 
 
-def dialogue_reply(session, text, n_chunks=6, temperature=0.9, greedy=False):
+def dialogue_reply(session, text, n_chunks=6, temperature=0.9, greedy=False,
+                   use_end_head=True, end_threshold=0.5):
     """One chatbot turn through the persistent session (memory carries across
-    calls). Returns (reply_chunks: list[str], read_chunks: list[str])."""
+    calls). Returns (reply_chunks: list[str], read_chunks: list[str]).
+
+    `n_chunks` is a CAP: a checkpoint trained with StageFConfig.end_weight > 0
+    ends its own turn when P(end) > `end_threshold` (STAGE_F.md §2.1). An
+    untrained end head effectively never fires, so this degrades to exactly
+    n_chunks chunks -- the old behavior."""
     read = input_chunks(session.chunker, text)
     joined = session.reply(text, max_chunks=n_chunks, temperature=temperature,
-                           greedy=greedy, separator=_SENT)
+                           greedy=greedy, separator=_SENT,
+                           use_end_head=use_end_head, end_threshold=end_threshold)
     reply = [c for c in joined.split(_SENT) if c]
     return reply, read
 

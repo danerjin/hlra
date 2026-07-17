@@ -112,6 +112,63 @@ def supervised_halt_loss(halt_logits: torch.Tensor, cos_dist: torch.Tensor,
     return (bce * m).sum() / m.sum().clamp_min(1.0)
 
 
+def turn_end_loss(end_logits: torch.Tensor, end_target: torch.Tensor,
+                  supervise_mask: torch.Tensor):
+    """
+    Stage-F learned turn-end (STAGE_F.md §2.1). The token-level end-of-chunk stop
+    (`model._talker_target_mask`'s supervised PAD, §19.2) lets the Talker end a
+    CHUNK; nothing lets the model end a TURN. Without this the reply length is a
+    caller-supplied constant (`DialogueSession.reply(max_chunks=...)`), so replies
+    run on or get cut mid-thought regardless of whether the answer finished.
+
+    This is a per-thought BCE: after the loop has ingested response chunk t and
+    formed the thought h_t, predict "the turn ends here" -- i.e. there is no
+    chunk t+1.
+
+      end_logits    (N,): the end head's pre-sigmoid output for N supervised
+                          thoughts. Read off a DETACHED h_t by default (the
+                          `supervised_halt_loss` convention), so the BCE trains
+                          only the head and never reshapes the reasoning; pass
+                          `end_grad=True` in forward_dialogue to let it through.
+      end_target    (N,): 1.0 where the turn ends at this thought, else 0.0.
+      supervise_mask (N,): bool, True where the label is TRUSTWORTHY.
+
+    WHY supervise_mask IS NOT JUST "is this chunk real":
+    the label is free -- it is `resp_mask` -- but it is NOT unconditionally
+    correct. `chunker.chunk_batch` caps a response at `max_chunks_per_doc`, so a
+    response that FILLS all M slots is indistinguishable from one that was
+    truncated at M. Its final chunk's "the turn ends here" label is therefore
+    unknown, not True. Training on it naively teaches "every turn ends after
+    exactly M chunks". The caller masks exactly those final positions out; every
+    non-final position ("a chunk follows" = 0) is correct either way and is kept.
+
+    Returns (loss, n_supervised). Loss is the mask-mean BCE, 0.0 when nothing is
+    supervised (an all-truncated batch) -- with n_supervised so a caller can log
+    how much signal a batch actually carried.
+    """
+    m = supervise_mask.float()
+    n = m.sum()
+    bce = F.binary_cross_entropy_with_logits(end_logits, end_target, reduction="none")
+    return (bce * m).sum() / n.clamp_min(1.0), n
+
+
+@torch.no_grad()
+def turn_end_accuracy(end_logits: torch.Tensor, end_target: torch.Tensor,
+                      supervise_mask: torch.Tensor) -> torch.Tensor:
+    """Fraction of SUPERVISED thoughts whose P(end) > 0.5 matches the label.
+
+    Exists because of the anti-sycophancy lesson (`antisycophancy_trust_gate_note.md`
+    #1): an auxiliary head can be wired correctly, receive gradient, and still not
+    learn the intended behavior. This turns "is the end head working?" from a hope
+    into a logged number. Note the label is heavily imbalanced (one 'end' per
+    turn), so a head that always predicts "continue" scores ~1-1/M -- read this
+    next to the BCE, not alone.
+    """
+    m = supervise_mask.float()
+    correct = ((end_logits > 0).float() == end_target).float()
+    return (correct * m).sum() / m.sum().clamp_min(1.0)
+
+
 def anti_sycophancy_loss(pred_a: torch.Tensor, pred_b: torch.Tensor, target: torch.Tensor,
                          k: float = 4.0, agree_weight: float = 1.0) -> torch.Tensor:
     """

@@ -190,12 +190,13 @@ def stage_f_flags(cfg: ModelConfig, use_act: bool = True) -> StageFlags:
     (curriculum.py's Stage-F flags, reconstructed here since this driver does not
     use the A-E Curriculum).
 
-    `use_act=False` (--no-act) exists because of the turn-end gate: ACT's halt vote
-    is a batch MEAN, so a row's loop depth depends on its batchmates and a B=1 serve
-    can take a different depth than training did -- the gate is then supervised on an
-    h_t the server never computes. With ACT off, train and serve agree to ~4e-06.
-    Until per-row halting lands (experiments.md #2) this is the only way to make the
-    documented mitigation actually available."""
+    `use_act=False` (--no-act) is a DIAGNOSTIC, not a recommendation: ACT on is what
+    curriculum.py's Stage F specifies and what D/E consolidated with, so a real run
+    keeps it. It exists to isolate the turn-end gate from ACT's variable depth in an
+    A/B -- ACT's halt vote is a batch mean, so training (B>1) lets batchmates decide a
+    row's depth while a B=1 serve halts per-row. That skew is inert while the halting
+    head stays undiscriminating (measured: P(halt) in [0.554, 0.674], all above 0.5);
+    if it ever bites, the fix is per-row halting (experiments.md #2), not this."""
     return StageFlags(
         use_hrm_loop=True, detach_memory=False,
         inner_loop_grad_window=cfg.inner_loop_grad_window_end,
@@ -227,10 +228,10 @@ def main():
                          "model CANNOT end its own turn and reply() emits a fixed chunk count. "
                          "Use ~0.5 for a chatbot you intend to serve.")
     ap.add_argument("--no-act", action="store_true",
-                    help="turn ACT OFF for the fine-tune. ACT's halt vote is a batch mean, so a "
-                         "row's loop depth depends on its batchmates and a B=1 serve can differ "
-                         "from training -- which the turn-end gate depends on. Recommended "
-                         "alongside --end-weight until per-row halting lands.")
+                    help="DIAGNOSTIC: run Stage F at fixed depth. ACT ON is the curriculum's "
+                         "Stage-F setting (D/E consolidated with it) and is the default -- do "
+                         "not use this for a real run. It exists to isolate the turn-end gate "
+                         "from ACT's variable depth in an A/B.")
     ap.add_argument("--end-grad", action="store_true",
                     help="let the turn-end BCE shape the thought instead of training only the "
                          "head (default: detached, the supervised-halt-gate convention)")
@@ -306,19 +307,23 @@ def main():
               f"positives masked away: end_pos=0 means the gate is NOT training, "
               f"however good end/end_acc look.", flush=True)
         if flags.use_act:
-            # hrm_loop.py's ACT halt vote is a BATCH MEAN, so a row's loop depth is
-            # decided by its batchmates. Training runs B=batch_size; reply() runs
-            # B=1. The gate is then supervised on an h_t the server never computes,
-            # and the measured skew straddles the 0.5 decision threshold. Not
-            # introduced here (per-row halting is experiments.md #2), but the gate
-            # is the first thing that depends on train/serve h_t agreement.
-            print("[train_dialogue] WARNING: turn-end gate is ON with ACT ON. The "
-                  "ACT halt vote is a batch MEAN, so a row's loop depth depends on "
-                  "its batchmates; at serve time reply() runs B=1 and can take a "
-                  "different depth, making its h_t a different tensor from the one "
-                  "the gate was trained on. Until per-row halting lands "
-                  "(experiments.md #2), prefer ACT off for a Stage-F run whose "
-                  "reply must stop reliably.", flush=True)
+            # ACT ON is CORRECT here -- it is curriculum.py's Stage-F setting and D/E
+            # consolidated with it. Note (not warn) the interaction: hrm_loop's halt
+            # vote is a BATCH MEAN, so in training a row's depth is decided by its
+            # batchmates while a B=1 serve halts per-row. That could skew the h_t the
+            # gate is supervised on -- but only if the halting head DISCRIMINATES
+            # between rows, and measured it does not (P(halt) in [0.554, 0.674] on a
+            # trained checkpoint, all above 0.5 => batch-mean == per-row). The real
+            # fix if that ever changes is per-row halting (experiments.md #2), not
+            # turning adaptive depth off.
+            print("[train_dialogue] note: gate ON with ACT ON (the curriculum's "
+                  "Stage-F setting). ACT's halt vote is a batch mean, so if the "
+                  "halting head ever discriminates between rows, training depth (B="
+                  f"{sf.batch_size}) and serve depth (B=1) can diverge and the gate "
+                  "would be trained on an h_t the server never computes. Measured, "
+                  "the head does not discriminate, so this is inert -- watch it, "
+                  "don't pre-emptively disable ACT. --no-act is a diagnostic.",
+                  flush=True)
     else:
         print("[train_dialogue] NOTE: turn-end gate OFF (end_weight=0). The model "
               "cannot end its own turn -- DialogueSession.reply will emit exactly "

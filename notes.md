@@ -707,10 +707,19 @@ re-validate anti-collapse at width before turning any on.
     *per chunk*, so an untrained gate stops ~10% of 6-chunk replies — and `reply()`
     defaulted `use_end_head=True` without consulting `end_weight`. Now off unless the
     checkpoint's new `end_gate_trained` flag says otherwise.
-  - **ACT's halt vote is a batch mean**, so train (B=batch) and serve (B=1) take different
-    loop depths: measured end-logit gap 1.36, straddling the 0.5 threshold at the final
-    chunk. Pre-existing (per-row halting is `experiments.md` #2) but the gate is the first
-    thing to depend on train/serve `h_t` agreement — `train_dialogue` now warns.
+  - **ACT's halt vote is a batch mean**, so train (B=batch) and serve (B=1) *could* take
+    different loop depths — the audit forced a 1.36 end-logit gap straddling the threshold.
+    **But that used a synthetic discriminative halting head, which training does not
+    produce:** measured on the trained checkpoint, P(halt) over 64 varied thoughts spans
+    [0.554, 0.674] (mean 0.619, std 0.031) — entirely above 0.5, so every row votes halt and
+    batch-mean == per-row. Inert today, courtesy of the documented ACT degeneracy. **ACT
+    stays ON in Stage F** (curriculum.py's Stage-F setting; D/E consolidated with it;
+    adaptive depth is a central claim). A first draft recommended `--no-act` — an
+    over-correction from a worst-case hypothetical, withdrawn; it is a diagnostic only. The
+    real asymmetry: at serve B=1 the "batch mean" IS that row's own vote, so **serving
+    already halts per-row — it is TRAINING that lets batchmates decide a row's depth**. If
+    the head ever discriminates at scale, the fix is per-row halting (`experiments.md` #2),
+    not disabling adaptive depth.
   - Pre-gate Stage-F checkpoints could not resume *or serve* (strict load; optimizer group
     138→140) — both sites now load non-strictly with a clear note.
   - `StageFConfig.end_threshold` was dead config (serving never sees StageFConfig) —

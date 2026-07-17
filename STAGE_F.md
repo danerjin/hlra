@@ -78,18 +78,29 @@ after the loop ingests chunk *t*, in both paths, and the alternative (predicting
 the thought that *generated* chunk *t*) would answer a different question the
 generation loop cannot ask.
 
-**But "the same tensor" is only true with ACT OFF, and that is a real caveat.**
-`hrm_loop`'s ACT halt vote is a **batch mean**, so a row's loop depth is decided by
-its batchmates. Training runs `B = batch_size`; `reply()` runs `B = 1`. With ACT on
-(the Stage-F default) the gate is therefore supervised on an `h_t` the server does
-not reproduce — measured on a discriminative halting head, row 0's end logit moved
-1.36 between B=8 and B=1, and the two sides landed on **opposite sides of the 0.5
-threshold** (P(end) 0.574 training vs 0.258 serving) at exactly the final chunk, the
-only "end"-labelled thought. With ACT off the two agree to ~4e-06. This is not
-introduced by the gate — per-row halting is `experiments.md` #2 — but the gate is the
-first thing that depends on train/serve `h_t` agreement, so `train_dialogue.py` warns
-when both are on and **`--no-act` exists to actually act on that advice** (ACT was
-hardcoded on in `stage_f_flags` before, which made the recommendation unfollowable).
+**Caveat: ACT can make "the same tensor" untrue — but measurement says it currently
+does not.** `hrm_loop`'s ACT halt vote is a **batch mean**, so a row's loop depth is
+decided by its batchmates. Training runs `B = batch_size`; `reply()` runs `B = 1`. In
+principle the gate is then supervised on an `h_t` the server never computes: forced
+with a *synthetic discriminative* halting head, row 0's end logit moves 1.36 between
+B=8 and B=1, landing on opposite sides of the 0.5 threshold.
+
+**But training does not produce such a head.** On the trained checkpoint, P(halt) over
+64 varied thoughts spans **[0.554, 0.674]** — mean 0.619, std 0.031, the whole range
+above 0.5. Every row votes halt, so the batch mean and a per-row vote agree, and the
+skew is ~zero in practice. That is the documented ACT degeneracy ("halting degenerates
+toward minimum depth") doing the gate a favour. Note also that at serve `B = 1` makes
+the "batch mean" the row's *own* vote — **serving already halts per-row; it is
+TRAINING that lets batchmates decide a row's depth.**
+
+**So ACT stays ON in Stage F** — `curriculum.py`'s Stage F is `use_act=True`, Stages
+D and E consolidated with it, and adaptive depth is one of the architecture's central
+claims. Turning it off would run F in a regime the model was never consolidated in.
+The default is ACT on. `--no-act` exists only as a **diagnostic** for isolating the
+gate from ACT in an A/B, not as a recommendation. The real fix, if the halting head
+ever *does* become discriminative at scale, is per-row halting (`experiments.md` #2) —
+not deleting adaptive depth. `train_dialogue.py` notes the interaction so it stays
+watched.
 
 **The label is free, and was being discarded.** It is already in the SFT batch:
 `resp_mask[:, t+1]` says whether a chunk *t+1* exists. So there is **no data-format
@@ -156,11 +167,11 @@ exactly the pre-gate fixed-length behavior. This is deliberate: an untrained hea
 would truncate replies from any A→E or `end_weight=0` checkpoint.
 
 ```bash
-# --no-act is recommended WITH the gate: ACT's batch-mean halt vote makes the
-# server's B=1 h_t differ from the one the gate was trained on (see above).
-python train_dialogue.py --ckpt runs/scaled/model.pt --multi-turn \
-    --end-weight 0.5 --no-act
-python train_dialogue.py ... --end-weight 0.5 --no-act --end-grad   # the A/B (see limits)
+# ACT stays ON (the curriculum's Stage-F setting; D/E consolidated with it).
+python train_dialogue.py --ckpt runs/scaled/model.pt --multi-turn --end-weight 0.5
+python train_dialogue.py ... --end-weight 0.5 --end-grad    # the A/B (see limits)
+python train_dialogue.py ... --end-weight 0.5 --no-act      # DIAGNOSTIC only: isolates
+                                                            # the gate from ACT's depth
 ```
 `save()` records both `end_gate_trained` and `stage_f_use_act`, and
 `chat_core.new_dialogue_session(..., ckpt)` reads them, so serving runs the loop the

@@ -109,12 +109,14 @@ def main(argv=None) -> int:
                         "encoding), the model-native ranking score for "
                         "multiple-choice acc (not for perplexity).")
     p.add_argument("--arc-templater", default="deterministic",
-                   choices=("deterministic", "ollama"),
+                   choices=("deterministic", "regex", "ollama"),
                    help="backend for the opt-in `arc_challenge_statement` task, "
                         "which rewrites each option into a full sentence. "
-                        "deterministic (default) = rule-based, no LLM. "
-                        "ollama = temp-0 LLM rewrite, cached to disk. Only used "
-                        "when arc_challenge_statement is among --tasks.")
+                        "deterministic (default) = crude '<q> The answer is <opt>'. "
+                        "regex = rule-based declarativization of common stems, no "
+                        "LLM, faithful by construction. ollama = temp-0 LLM "
+                        "rewrite, cached+guarded. Only used when "
+                        "arc_challenge_statement is among --tasks.")
     p.add_argument("--arc-templater-model", default="gemma4",
                    help="ollama model tag for --arc-templater ollama (default: "
                         "gemma4 -- measured 100%% faithful vs phi3's 46%% on a "

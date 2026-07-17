@@ -60,7 +60,7 @@ headline number.) Re-run the bake-off any time with
 
 Config is read from the environment (set by `run_lm_eval.py --arc-templater ...`,
 or exported by hand):
-  ARC_TEMPLATER_BACKEND  deterministic (default) | ollama
+  ARC_TEMPLATER_BACKEND  deterministic (default) | regex | ollama
   ARC_TEMPLATER_MODEL    ollama model tag (default: gemma4; phi3 rejects ~half)
   ARC_TEMPLATER_CACHE    cache json path (default: poster_data/arc_statements_cache.json)
   ARC_TEMPLATER_LIMIT    if set, only rewrite+keep the first N docs (keeps
@@ -76,6 +76,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 
 _HERE = os.path.dirname(os.path.abspath(__file__))            # files/tasks
 PROJECT = os.path.dirname(os.path.dirname(_HERE))             # repo root
@@ -124,10 +125,57 @@ def deterministic(question: str, option: str) -> str:
     """Rule-based baseline: no LLM, fully reproducible, deliberately crude. Not a
     grammatical rewrite -- it just presents the option as a stated answer in one
     span. The point of the deterministic backend is to be the honest, dependency-
-    free floor the LLM rewrite is compared against."""
+    free floor the LLM rewrite (and the regex backend) fall back to."""
     q = question.strip()
     opt = _lower_lead(option).rstrip(".")
     return f"{q} The answer is {opt}."
+
+
+def _cap(s: str) -> str:
+    s = s.strip()
+    return (s[0].upper() + s[1:]) if s else s
+
+
+# No-LLM declarativization for the common ARC stem forms. Each rule turns the
+# QUESTION into a statement frame and slots the VERBATIM option in, so it is
+# faithful by construction (only the option's leading case is lowered for flow;
+# is_faithful is case-insensitive). Anything unmatched falls back to
+# deterministic(). This is the "just do it with regex" path -- nicer sentences
+# than deterministic for the forms it covers, still no model, fully reproducible.
+_REGEX_RULES = [
+    # "[context.] What/Which is|are|was|were (the) X?"  ->
+    #   "[context.] The X is|are {option}."   Any leading context sentence(s) are
+    #   kept verbatim as a prefix; only the trailing interrogative clause is
+    #   declarativized. Group 1 = optional context ending in .!?; 2 = verb; 3 = predicate.
+    #   "An astronomer observes ... impact. Which is the most likely effect ...?"
+    #     -> "An astronomer observes ... impact. The most likely effect ... is {option}."
+    #   "What is the smallest unit of copper?" -> "The smallest unit of copper is {option}."
+    (re.compile(r"^(.*?[.!?]\s+)?(?:what|which)\s+(is|are|was|were)\s+(.+?)\s*\?$", re.I),
+     lambda m, opt: "%s%s %s %s." % (m.group(1) or "", _cap(m.group(3)),
+                                     m.group(2).lower(), _lower_lead(opt).rstrip("."))),
+    # "What/Which does|do|will|would|can X ...?"  ->  "X ...: {option}." is too
+    #   varied to declarativize cleanly, so those fall through to deterministic.
+]
+
+
+def regex_statement(question: str, option: str) -> str:
+    """Rule-based declarativizer: convert common ARC question forms into a
+    statement with the verbatim option slotted in; fall back to deterministic()
+    for stems no rule matches. No LLM, reproducible, faithful by construction.
+
+    Coverage is intentionally narrow: only "[context.] What/Which is/are X?"
+    forms, where the answer is the predicate ("The X is {option}."). Measured
+    ~16% of ARC-C options match a rule (the rest fall back to the crude
+    template); 100% stay faithful. It is NOT broadened to "Which of these is a
+    Y?" forms, where the answer is the SUBJECT ("{option} is a Y.") -- a regex
+    cannot tell the two apart, and mislabelling the roles yields backwards
+    sentences. For full coverage use the ollama backend with a capable model."""
+    q = question.strip()
+    for rx, fn in _REGEX_RULES:
+        m = rx.match(q)
+        if m:
+            return fn(m, option)
+    return deterministic(question, option)
 
 
 _STOP = {"a", "an", "the", "of", "to", "in", "on", "is", "are", "was", "were",
@@ -140,7 +188,6 @@ def _content_tokens(text: str) -> set:
     non-alphanumerics, drop stopwords and 1-2 char tokens. 'cell-cycle' -> {cell,
     cycle}; 'non-infectious' -> {non, infectious} (so 'infectious' alone does not
     spuriously match the negated form)."""
-    import re
     toks = re.split(r"[^a-z0-9]+", text.lower())
     return {t for t in toks if len(t) >= 3 and t not in _STOP}
 
@@ -164,11 +211,10 @@ def is_faithful(option: str, rewrite: str, min_overlap: float = 0.5) -> bool:
 # necessarily accurate") that the word-level faithfulness check lets through
 # because the option's words are still present. That commentary is asymmetric
 # signal (it editorializes about THIS option), so reject it.
-import re as _re
-_JUDGE_RE = _re.compile(
+_JUDGE_RE = re.compile(
     r"\b(correct|incorrect|accurate|inaccurate|not necessarily|is true|is false|"
     r"is wrong|the right answer|best answer|however|therefore|in conclusion)\b",
-    _re.IGNORECASE)
+    re.IGNORECASE)
 
 
 def editorializes(rewrite: str) -> bool:
@@ -268,6 +314,8 @@ def statement(question: str, option: str, *, backend: str, model: str,
             s = deterministic(question, option)
             print("[arc_templater] ollama failed (%s); deterministic fallback for: %r"
                   % (type(e).__name__, option))
+    elif backend == "regex":
+        s = regex_statement(question, option)
     else:
         s = deterministic(question, option)
     cache[k] = s
@@ -403,6 +451,22 @@ def _self_test() -> int:
         ok = False
     if deterministic(q, "the atom") != d1:
         print("[self-test] FAIL: deterministic template is not reproducible")
+        ok = False
+
+    # 1b. regex backend: declarativizes a matched stem, keeps the option verbatim,
+    #     and falls back to deterministic on an unmatched stem.
+    r_hit = regex_statement("Which is the most likely effect of the impact?",
+                            "Planetary days will become shorter.")
+    print("[self-test] regex (matched):\n   %r" % r_hit)
+    if r_hit != "The most likely effect of the impact is planetary days will become shorter.":
+        print("[self-test] FAIL: regex did not declarativize the matched stem as expected")
+        ok = False
+    if not is_faithful("Planetary days will become shorter.", r_hit):
+        print("[self-test] FAIL: regex output dropped the option's content")
+        ok = False
+    r_miss = regex_statement("How do plants make food?", "by photosynthesis")
+    if r_miss != deterministic("How do plants make food?", "by photosynthesis"):
+        print("[self-test] FAIL: regex did not fall back to deterministic on an unmatched stem")
         ok = False
 
     # 2. cache round-trip + a monkeypatched 'LLM' backend that we can assert is

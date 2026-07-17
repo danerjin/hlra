@@ -160,10 +160,13 @@ HF Hub on first run.
 
 **Opt-in ARC "statement" variant** (`--tasks arc_challenge_statement`) rewrites each answer option
 into a full declarative sentence — a longer, more differentiated span than ARC-C's short phrases —
-via `files/tasks/arc_templater.py`. `--arc-templater deterministic` (default) is a reproducible
-rule-based template; `--arc-templater ollama` (with `--arc-templater-model`, default `gemma4`) is a
-temp-0 LLM rewrite, cached to disk and gated by three guards — content-drift, editorializing, and
-length — any of which falls back to the verbatim-safe template. It is a **distinct, clearly-labelled**
+via `files/tasks/arc_templater.py`, with three backends: `--arc-templater deterministic` (default) is a
+crude reproducible template (`"<q> The answer is <opt>"`); `regex` declarativizes the common
+"What/Which is/are …?" stems into a real sentence with the verbatim option slotted in (no LLM, faithful
+by construction, but only ~16% of ARC-C stems match a rule — the rest fall back to the crude template);
+`ollama` (with `--arc-templater-model`, default `gemma4`) is a temp-0 LLM rewrite, cached to disk and
+gated by three guards — content-drift, editorializing, and length — any of which falls back to the
+verbatim-safe template. It is a **distinct, clearly-labelled**
 task, never a substitute for standard `arc_challenge` — report it as "ARC-C (statement-rewritten by
 &lt;model&gt;)". **Model choice dominates:** on a 24-option bake-off, `gemma4` produced faithful,
 on-template rewrites 100% of the time while `phi3` passed only 46% (paraphrase drift, rambling, one

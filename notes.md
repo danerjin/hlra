@@ -771,6 +771,27 @@ re-validate anti-collapse at width before turning any on.
   zero-init, live under `--persona`, which is in TRAINING.md's recommended command.
   Found independently by two auditors.
 
+- **Stage F could not run on real data at all (2026-07-16, found by driving the
+  DOCUMENTED commands end-to-end; both FIXED).** Three prior audit rounds missed both
+  because the preflight only runs `train_dialogue.py --offline` with **no `--ckpt`** —
+  it exercises neither the checkpoint handoff nor the HF loader.
+  - **The A→E→F handoff crashed on every completed run.** `train_dialogue` used
+    `stage_reached == "F"` to mean "my own Stage-F checkpoint" — but `F` is ALSO the
+    A→E curriculum's terminal stage (`curriculum.Stage.F`), and `trainer.py` saves
+    `curriculum.stage.name`. So a finished A→E `model.pt` is stamped `"F"`, was misread
+    as a resume, and loaded the A→E optimizer (model params only) into the Stage-F
+    optimizer (model + adapter) → `ValueError: param group ... doesn't match`. The
+    guard's own comment stated the invariant it broke. Now keys on `adapter_state`,
+    which only `save()` writes. `runs/model.pt` (stage_reached='F', no adapter) was the
+    counterexample sitting in the repo the whole time. `dialogue_chat.py` had the same
+    confusion (an A→E foundation passed its "is a chatbot" check).
+  - **`TRANSFORMERS_OFFLINE=1` at import made the real corpus unreachable.**
+    `huggingface_hub` honours it as a legacy alias for `HF_HUB_OFFLINE` and `datasets`
+    inherits it, so every `--hf-chat` run died "Offline mode is enabled" — the data this
+    driver exists to train on, unreachable by construction. Copied from
+    `generate.py`/`train_real.py`, which only load the LOCAL `gpt2_tok` and so were
+    unaffected; `data_prep.py` omits it deliberately and says why. Removed.
+
 ## Eval-tooling dry-run (2026-07-16)
 
 Exercised the whole post-run eval path CPU-only against `runs/model.pt`, before the A→E

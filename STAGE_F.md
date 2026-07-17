@@ -171,6 +171,16 @@ exactly the pre-gate fixed-length behavior. This is deliberate: an untrained hea
 *not* inert (P = 0.018 **per chunk** → 8.7% of 6-chunk replies stop early), so defaulting it on
 would truncate replies from any A→E or `end_weight=0` checkpoint.
 
+> ⚠️ **`stage_reached` does NOT identify a Stage-F checkpoint.** `F` is also the A→E
+> curriculum's *terminal* stage name, and `trainer.py` saves `curriculum.stage.name` —
+> so every **completed** A→E run's `model.pt` is stamped `stage_reached="F"` too
+> (`runs/model.pt` is the counterexample sitting in this repo). Only `save()` here
+> writes `adapter_state`, so **its presence is the discriminator**. Keying on the stage
+> name made the documented A→E→F handoff load the A→E optimizer (model params only)
+> into this driver's optimizer (model + adapter) and die with a param-group size
+> mismatch — on every finished run. Fixed 2026-07-16; `dialogue_chat.py` had the same
+> confusion.
+
 ```bash
 # ACT stays ON (the curriculum's Stage-F setting; D/E consolidated with it).
 python train_dialogue.py --ckpt runs/scaled/model.pt --multi-turn --end-weight 0.5

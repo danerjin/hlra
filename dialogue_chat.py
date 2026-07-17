@@ -55,9 +55,13 @@ def main():
     have_adapter = "adapter_state" in ckpt
     print(f"[dialogue] ready. stage={info['stage_reached']} d_latent={cfg.d_latent} "
           f"roles={n_roles} adapter={'loaded' if have_adapter else 'ZERO-INIT (untrained)'}")
-    if info["stage_reached"] != "F":
-        print("[dialogue] NOTE: stage_reached is not 'F' -- the dialogue path will run "
-              "but is untrained; expect noise.")
+    # Key on the ADAPTER, not stage_reached. "F" is also the A-E curriculum's terminal
+    # stage name, so a completed A-E foundation is stamped "F" too and would have
+    # passed this "it's a chatbot" check silently while its dialogue path is untrained.
+    if not have_adapter:
+        print("[dialogue] NOTE: no adapter_state in this checkpoint -- it is an A-E "
+              "foundation, not a Stage-F chatbot (a completed A-E run is ALSO stamped "
+              "stage_reached='F'). The dialogue path runs but is untrained; expect noise.")
     print("[dialogue] commands: <text> | :source <t> | :reset | :temp f | :n k | :greedy | :q\n")
 
     # Pass `ckpt`: it carries end_gate_trained / stage_f_use_act, so the session

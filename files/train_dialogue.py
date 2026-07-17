@@ -35,8 +35,17 @@ from __future__ import annotations
 
 import os
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Keep the HF cache in-project. NOTE: we deliberately do NOT force
+# TRANSFORMERS_OFFLINE/HF_HUB_OFFLINE here -- this driver's whole point is to train on
+# a real dialogue corpus (--hf-chat), which must be fetched from the hub. huggingface_hub
+# honours TRANSFORMERS_OFFLINE as a legacy alias for HF_HUB_OFFLINE, and datasets
+# inherits it, so setting it made every --hf-chat run die with "Offline mode is enabled"
+# -- the real data was unreachable by construction. (Copied in from generate.py /
+# train_real.py, which only ever load the LOCAL gpt2_tok and so were unaffected.)
+# data_prep.py, the project's other download-needing script, omits it for this reason.
+# --offline and the gpt2 tokenizer stay offline regardless: the stub chunker touches no
+# hub, and gpt2_tok is a local dir.
 os.environ.setdefault("HF_HOME", os.path.join(PROJECT, ".hf_cache"))
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 import argparse
 import dataclasses
@@ -163,13 +172,23 @@ def load_base_model(ckpt_path, preset, device, soft_tags=False, trust_gate=False
                   f"unused by this model and DROPPED (reparameterized/removed modules "
                   f"{sorted({k.split('.')[0] for k in unexpected})}; e.g. --soft-tags "
                   f"discards the trained discrete role_embed).")
-        # Resume payload: only a Stage-F checkpoint (written by save() below,
-        # stage_reached=='F') carries an adapter/EMA/optimizer state that is
-        # COMPATIBLE with this driver's optimizer (base + adapter param groups).
-        # An A-E checkpoint's optimizer is over model params only, so we must NOT
-        # load it -- starting a fine-tune re-seeds EMA/optimizer fresh by design.
+        # Resume payload: only a Stage-F checkpoint (written by save() below) carries
+        # an adapter/EMA/optimizer state COMPATIBLE with this driver's optimizer (base
+        # + adapter param groups). An A-E checkpoint's optimizer is over model params
+        # only, so we must NOT load it -- a fine-tune re-seeds EMA/optimizer fresh.
+        #
+        # Key on `adapter_state`, NOT on stage_reached=='F'. "F" is ALSO the A-E
+        # curriculum's TERMINAL stage name (curriculum.Stage.F), and trainer.py saves
+        # `curriculum.stage.name` -- so every COMPLETED A-E run's model.pt is stamped
+        # "F" as well. Keying on it made the documented A-E -> F handoff misread the
+        # foundation checkpoint as a resume and die loading the A-E optimizer into this
+        # one ("param group that doesn't match the size of optimizer's group") -- the
+        # exact failure the paragraph above says must not happen. It also silently
+        # loaded the A-E EMA first. Only save() writes adapter_state, so its presence
+        # is the real discriminator; `runs/model.pt` in this repo is the counterexample
+        # (stage_reached='F', adapter_state absent).
         resume = None
-        if ckpt.get("stage_reached") == "F":
+        if ckpt.get("adapter_state") is not None:
             resume = {"adapter_state": ckpt.get("adapter_state"),
                       "ema": ckpt.get("ema"),
                       "optimizer": ckpt.get("optimizer"),

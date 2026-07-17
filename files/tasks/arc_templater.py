@@ -79,11 +79,28 @@ _HERE = os.path.dirname(os.path.abspath(__file__))            # files/tasks
 PROJECT = os.path.dirname(os.path.dirname(_HERE))             # repo root
 _DEFAULT_CACHE = os.path.join(PROJECT, "poster_data", "arc_statements_cache.json")
 
+# Deliberately CONSTRAINED: phi3 (and small models generally) paraphrase too
+# freely -- they swap synonyms ("gravity" -> "gravitational", "stronger" ->
+# "intensify") and even negate ("infectious" -> "non-infectious"), which drifts
+# the answer's meaning and trips the faithfulness guard so the rewrite is thrown
+# away. The fix is to forbid rephrasing: reuse the EXACT words of the question and
+# option, only REORDER them and add minimal glue. That preserves every content
+# token verbatim, so the guard passes and we get a real full sentence instead of
+# a fallback. The one-shot example anchors the "reorder, don't reword" behavior.
 _OLLAMA_PROMPT = (
-    "Rewrite the question and the given answer option as a single, natural "
-    "declarative sentence that states the option as the answer to the question. "
-    "Do NOT say whether the option is correct or incorrect. Do not add facts. "
-    "Output ONLY the sentence.\n\n"
+    "Combine the question and the answer option into ONE declarative sentence.\n"
+    "STRICT RULES:\n"
+    "1. Reuse the EXACT words from the Question and the Option. Do NOT replace any "
+    "word with a synonym. Do NOT add, remove, negate, or change any information.\n"
+    "2. You may ONLY reorder the existing words and insert small connective words "
+    "if needed (is, are, was, the, a, an, that, of, to, will).\n"
+    "3. Every word of the Option must appear, unchanged, in your sentence.\n"
+    "4. Do NOT state whether the option is correct.\n"
+    "5. Output ONLY the sentence, nothing else.\n\n"
+    "Example:\n"
+    "Question: What is the smallest unit of copper that maintains its properties?\n"
+    "Option: the atom\n"
+    "Sentence: The atom is the smallest unit of copper that maintains its properties.\n\n"
     "Question: {q}\nOption: {o}\nSentence:"
 )
 

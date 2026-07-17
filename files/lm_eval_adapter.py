@@ -102,6 +102,22 @@ from model import LatentThoughtModel, SELF
 from gestalt_memory import GestaltMemoryBank
 from data import build_offline_chunker, PAD
 
+# `import generate` sets TRANSFORMERS_OFFLINE=1 at import (belt-and-suspenders for
+# its local-only chat/CLI paths, which load only the local gpt2_tok). But THIS
+# module's whole reason to exist is to drive lm-eval-harness tasks
+# (LAMBADA/HellaSwag/ARC), which must fetch their datasets from the HF Hub --
+# and huggingface_hub honours TRANSFORMERS_OFFLINE as a legacy alias for
+# HF_HUB_OFFLINE, so datasets.load_dataset dies "Offline mode is enabled" for
+# every task. (Exact twin of the Stage-F offline bug in notes.md, latent here
+# only because the harness had never been driven end-to-end.) Undo the leak
+# NOW, before lm_eval / huggingface_hub / datasets are imported below and cache
+# the flag at their own import time. `import generate` pulls in none of those
+# libraries (verified), so clearing the env here is sufficient and in time.
+# A user wanting fully-offline eval must pre-cache the datasets and set
+# HF_HUB_OFFLINE themselves after this import.
+for _offline_var in ("TRANSFORMERS_OFFLINE", "HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE"):
+    os.environ.pop(_offline_var, None)
+
 PROJECT = os.path.dirname(_HERE)
 DEFAULT_CKPT = os.path.join(PROJECT, "runs", "model.pt")
 

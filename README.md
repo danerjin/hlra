@@ -118,6 +118,35 @@ needs more capacity than a token." Widening the thought moves the anti-collapse 
 wider space, so `cosine_loss_k` / the variance floor should be re-tuned at `d_latent`. See the design
 doc §1.1.
 
+## Evaluating a trained checkpoint
+
+`files/lm_eval_adapter.py` exposes the model to EleutherAI's
+[lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness) as a `TemplateLM`,
+and `files/run_lm_eval.py` is the one-command runner:
+
+```bash
+pip install "lm_eval==0.4.4"
+python files/run_lm_eval.py --ckpt runs/scaled/model.pt                 # default tasks
+python files/run_lm_eval.py --ckpt runs/scaled/model.pt \
+    --tasks lambada_openai,hellaswag --limit 200 --output results/lm_eval.json
+```
+
+**Scoring is at chunk granularity, not token.** The model has no native token-level conditional
+log-probability, so the adapter *cannot* use the reconstruction path — that leaks the answer into
+its own conditioning (see the `lm_eval_adapter.py` module docstring). It scores a continuation the
+way the model *generates*: read the context through the HRM loop, then for each continuation chunk
+score the true tokens under the latent that `pred_head` forecasts off the running thought (the
+tokens being scored never enter the latent they are scored under). The dependency-free core,
+`_score_continuation`, is unit-testable with `lm_eval` absent: `python files/lm_eval_adapter.py`
+runs a self-test (no checkpoint, no downloads).
+
+**Task choice is load-bearing.** Cloze / sentence-completion tasks map cleanly onto chunk scoring,
+so the default is `lambada_openai,hellaswag`. Multiple-choice tasks whose options differ by a
+single token — **ARC-Challenge** is the documented worst case — degenerate to a one-chunk
+`pred_head`→Talker decode and, at `small` scale, sit near chance; ARC-C is available
+(`--tasks arc_challenge`) but is not the honest headline number. Scoring runs on **CPU** (the shared
+inference path is CPU-only); datasets are fetched from the HF Hub on first run.
+
 ## Status and honest limits
 
 - **Verified at smoke and `small` (512-d) scale**, on offline synthetic and real gpt2 text: full A→E

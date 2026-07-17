@@ -197,11 +197,25 @@ Confirms the path runs and the losses aren't `nan` (a **fresh** `small-w3` model
 real fine-tune below loads the trained one via `--ckpt`).
 
 ### 6.2 Real fine-tune off the small-w3 checkpoint (background)
+> ⚠️ **Do not launch until A→E has EXITED.** `train_scaled.py` writes `model.pt` only
+> *after* `trainer.train()` returns — while A→E is running, `runs/scaled/` holds only
+> `checkpoint.pt`. Launching early either dies in 2s on the `--ckpt` guard (harmless) or,
+> if a **stale** `model.pt` from an earlier run is lying there, silently fine-tunes the
+> WRONG foundation *and* puts two jobs in the same ~68 GB GTT pool — which can OOM the
+> A→E run you are waiting on. Check both:
+> ```bash
+> grep -c "\[train_scaled\] done" train.log     # 1 = A→E finished
+> ls -l runs/scaled/model.pt                       # exists, mtime AFTER that line
+> ```
+> `-u` is not optional either: without it the log is block-buffered and `[step N]` lines
+> appear only every ~500 steps — hours of silence indistinguishable from a hang, and a
+> SIGKILL loses the buffer entirely.
+
 The foundation (`runs/scaled/model.pt`) is loaded **read-only**; Stage-F writes to a
 **separate** `--out runs/dialogue` — it never overwrites the A→E checkpoint.
 ```bash
 cd ~/hlra/files && export LATENT_MANUAL_LAYERNORM=1 TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
-nohup python train_dialogue.py --ckpt runs/scaled/model.pt --amp --amp-dtype bf16 \
+nohup python -u train_dialogue.py --ckpt runs/scaled/model.pt --amp --amp-dtype bf16 \
   --hf-chat HuggingFaceH4/ultrachat_200k --split train_sft \
   --multi-turn --soft-tags --content-tags --trust-gate --vector-gate --trust-prior --persona --gestalt-readout --end-weight 0.5 \
   --batch-size 8 --steps 3000 --out runs/dialogue > dialogue.log 2>&1 &

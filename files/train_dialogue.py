@@ -440,6 +440,23 @@ def main():
         print("[train_dialogue] --syco-freeze ON: response seed + premise encoder "
               "detached for the contrastive term (loop transitions still carry "
               "grad; full gate isolation needs a loop change).", flush=True)
+    if args.trust_prior and cfg.soft_role_tags:
+        print("[train_dialogue] " + "!" * 60, flush=True)
+        print("[train_dialogue] WARNING: --trust-prior is a NUMERICAL NO-OP with soft role "
+              "tags. `role_logits` is zero-init ('uniform mix'), so every role's tag VECTOR "
+              "is identical -> trust[SELF]-trust[USER] is identically 0 and every gradient "
+              "path into it vanishes (d(gap)/dW is proportional to tag_SELF-tag_USER = 0; "
+              "d(gap)/d(role_logits) is proportional to trust_proj.weight, also zero-init). "
+              "MEASURED at init: max|grad| 4.6e-13 with soft tags vs 1.0e-03 without; a "
+              "120-step run leaves tprior pinned at margin (0.1000) and trust at "
+              "0.98/0.98/0.98 (std 0.000), while WITHOUT soft tags the same run reaches "
+              "tprior 0.0803 and USER:0.97/SELF:0.99.", flush=True)
+        print("[train_dialogue] NOTE --content-tags IMPLIES --soft-tags. Layer 3 -- the "
+              "load-bearing behavioral separation -- will get NO training this run. Drop "
+              "--soft-tags/--content-tags to make the prior live, or accept it and do not "
+              "claim Layer 3. `trust=USER:0.98/SELF:0.98 std=0.000` in the log is this "
+              "dead state, NOT 'the gate held'.", flush=True)
+        print("[train_dialogue] " + "!" * 60, flush=True)
     if args.trust_prior and not cfg.trust_gate:
         raise SystemExit("--trust-prior needs a trust gate to regularize; add --trust-gate "
                          "(and --vector-gate for the polarity-subspace form).")
@@ -583,6 +600,7 @@ def main():
     model.train()
     step, nonfinite_streak = start_step, 0
     end_dry = 0                      # consecutive batches with zero turn-end positives
+    last_syco = None                 # last anti-sycophancy value (see the log line)
     out_dir = os.path.join(PROJECT, args.out)
     print(f"[train_dialogue] device={device} d_latent={cfg.d_latent} steps={sf.steps} "
           f"batch={sf.batch_size} lr={sf.lr}  (offline={args.offline})")
@@ -658,6 +676,7 @@ def main():
                                                          freeze_escape=args.syco_freeze)
                 loss = loss + sf.syco_weight * syco
                 syco_val = float(syco)
+                last_syco = syco_val
 
             # Explicit provenance prior (review #2, option 3): a first-class hinge
             # driving trust(USER) below trust(SELF), trained EVERY step (cheap --
@@ -703,7 +722,12 @@ def main():
                 msg = (f"[step {step}] nll={float(nll):.4f} cos={float(dlg['cos']):.4f} "
                        f"gen={float(dlg['gen']):.4f} var={float(dlg['var']):.4f} "
                        f"ponder={float(dlg['ponder']):.4f}"
-                       + (f" syco={syco_val:.4f}" if syco_val is not None else "")
+                       # `syco_val` is None on non-syco steps, and the log cadence can
+                       # never coincide with the syco cadence (log at step%log_every==0,
+                       # syco at (step-1)%syco_every==0: with 50/4, 50k-1 mod 4 is 1 or 3,
+                       # never 0) -- so this field could NEVER print. Carry the last value
+                       # instead; a term you cannot observe is a term you cannot trust.
+                       + (f" syco={last_syco:.4f}" if last_syco is not None else "")
                        + (f" tprior={tp_val:.4f}" if tp_val is not None else "")
                        # end_acc is imbalanced (~1 'end' per turn): a head that
                        # always says "continue" scores ~1-1/M, so it is never read

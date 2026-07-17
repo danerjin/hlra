@@ -88,7 +88,8 @@ threshold** (P(end) 0.574 training vs 0.258 serving) at exactly the final chunk,
 only "end"-labelled thought. With ACT off the two agree to ~4e-06. This is not
 introduced by the gate — per-row halting is `experiments.md` #2 — but the gate is the
 first thing that depends on train/serve `h_t` agreement, so `train_dialogue.py` warns
-when both are on. Prefer ACT off for a Stage-F run whose reply must stop reliably.
+when both are on and **`--no-act` exists to actually act on that advice** (ACT was
+hardcoded on in `stage_f_flags` before, which made the recommendation unfollowable).
 
 **The label is free, and was being discarded.** It is already in the SFT batch:
 `resp_mask[:, t+1]` says whether a chunk *t+1* exists. So there is **no data-format
@@ -118,15 +119,33 @@ cap. And `max_chunks_per_doc = 1` masks *everything* — no shipped preset does 
 (12/32/48/64), but it fails silently to `end_pos = 0` rather than erroring.
 
 **Where it lives.** `end_head` is in `dialogue.DialogueAdapter`, next to
-`response_seed` and for the same reason: the A→E `state_dict` stays **byte-identical**,
-so an A→E checkpoint still loads strict. Verified: `forward_grounded` /
-`forward_self_supervised` are bit-for-bit unchanged (losses + every per-parameter
-grad norm, float64), and `end_weight=0` reproduces pre-change Stage F bit-for-bit.
+`response_seed` and for the same reason: the **base model's** `state_dict` is
+unchanged, so an A→E checkpoint still loads strict and the A→E run is untouched.
+Verified: `forward_grounded` / `forward_self_supervised` /
+`forward_self_supervised_halt` are bit-for-bit unchanged (losses + every
+per-parameter grad norm, float64, across every stage flag combo and 5 arch configs).
+
+Note the scope: this is the **base model's** state_dict. The **adapter's** grew by
+`end_head.*`, so a Stage-F checkpoint written *before* the gate no longer loads
+strict — `train_dialogue` and `chat_core` both load it non-strictly and say so.
+
+⚠️ **Adding a new head is not free, even switched off.** `nn.Linear.__init__` runs
+`reset_parameters()`, which **consumes global RNG draws**; zeroing the weights
+afterward fixes the values but does **not** rewind the stream. With `dropout=0.1`
+live, merely constructing `end_head` shifted every later dropout mask — 130/137 base
+tensors differed after 3 Stage-F steps at `end_weight=0`, i.e. "off" was not off.
+`end_head` is therefore built with `torch.nn.utils.skip_init` (no draw on any device,
+unlike CPU-only `get`/`set_rng_state`). **Do the same for the next head you add**, and
+note that a probe which reseeds before its training loop cannot see this class of bug.
 
 **Gradient routing.** `end_grad=False` (default) reads a **detached** `h_t`, so the
 BCE trains only the head and never reshapes the reasoning — the
-`forward_self_supervised_halt` convention. Verified: with it off the loop and encoder
-receive **exactly zero** gradient from this term; with `--end-grad` it reaches both.
+`forward_self_supervised_halt` convention. Verified: with it off, *every* base-model
+parameter receives **exactly zero** gradient from this term (the only tensors with a
+gradient are `end_head.weight`/`.bias`). With `--end-grad` the gradient does reach the
+loop and encoder — but **not at step 0**: `end_head.weight` is zero-init, so ∂/∂`h_t`
+is identically zero until the weight moves off zero (which the head's own gradient
+does immediately). Connectivity is real; step-0 magnitude is zero by construction.
 
 **Serving.** `max_chunks` becomes a *cap*, not the reply length — but **only for a
 checkpoint that actually trained the gate**. `train_dialogue.save` records
@@ -137,9 +156,15 @@ exactly the pre-gate fixed-length behavior. This is deliberate: an untrained hea
 would truncate replies from any A→E or `end_weight=0` checkpoint.
 
 ```bash
-python train_dialogue.py --ckpt runs/scaled/model.pt --multi-turn --end-weight 0.5
-python train_dialogue.py ... --end-weight 0.5 --end-grad      # the A/B (see limits)
+# --no-act is recommended WITH the gate: ACT's batch-mean halt vote makes the
+# server's B=1 h_t differ from the one the gate was trained on (see above).
+python train_dialogue.py --ckpt runs/scaled/model.pt --multi-turn \
+    --end-weight 0.5 --no-act
+python train_dialogue.py ... --end-weight 0.5 --no-act --end-grad   # the A/B (see limits)
 ```
+`save()` records both `end_gate_trained` and `stage_f_use_act`, and
+`chat_core.new_dialogue_session(..., ckpt)` reads them, so serving runs the loop the
+way training did instead of guessing.
 
 **Honest limits — read before trusting it.** Turning this on does *not* mean the gate
 works:

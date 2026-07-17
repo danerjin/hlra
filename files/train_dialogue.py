@@ -185,15 +185,22 @@ def load_base_model(ckpt_path, preset, device, soft_tags=False, trust_gate=False
     return LatentThoughtModel(cfg, chunker=None), cfg, None
 
 
-def stage_f_flags(cfg: ModelConfig) -> StageFlags:
+def stage_f_flags(cfg: ModelConfig, use_act: bool = True) -> StageFlags:
     """Stage F: input lanes on, memory un-detached, windows fully warmed, ACT on
     (curriculum.py's Stage-F flags, reconstructed here since this driver does not
-    use the A-E Curriculum)."""
+    use the A-E Curriculum).
+
+    `use_act=False` (--no-act) exists because of the turn-end gate: ACT's halt vote
+    is a batch MEAN, so a row's loop depth depends on its batchmates and a B=1 serve
+    can take a different depth than training did -- the gate is then supervised on an
+    h_t the server never computes. With ACT off, train and serve agree to ~4e-06.
+    Until per-row halting lands (experiments.md #2) this is the only way to make the
+    documented mitigation actually available."""
     return StageFlags(
         use_hrm_loop=True, detach_memory=False,
         inner_loop_grad_window=cfg.inner_loop_grad_window_end,
         memory_grad_window=cfg.memory_grad_window_end,
-        use_act=True, use_input_lanes=True)
+        use_act=use_act, use_input_lanes=True)
 
 
 def main():
@@ -219,6 +226,11 @@ def main():
                     help="learned turn-end BCE weight (STAGE_F.md §2.1). 0 = off (default): the "
                          "model CANNOT end its own turn and reply() emits a fixed chunk count. "
                          "Use ~0.5 for a chatbot you intend to serve.")
+    ap.add_argument("--no-act", action="store_true",
+                    help="turn ACT OFF for the fine-tune. ACT's halt vote is a batch mean, so a "
+                         "row's loop depth depends on its batchmates and a B=1 serve can differ "
+                         "from training -- which the turn-end gate depends on. Recommended "
+                         "alongside --end-weight until per-row halting lands.")
     ap.add_argument("--end-grad", action="store_true",
                     help="let the turn-end BCE shape the thought instead of training only the "
                          "head (default: detached, the supervised-halt-gate convention)")
@@ -270,7 +282,7 @@ def main():
     model = model.to(device)
     adapter = DialogueAdapter(cfg.d_latent).to(device)
     ema = EMATargetEncoder(model.chunk_encoder, momentum=cfg.ema_momentum).to(device)
-    flags = stage_f_flags(cfg)
+    flags = stage_f_flags(cfg, use_act=not args.no_act)
 
     # --- Anti-sycophancy measurement guard (Layer-3, 2026-07-14 review #2) ---
     # The contrastive loss is meant to drive trust(USER) down, but the review
@@ -561,16 +573,17 @@ def main():
                 (bar.write(msg) if bar is not None else print(msg, flush=True))
             if sf.checkpoint_every and step % sf.checkpoint_every == 0:
                 save(out_dir, "checkpoint.pt", model, adapter, ema, optimizer, cfg, step,
-                     end_gate_trained=end_on)
+                     end_gate_trained=end_on, use_act=flags.use_act)
 
     if bar is not None:
         bar.close()
     save(out_dir, "model.pt", model, adapter, ema, optimizer, cfg, step,
-         end_gate_trained=end_on)
+         end_gate_trained=end_on, use_act=flags.use_act)
     print(f"[train_dialogue] done. {step} steps -> {os.path.join(out_dir, 'model.pt')}")
 
 
-def save(out_dir, name, model, adapter, ema, optimizer, cfg, step, end_gate_trained=False):
+def save(out_dir, name, model, adapter, ema, optimizer, cfg, step, end_gate_trained=False,
+         use_act=True):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, name)
     tmp = path + ".tmp"
@@ -590,6 +603,9 @@ def save(out_dir, name, model, adapter, ema, optimizer, cfg, step, end_gate_trai
             # 6-chunk replies stop early). Serving reads this to decide whether the
             # gate may be used at all, instead of guessing from the weights.
             "end_gate_trained": bool(end_gate_trained),
+            # Serving must run the loop the way training did: DialogueSession
+            # defaults use_act=True, which would silently mismatch a --no-act run.
+            "stage_f_use_act": bool(use_act),
             "tokenizer_name": "gpt2", "chunker": "regex_gpt2",
         }, f)
         f.flush(); os.fsync(f.fileno())

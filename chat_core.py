@@ -90,14 +90,21 @@ def new_dialogue_session(model, adapter, chunker, cfg, ckpt=None):
     """A fresh DialogueSession (the full Stage-F two-lane serving: input lane +
     response seed + cross-turn gestalt memory). One session = one conversation.
 
-    Pass the `ckpt` dict from load_dialogue_checkpoint to enable the turn-end gate
-    when -- and only when -- that checkpoint actually trained it. The gate is off
-    otherwise: an untrained end_head fires at P=0.018 per CHUNK (~10% of 6-chunk
-    replies), so switching it on blindly would truncate replies at random."""
+    Pass the `ckpt` dict from load_dialogue_checkpoint so serving matches training:
+
+      * the turn-end gate is enabled only when that checkpoint actually TRAINED it
+        (`end_gate_trained`). Otherwise it stays off -- an untrained end_head fires
+        at P=0.018 per CHUNK (~10% of 6-chunk replies), so switching it on blindly
+        would truncate replies at random.
+      * ACT is run the way training ran it (`stage_f_use_act`). Serving with ACT on
+        a --no-act checkpoint (or vice versa) changes the loop depth, hence h_t,
+        hence what the gate sees. Defaults True for checkpoints written before this
+        was recorded -- which is what they all trained with."""
     from dialogue import DialogueSession
-    trained = bool((ckpt or {}).get("end_gate_trained", False))
-    return DialogueSession(model, adapter, chunker, cfg, use_act=True,
-                           use_end_head=trained)
+    ck = ckpt or {}
+    return DialogueSession(model, adapter, chunker, cfg,
+                           use_act=bool(ck.get("stage_f_use_act", True)),
+                           use_end_head=bool(ck.get("end_gate_trained", False)))
 
 
 def dialogue_reply(session, text, n_chunks=6, temperature=0.9, greedy=False,

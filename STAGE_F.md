@@ -85,13 +85,18 @@ principle the gate is then supervised on an `h_t` the server never computes: for
 with a *synthetic discriminative* halting head, row 0's end logit moves 1.36 between
 B=8 and B=1, landing on opposite sides of the 0.5 threshold.
 
-**But training does not produce such a head.** On the trained checkpoint, P(halt) over
-64 varied thoughts spans **[0.554, 0.674]** — mean 0.619, std 0.031, the whole range
-above 0.5. Every row votes halt, so the batch mean and a per-row vote agree, and the
-skew is ~zero in practice. That is the documented ACT degeneracy ("halting degenerates
-toward minimum depth") doing the gate a favour. Note also that at serve `B = 1` makes
-the "batch mean" the row's *own* vote — **serving already halts per-row; it is
-TRAINING that lets batchmates decide a row's depth.**
+**But the halting head measured here does not discriminate.** On `runs/model.pt` — a
+*toy smoke* checkpoint, so treat this as indicative, not settled — P(halt) over 64
+varied thoughts spans **[0.554, 0.674]** (mean 0.619, std 0.031), the whole range above
+0.5. An independent probe hooking the halting head inside the live ACT loop on real
+text agrees: P(halt) ∈ **[0.523, 0.994]**, 100% above 0.5. Because `hrm_loop` thresholds
+the batch mean at 0.5, a range entirely above 0.5 means every row votes halt and the
+batch mean and a per-row vote reach the *same decision* — so the skew is ~zero here.
+That is the documented ACT degeneracy ("halting degenerates toward minimum depth")
+doing the gate a favour. **At scale, unknown** — both measurements are smoke-scale.
+Note also that at serve `B = 1` makes the "batch mean" the row's *own* vote —
+**serving already halts per-row; it is TRAINING that lets batchmates decide a row's
+depth.**
 
 **So ACT stays ON in Stage F** — `curriculum.py`'s Stage F is `use_act=True`, Stages
 D and E consolidated with it, and adaptive depth is one of the architecture's central
@@ -163,7 +168,7 @@ checkpoint that actually trained the gate**. `train_dialogue.save` records
 `end_gate_trained`; `chat_core.new_dialogue_session(..., ckpt)` reads it and switches
 the gate on only then. `DialogueSession(use_end_head=False)` is the default, which is
 exactly the pre-gate fixed-length behavior. This is deliberate: an untrained head is
-*not* inert (P = 0.018 **per chunk** ≈ 10% of 6-chunk replies), so defaulting it on
+*not* inert (P = 0.018 **per chunk** → 8.7% of 6-chunk replies stop early), so defaulting it on
 would truncate replies from any A→E or `end_weight=0` checkpoint.
 
 ```bash
@@ -173,9 +178,14 @@ python train_dialogue.py ... --end-weight 0.5 --end-grad    # the A/B (see limit
 python train_dialogue.py ... --end-weight 0.5 --no-act      # DIAGNOSTIC only: isolates
                                                             # the gate from ACT's depth
 ```
-`save()` records both `end_gate_trained` and `stage_f_use_act`, and
-`chat_core.new_dialogue_session(..., ckpt)` reads them, so serving runs the loop the
-way training did instead of guessing.
+`save()` records both `end_gate_trained` and `stage_f_use_act`; `chat_core.new_dialogue_session(..., ckpt)`
+reads them (and `chat.py` / `dialogue_chat.py` / `web_chat.py` pass `ckpt`), so serving
+runs the loop the way training did instead of guessing. Resuming with different
+`--end-weight`/`--no-act` flags warns, mirroring `trainer.py`'s schedule/halt guards.
+
+```bash
+.venv/bin/python files/dialogue.py    # self-test: RNG trap, labels, end_pos, NULL control
+```
 
 **Honest limits — read before trusting it.** Turning this on does *not* mean the gate
 works:
@@ -186,11 +196,13 @@ works:
   because a constant head cannot beat `H(p)`. That inference is **invalid** and the
   claim is withdrawn. With ~14 supervised points in a 192-d latent the head can
   separate *any* labeling: a null run of the identical head on **pure noise features
-  with random labels** reaches BCE 0.008 and beats the base-rate entropy in **20/20
-  seeds**. Beating `H(p)` here is what a signal-free head does. Worse, 0.455 is far
-  *above* the null's 0.008 — the measurement shows an **underfit** head, and says
-  nothing about signal in either direction. A real answer needs a **held-out split**,
-  which has not been run.
+  with random labels** also beats the base-rate entropy, in **20/20 seeds**, at every
+  optimization budget that trains at all. Beating `H(p)` here is simply what a
+  signal-free head does. The null's exact BCE is a function of budget, not a fixed
+  reference (≈1.14 at 20 steps, ≈0.47 at 700, ≈0.07 at 2000) — and **budget-matched to
+  the real run it lands on ≈0.47, i.e. right on top of the 0.455 being reported**. So
+  the measurement is indistinguishable from noise, and says nothing about signal in
+  either direction. A real answer needs a **held-out split**, which has not been run.
 - **The detached head may not be able to learn this at all.** `end_grad=False` lets it
   read only what `cos`/`gen` already put in `h_t`, and nothing forces them to encode "I
   am done" — the same shape as the halt gate degenerating to a constant P(halt) ≈ 0.95.
@@ -199,8 +211,8 @@ works:
   scores ≈ 1 − 1/M (0.714 on the smoke batch). Never read alone. And see the `end_pos`
   warning above: at `end_pos = 0`, `end`/`end_acc` look *perfect* and mean nothing.
 - **An untrained gate is NOT inert at serve time.** sigmoid(−4.0) = 0.018 is a
-  *per-chunk* rate, so ~10% of 6-chunk replies (≈20% of 12-chunk) would stop early at
-  random. Serving therefore keeps the gate **off** unless the checkpoint's
+  *per-chunk* rate, and a 6-chunk reply has 5 chances to stop early — 8.7% of them
+  would (18.1% for 12 chunks), at random. Serving therefore keeps the gate **off** unless the checkpoint's
   `end_gate_trained` flag says it was really trained (`DialogueSession(use_end_head=)`,
   set by `chat_core.new_dialogue_session`). Off = exactly the pre-gate behavior.
 
@@ -301,8 +313,9 @@ MMLU-style continuations are the degenerate worst case; LAMBADA/cloze map best.
 
 - **Unvalidated** — smoke-only on synthetic data; no real dialogue run.
 - **The turn-end gate is OFF by default** (`end_weight=0`) and, when on, is
-  unvalidated on real dialogue — the detached head learns only weakly at smoke scale
-  and may need `--end-grad`. See §2.1's honest limits. With it off the model **cannot
+  unvalidated: there is **no evidence it extracts signal at all** (§2.1 — the earlier
+  "learns only weakly" reading was withdrawn as an invalid inference). `--end-grad` is
+  the first thing to try. See §2.1's honest limits. With it off the model **cannot
   end its own turn** at all; `train_dialogue.py` says so on every run.
 - **Behavioral separation (Layer 3) is not yet trained.** The 2026-07-14 review found the
   anti-sycophancy loss routes correctly but does not actually move the trust gate — SGD

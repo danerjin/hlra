@@ -134,8 +134,11 @@ doc §1.1.
 - **Stage F** (two-lane dialogue, anti-sycophancy loss) is designed but not yet exercised.
 - **Termination:** end-of-**chunk** is properly trained (PAD is a supervised stop, §19.2).
   A chunk that exactly fills `max_chunk_len` has no PAD slot and so goes unsupervised, but
-  that is rare: **0.42%** (123 of 29,568 chunks over 1401 real documents at
-  `max_chunk_len=64`; mean chunk length 19.9). End-of-**turn** is a Stage-F head
+  that is rare: **≳0.42%** (123 of 29,568 chunks over 1401 real documents at
+  `max_chunk_len=64`; mean chunk length 19.9). Read that as a **lower bound**: the cache
+  measured predates the 2026-07-11 chunker (17.2% of its chunks are ≤3 tokens), and v3
+  glues those fragments into fewer, larger chunks — which both shrinks the denominator
+  and pushes more chunks to the cap. End-of-**turn** is a Stage-F head
   (`--end-weight`, **off by default**; the plumbing runs but there is *no evidence yet* it
   learns — see `STAGE_F.md` §2.1). End-of-**document** does *not* exist: there is no EOS
   token and `generate.py` emits a caller-supplied chunk count. Benign for A→E (the

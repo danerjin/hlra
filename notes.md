@@ -704,7 +704,8 @@ re-validate anti-collapse at width before turning any on.
     `positives=0`, BCE→0.000, `end_acc`→1.000 — a head that learned "never end" with a
     perfect scorecard. Added `end_pos` + a 50-dry-batch warning.
   - **A serving regression I introduced and then understated:** sigmoid(−4) = 0.018 is
-    *per chunk*, so an untrained gate stops ~10% of 6-chunk replies — and `reply()`
+    *per chunk*, so an untrained gate stops 8.7% of 6-chunk replies (5 chances to stop
+    early, not 6) — and `reply()`
     defaulted `use_end_head=True` without consulting `end_weight`. Now off unless the
     checkpoint's new `end_gate_trained` flag says otherwise.
   - **ACT's halt vote is a batch mean**, so train (B=batch) and serve (B=1) *could* take

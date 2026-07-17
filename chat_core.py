@@ -68,18 +68,24 @@ def load_dialogue_checkpoint(ckpt_path):
     from dialogue import DialogueAdapter
     model, chunker, cfg, ckpt = load_checkpoint(ckpt_path)
     adapter = DialogueAdapter(cfg.d_latent)
-    if "adapter_state" in ckpt:
+    if ckpt.get("adapter_state") is not None:
         # Non-strict: a Stage-F checkpoint written before the turn-end gate has no
         # `end_head.*` and would otherwise raise "Missing key(s)" here and refuse to
         # serve at all. Missing end_head just means an untrained gate, which never
         # fires (bias -4.0) -- i.e. the old fixed-length behavior. Anything else
         # missing IS a real mismatch and must not pass silently.
         missing, unexpected = adapter.load_state_dict(ckpt["adapter_state"], strict=False)
-        other = [k for k in missing if not k.startswith("end_head")]
+        # ALL of end_head.* missing == a genuine pre-gate checkpoint; a PARTIAL miss is
+        # corruption and must not be waved through. Exact names, not a prefix.
+        end_keys = {"end_head.weight", "end_head.bias"}
+        miss_end = end_keys & set(missing)
+        pre_gate = miss_end == end_keys
+        other = [k for k in missing if k not in end_keys] + (
+            sorted(miss_end) if miss_end and not pre_gate else [])
         if other or unexpected:
             raise RuntimeError(f"adapter state mismatch: missing={other} "
                                f"unexpected={list(unexpected)}")
-        if any(k.startswith("end_head") for k in missing):
+        if pre_gate:
             print("[chat_core] NOTE: checkpoint predates the turn-end gate; replies "
                   "will run to max_chunks.")
     adapter.eval()
@@ -94,7 +100,7 @@ def new_dialogue_session(model, adapter, chunker, cfg, ckpt=None):
 
       * the turn-end gate is enabled only when that checkpoint actually TRAINED it
         (`end_gate_trained`). Otherwise it stays off -- an untrained end_head fires
-        at P=0.018 per CHUNK (~10% of 6-chunk replies), so switching it on blindly
+        at P=0.018 per CHUNK (8.7% of 6-chunk replies), so switching it on blindly
         would truncate replies at random.
       * ACT is run the way training ran it (`stage_f_use_act`). Serving with ACT on
         a --no-act checkpoint (or vice versa) changes the loop depth, hence h_t,
@@ -115,8 +121,8 @@ def dialogue_reply(session, text, n_chunks=6, temperature=0.9, greedy=False,
     `n_chunks` is a CAP. `use_end_head=None` inherits the session's setting, which
     new_dialogue_session turns on only for a checkpoint whose `end_gate_trained`
     flag is set; otherwise the reply runs to n_chunks exactly as before the gate
-    existed. Forcing it True on an untrained gate stops ~10% of 6-chunk replies at
-    random (P=0.018 per chunk) -- don't."""
+    existed. Forcing it True on an untrained gate stops 8.7% of 6-chunk replies at
+    random (P=0.018 per chunk x 5 chances to stop early) -- don't."""
     read = input_chunks(session.chunker, text)
     joined = session.reply(text, max_chunks=n_chunks, temperature=temperature,
                            greedy=greedy, separator=_SENT,

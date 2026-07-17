@@ -28,6 +28,7 @@ The training objective that makes a checkpoint usable here lives in
 """
 from __future__ import annotations
 
+import math
 from typing import List, Optional, Tuple
 
 import torch
@@ -38,11 +39,16 @@ from model import USER, SELF, SYSTEM, RETRIEVED
 from data import PAD
 
 
-# An untrained end head must never fire: sigmoid(-4) ~= 0.018, so with a
-# zero-init weight the head is a constant P(end) ~= 1.8% and a 6-chunk reply stops
-# early ~10% of the time -- i.e. it degrades to today's fixed-length behavior
-# rather than truncating replies at random. Same rationale as response_seed's
-# zero-init: an untrained adapter degrades gracefully.
+# Opening bias for the turn-end head: sigmoid(-4) ~= 0.018, so a zero-init weight
+# makes an untrained head a constant P(end) ~= 1.8% PER CHUNK.
+#
+# That is NOT inert, and an earlier version of this comment claimed it was ("it
+# degrades to today's fixed-length behavior rather than truncating replies at
+# random") -- self-refuting, since a 6-chunk reply has 5 chances to stop early and
+# 1 - 0.982^5 = 8.7% of them would (18.1% for 12 chunks). Stopping 9% of replies at
+# random IS truncating at random. The bias only makes an untrained gate quiet, never
+# safe; what actually makes it safe is DialogueSession(use_end_head=False) by
+# default, driven by the checkpoint's `end_gate_trained` flag.
 _END_BIAS_INIT = -4.0
 
 
@@ -141,8 +147,8 @@ class DialogueSession:
 
     `use_end_head` defaults to **False**: the turn-end gate is used only when the
     caller knows it was trained. An UNTRAINED gate is not inert -- sigmoid(-4.0)
-    = 0.018 is a PER-CHUNK fire rate, i.e. ~10% of 6-chunk replies (and ~20% of
-    12-chunk ones) would stop early for no reason. Defaulting it on would silently
+    = 0.018 is a PER-CHUNK fire rate: a 6-chunk reply has 5 chances to stop early,
+    so 8.7% of them would (18.1% for 12 chunks) for no reason. Defaulting it on would silently
     truncate replies from any A-E or end_weight=0 checkpoint, a regression the
     gate is supposed to prevent, not cause. `chat_core.load_dialogue_checkpoint`
     reads `end_gate_trained` off the checkpoint and turns it on when it is real.
@@ -231,9 +237,12 @@ class DialogueSession:
                               0 if self.cfg.persona_tags else None)
 
             # Turn-end gate: `h` is the thought after ingesting the chunk just
-            # emitted -- the SAME tensor forward_dialogue supervises the head on,
-            # so train and serve agree by construction. This is the only thing
-            # that makes `max_chunks` a cap rather than the reply's length.
+            # emitted -- read at the SAME point in the loop, through the SAME head,
+            # that forward_dialogue supervises. NOT "identical by construction":
+            # with ACT on, the halt vote is a batch mean, so training (B>1) can take
+            # a different loop depth than this B=1 serve. Measured inert (the halting
+            # head does not discriminate) -- see STAGE_F.md 2.1. This is what makes
+            # `max_chunks` a cap rather than the reply's length.
             if use_end_head and getattr(self.adapter, "end_head", None) is not None:
                 p_end = torch.sigmoid(self.adapter.end_head(h)).item()
                 if p_end > end_threshold:
@@ -279,3 +288,76 @@ class DialogueSession:
 def _decode_ids(tok, ids) -> str:
     ids = [int(i) for i in ids if int(i) != PAD]
     return tok.decode(ids) if ids else ""
+
+
+# ======================================================================
+# Self-test for the turn-end gate. Runs offline, no checkpoint, no downloads:
+#   .venv/bin/python files/dialogue.py
+#
+# These four checks exist because each one is a mistake that was actually MADE
+# and shipped during this feature's review (see STAGE_F.md 2.1, notes.md):
+#   [1] the RNG trap      -- constructing the head shifted every dropout mask
+#   [2] the label mask    -- correct, incl. the truncation confound
+#   [3] the LYING metric  -- end_n stays healthy while the gate learns "never end"
+#   [4] the NULL control  -- beating base-rate entropy is NOT evidence of signal
+# ======================================================================
+def _self_test() -> int:
+    import torch.nn.functional as F
+    ok = True
+
+    def chk(cond, msg):
+        nonlocal ok
+        print(("  PASS  " if cond else "  FAIL  ") + msg)
+        ok = ok and bool(cond)
+
+    print("[1] constructing DialogueAdapter must NOT consume global RNG")
+    torch.manual_seed(0); ref = torch.randn(4)
+    torch.manual_seed(0); a = DialogueAdapter(16); got = torch.randn(4)
+    chk(torch.allclose(ref, got),
+        "RNG stream unshifted (a plain nn.Linear WOULD shift it, silently changing "
+        "every later dropout mask -- 130/137 base tensors once differed this way)")
+    chk(bool((a.end_head.weight == 0).all()) and abs(float(a.end_head.bias) - _END_BIAS_INIT) < 1e-9,
+        f"end_head is deterministic: weight all-zero, bias {_END_BIAS_INIT}")
+
+    print("[2] _turn_end_labels: labels + the truncation confound")
+    from model import LatentThoughtModel
+    rm = torch.tensor([[1, 1, 1, 0, 0, 0],    # ends at t=2 -> trustworthy
+                       [1, 0, 0, 0, 0, 0],    # single-chunk turn
+                       [1, 1, 1, 1, 1, 1]],   # FILLED -> may be truncated
+                      dtype=torch.bool)
+    tgt, val = LatentThoughtModel._turn_end_labels(rm)
+    chk(tgt[0].tolist() == [0, 0, 1, 0, 0, 0], "row0 ends at its last real chunk")
+    chk(tgt[1].tolist() == [1, 0, 0, 0, 0, 0], "row1 single-chunk turn ends at t=0")
+    chk(val[2].tolist() == [1, 1, 1, 1, 1, 0],
+        "row2 (filled) has its AMBIGUOUS final label masked, earlier ones kept")
+
+    print("[3] end_pos, not end_n: an all-filled batch must show ZERO positives")
+    rm2 = torch.ones(4, 12, dtype=torch.bool)
+    t2, v2 = LatentThoughtModel._turn_end_labels(rm2)
+    n_sup, n_pos = int(v2.sum()), int((t2.bool() & v2).sum())
+    chk(n_sup > 0 and n_pos == 0,
+        f"end_n={n_sup} looks healthy while end_pos={n_pos} -- the masking deletes only "
+        f"POSITIVES, so BCE/end_acc go perfect as the head learns 'never end'")
+
+    print("[4] NULL control: beating base-rate entropy proves NOTHING here")
+    torch.manual_seed(0)
+    D, N, POS = 192, 14, 4
+    H = -(POS / N) * math.log(POS / N) - (1 - POS / N) * math.log(1 - POS / N)
+    noise = torch.randn(N, D)                       # pure noise features
+    lab = torch.zeros(N); lab[torch.randperm(N)[:POS]] = 1.0   # random labels
+    head = DialogueAdapter(D).end_head
+    opt = torch.optim.Adam(head.parameters(), lr=5e-3)
+    for _ in range(400):
+        loss = F.binary_cross_entropy_with_logits(head(noise).squeeze(-1), lab)
+        opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
+    chk(float(loss) < H,
+        f"a SIGNAL-FREE head on noise+random labels reaches BCE {float(loss):.4f} < the "
+        f"{H:.3f} base-rate entropy -- so 'beats H(p)' is NOT evidence the gate learns "
+        f"({N} points in {D}-d separate any labeling). Signal needs a HELD-OUT split.")
+
+    print("\n[self-test] " + ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_self_test())

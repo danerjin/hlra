@@ -60,7 +60,10 @@ def main():
               "but is untrained; expect noise.")
     print("[dialogue] commands: <text> | :source <t> | :reset | :temp f | :n k | :greedy | :q\n")
 
-    session = chat_core.new_dialogue_session(model, adapter, chunker, cfg)
+    # Pass `ckpt`: it carries end_gate_trained / stage_f_use_act, so the session
+    # serves the way the checkpoint was trained. Without it the turn-end gate can
+    # never turn on and a --no-act checkpoint would serve with ACT on.
+    session = chat_core.new_dialogue_session(model, adapter, chunker, cfg, ckpt=ckpt)
     temperature, n_chunks, greedy = 0.9, 6, False
 
     while True:

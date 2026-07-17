@@ -173,7 +173,13 @@ def load_base_model(ckpt_path, preset, device, soft_tags=False, trust_gate=False
             resume = {"adapter_state": ckpt.get("adapter_state"),
                       "ema": ckpt.get("ema"),
                       "optimizer": ckpt.get("optimizer"),
-                      "step": int(ckpt.get("step") or 0)}
+                      "step": int(ckpt.get("step") or 0),
+                      # Carried so main() can guard CLI drift on resume: these two
+                      # are CLI-sourced, so resuming without re-passing the original
+                      # flags silently changes the run (trainer.py's schedule/halt
+                      # guards exist for exactly this failure).
+                      "end_gate_trained": ckpt.get("end_gate_trained"),
+                      "stage_f_use_act": ckpt.get("stage_f_use_act")}
         print(f"[train_dialogue] loaded base checkpoint {ckpt_path} "
               f"(stage_reached={ckpt.get('stage_reached')}).")
         return model, cfg, resume
@@ -412,16 +418,43 @@ def main():
         # so load non-strictly and say exactly what happened. (A strict load
         # raised "Missing key(s): end_head.weight, end_head.bias" and the
         # optimizer raised a param-group size mismatch, 138 vs 140.)
+        # Stage-F drift guard, mirroring trainer.py's schedule/halt guards. Both of
+        # these are CLI-sourced (--end-weight / --no-act), so a resume that omits
+        # them silently changes the run: ACT flips back on, and `end_gate_trained`
+        # regresses True->False while the TRAINED end_head is still sitting in
+        # adapter_state -- which would permanently mismark a working gate as
+        # untrained, and serving reads that flag to decide whether to use it.
+        _drift = [("end_gate_trained", resume.get("end_gate_trained"), end_on),
+                  ("stage_f_use_act", resume.get("stage_f_use_act"), flags.use_act)]
+        _drift = [(k, o, n) for k, o, n in _drift if o is not None and bool(o) != bool(n)]
+        if _drift:
+            print("[train_dialogue] " + "!" * 60, flush=True)
+            print("[train_dialogue] WARNING: resume Stage-F config differs from the "
+                  "checkpoint (weights still load):", flush=True)
+            for k, o, n in _drift:
+                print(f"[train_dialogue]   {k}: checkpoint={o!r}  now={n!r}", flush=True)
+            print("[train_dialogue] Re-pass the original --end-weight / --no-act to "
+                  "continue the same run, or proceed if the switch is intentional.",
+                  flush=True)
+            print("[train_dialogue] " + "!" * 60, flush=True)
+
         pre_gate = False
         if resume["adapter_state"] is not None:
             missing, unexpected = adapter.load_state_dict(resume["adapter_state"],
                                                           strict=False)
-            pre_gate = any(k.startswith("end_head") for k in missing)
+            # ALL of end_head.* missing == a genuine pre-gate checkpoint. A PARTIAL
+            # miss (e.g. only end_head.bias) is corruption, not an old file, and must
+            # not be waved through as "predates the gate". Exact names, not a prefix:
+            # startswith("end_head") would also swallow a future `end_head_foo`.
+            _END_KEYS = {"end_head.weight", "end_head.bias"}
+            _miss_end = _END_KEYS & set(missing)
+            pre_gate = _miss_end == _END_KEYS
             if pre_gate:
                 print("[train_dialogue] NOTE: this Stage-F checkpoint predates the "
                       "turn-end gate (no end_head in its adapter state). The seed "
                       "resumed; end_head starts from its untrained init.", flush=True)
-            other = [k for k in missing if not k.startswith("end_head")]
+            other = [k for k in missing if k not in _END_KEYS] + (
+                sorted(_miss_end) if _miss_end and not pre_gate else [])
             if other or unexpected:
                 raise SystemExit(f"[train_dialogue] adapter state mismatch beyond the "
                                  f"turn-end gate -- missing={other} unexpected={list(unexpected)}")
@@ -500,7 +533,9 @@ def main():
                           f"truncation mask, so the gate is learning 'never end' "
                           f"regardless of what end/end_acc say. Your responses are "
                           f"filling max_chunks_per_doc={cfg.max_chunks_per_doc}; "
-                          f"raise it, or use shorter-response data.", flush=True)
+                          f"raise it, or use shorter-response data. (If end_n is also "
+                          f"0 the batch simply had no response chunks -- a data bug, "
+                          f"not a masking one.)", flush=True)
 
             syco_val = None
             if sf.syco_every and (step % sf.syco_every == 0):

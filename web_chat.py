@@ -33,7 +33,10 @@ def do_load(path):
     # is available. On a plain A→E checkpoint the adapter is zero-init (untrained
     # dialogue) but the Generate/Score modes are unaffected.
     model, adapter, chunker, cfg, ckpt = chat_core.load_dialogue_checkpoint(path)
-    session = chat_core.new_dialogue_session(model, adapter, chunker, cfg)
+    # Pass `ckpt`: it carries end_gate_trained / stage_f_use_act, so the session
+    # serves the way the checkpoint was trained. Without it the turn-end gate can
+    # never turn on and a --no-act checkpoint would serve with ACT on.
+    session = chat_core.new_dialogue_session(model, adapter, chunker, cfg, ckpt=ckpt)
     STATE.update(model=model, adapter=adapter, session=session, chunker=chunker, cfg=cfg,
                  meta=chat_core.ckpt_summary(cfg, ckpt),
                  path=os.path.abspath(os.path.expanduser(path.strip())))

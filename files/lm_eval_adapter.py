@@ -391,10 +391,24 @@ def _self_test() -> int:
         print(f"\n[self-test] the two continuations differ by "
               f"{abs(lp_a - lp_b):.4f} nats -- scoring is continuation-dependent.")
 
-    # An empty continuation must score exactly 0.0 (log P over no tokens).
-    lp_empty, _ = lm._score_continuation(context, "")
-    if lp_empty != 0.0:
-        print(f"[self-test] FAIL: empty continuation scored {lp_empty} (expected 0.0)")
+    # A continuation the chunker drops to ZERO scorable chunks (empty string,
+    # whitespace-only, unusual unicode) must never outrank a real candidate:
+    # log P = 0.0 is the MAXIMUM possible log-likelihood, so scoring it 0.0 would
+    # win every multiple-choice ranking outright. `_score_continuation` returns a
+    # large-negative sentinel instead. Assert that PROPERTY rather than the
+    # sentinel's magic value -- this test asserted 0.0 against the pre-999b6d3b
+    # contract and silently went red when the scorer was (correctly) fixed.
+    lp_empty, greedy_empty = lm._score_continuation(context, "")
+    print(f"\ncontinuation : '' (zero scorable chunks)\n"
+          f"  logprob = {lp_empty:.4g}   is_greedy = {greedy_empty}")
+    if not lp_empty < min(lp_a, lp_b):
+        print(f"[self-test] FAIL: empty continuation scored {lp_empty:.4g}, which does "
+              f"not rank below both real continuations ({lp_a:.4f}, {lp_b:.4f}) "
+              f"-- a degenerate candidate could win a ranking.")
+        ok = False
+    if greedy_empty:
+        print("[self-test] FAIL: empty continuation reported is_greedy=True "
+              "-- nothing was scored, so nothing can have been the argmax.")
         ok = False
 
     print("\n[self-test] " + ("PASS" if ok else "FAIL"))

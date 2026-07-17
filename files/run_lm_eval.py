@@ -55,6 +55,43 @@ import lm_eval_adapter  # noqa: E402  (import-order is deliberate; see above)
 # Honest default: the two tasks that map cleanly onto chunk-level scoring.
 DEFAULT_TASKS = "lambada_openai,hellaswag"
 
+# Named suites expand in --tasks. `reasoning` is the multiple-choice set whose
+# options are sentence/phrase-length (so they fit chunk-granularity scoring):
+#   copa       -- causal reasoning, 2 options            (super_glue)
+#   piqa       -- physical commonsense, 2 options
+#   hellaswag  -- adversarial commonsense continuation, 4 sentence-length endings
+#   arc_challenge -- grade-school science QA, full-phrase answers
+# ARC-C is the hardest and sits near chance at `small` scale -- it is here for
+# scale-up, not as a small-scale headline (see the module docstring / README).
+# StoryCloze/ROCStories also fits well but needs a MANUAL dataset download
+# (gated on HF), so it is not in the default suite; add it once its data is local.
+SUITES = {
+    "reasoning": "copa,piqa,hellaswag,arc_challenge",
+}
+
+
+def _expand_tasks(spec: str):
+    """Split a --tasks spec on commas, expanding any named suite in SUITES."""
+    out = []
+    for tok in (t.strip() for t in spec.split(",")):
+        if not tok:
+            continue
+        if tok in SUITES:
+            out.extend(t.strip() for t in SUITES[tok].split(","))
+        else:
+            out.append(tok)
+    # de-dup, preserve order
+    seen, uniq = set(), []
+    for t in out:
+        if t not in seen:
+            seen.add(t); uniq.append(t)
+    return uniq
+
+
+# Tasks whose metric is a real perplexity/log-likelihood -- meaningless under the
+# latent_cos RANKING score. Used only to warn.
+_PERPLEXITY_TASKS = {"lambada_openai", "lambada_standard", "wikitext"}
+
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__,
@@ -62,8 +99,15 @@ def main(argv=None) -> int:
     p.add_argument("--ckpt", default=lm_eval_adapter.DEFAULT_CKPT,
                    help="path to the trained checkpoint (default: runs/model.pt)")
     p.add_argument("--tasks", default=DEFAULT_TASKS,
-                   help="comma-separated lm-eval task names "
-                        f"(default: {DEFAULT_TASKS})")
+                   help="comma-separated lm-eval task names, or a named suite "
+                        f"({'/'.join(SUITES)}). default: {DEFAULT_TASKS}")
+    p.add_argument("--score-mode", default="token_nll",
+                   choices=lm_eval_adapter.LatentThoughtLM.SCORE_MODES,
+                   help="token_nll (default) = Talker token NLL, a real "
+                        "log-likelihood (needed for perplexity tasks). "
+                        "latent_cos = cosine(predicted latent, true chunk "
+                        "encoding), the model-native ranking score for "
+                        "multiple-choice acc (not for perplexity).")
     p.add_argument("--limit", type=int, default=None,
                    help="cap examples per task (omit for the full task; "
                         "use e.g. 200 for a fast dry-run)")
@@ -85,11 +129,21 @@ def main(argv=None) -> int:
     from lm_eval import simple_evaluate
     from lm_eval.utils import make_table
 
-    tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
+    tasks = _expand_tasks(args.tasks)
     print(f"[run_lm_eval] ckpt={args.ckpt}  tasks={tasks}  "
-          f"limit={args.limit}  device=cpu", flush=True)
+          f"score_mode={args.score_mode}  limit={args.limit}  device=cpu", flush=True)
 
-    lm = lm_eval_adapter.LatentThoughtLM(ckpt=args.ckpt, device=args.device)
+    # latent_cos is a ranking score, not a log-likelihood -- warn if it is paired
+    # with a perplexity task, where its number is meaningless.
+    if args.score_mode == "latent_cos":
+        bad = [t for t in tasks if t in _PERPLEXITY_TASKS]
+        if bad:
+            print(f"[run_lm_eval] WARNING: score_mode=latent_cos is a ranking "
+                  f"score; perplexity/log-likelihood tasks {bad} will report "
+                  f"meaningless numbers. Use token_nll for those.", flush=True)
+
+    lm = lm_eval_adapter.LatentThoughtLM(ckpt=args.ckpt, device=args.device,
+                                         score_mode=args.score_mode)
     print(f"[run_lm_eval] loaded: d_model={lm.cfg.d_model} "
           f"d_latent={lm.cfg.d_latent} vocab={lm.cfg.vocab_size}", flush=True)
 

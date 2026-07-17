@@ -75,6 +75,19 @@ chunker cuts it into; there is no per-token conditional. Two consequences:
     this adapter; cloze/continuation tasks with sentence-length completions
     (LAMBADA, HellaSwag endings) sit much better on the chunking.
 
+TWO SCORING MODES (`score_mode=`)
+--------------------------------
+The chain above is the DEFAULT ("token_nll"): a real conditional log-likelihood
+(Talker token NLL of the true continuation under the predicted latent), usable
+for perplexity tasks (LAMBADA) and multiple choice alike. A second mode,
+"latent_cos", scores each continuation chunk by the cosine between the predicted
+latent and the chunk's OWN encoding -- the SSL objective's native target, read
+WITHOUT the Talker decode. It is the model-native "closest to what the loop
+predicted next" score: a RANKING signal for multiple-choice `acc`
+(COPA/PIQA/HellaSwag/ARC-C), not a log-likelihood (do not use it for perplexity
+or `acc_norm`). See `_score_continuation` for the exact difference (it is one
+per-chunk term; the context read and teacher-forced advance are shared).
+
 The load-bearing, unit-testable logic is `_score_continuation`; the `lm_eval`
 wrapper around it is thin and only imported if the harness is installed.
 """
@@ -160,13 +173,20 @@ class LatentThoughtLM(TemplateLM):
     the actual work to `_score_continuation` / `generate.generate`.
     """
 
+    #: valid `score_mode` values (see `_score_continuation`).
+    SCORE_MODES = ("token_nll", "latent_cos")
+
     def __init__(self, ckpt: str = None, offline: bool = False,
                  preset: str = "smoke", vocab_size: int = 1024,
-                 device: str = "cpu", **kwargs):
+                 device: str = "cpu", score_mode: str = "token_nll", **kwargs):
         # TemplateLM.__init__ is cheap/no-arg in the harness versions we target;
         # skip it entirely when running without lm_eval (TemplateLM is `object`).
         if _HAVE_LM_EVAL:
             super().__init__()
+        if score_mode not in self.SCORE_MODES:
+            raise ValueError("score_mode must be one of %r, got %r"
+                             % (self.SCORE_MODES, score_mode))
+        self.score_mode = score_mode
         self.device = torch.device(device)
         # generate.read_prompt (the shared context-reading path) builds its
         # tensors on CPU and never moves them, so a non-CPU model would hit a
@@ -207,18 +227,41 @@ class LatentThoughtLM(TemplateLM):
     @torch.no_grad()
     def _score_continuation(self, context: str, continuation: str):
         """
-        Log P(continuation | context) via the predictive chain (see the module
-        docstring). Returns (logprob: float, is_greedy: bool).
+        Score log P(continuation | context) via the predictive chain (see the
+        module docstring). Returns (score: float, is_greedy: bool); a HIGHER
+        score ranks a continuation better, which is all the harness's
+        multiple-choice `acc` needs (it argmaxes across the choices' scores).
 
-        `logprob` is the negative summed teacher-forced token NLL of the
-        continuation's tokens, each chunk decoded from the latent pred_head
-        forecasts off the running thought (NOT from an encoding of the chunk
-        itself -- that would leak the answer). `is_greedy` is True iff every
-        supervised token was the Talker's argmax from the predicted latent.
+        Two scoring modes, chosen at construction (`score_mode=`):
 
-        Does NOT touch lm_eval -- callable directly for tests.
+          * "token_nll" (DEFAULT): score = the NEGATIVE summed teacher-forced
+            token NLL of the continuation's tokens, each chunk decoded by the
+            Talker from the latent pred_head forecasts off the running thought
+            (NOT from an encoding of the chunk itself -- that would leak the
+            answer). A real conditional log-likelihood; usable for perplexity
+            tasks (LAMBADA) as well as multiple choice. `is_greedy` is True iff
+            every supervised token was the Talker's argmax.
+
+          * "latent_cos": score = the summed cosine similarity between the
+            predicted latent and the TRUE chunk's OWN encoding -- exactly the
+            quantity the SSL loss trains (model.forward_self_supervised), read
+            WITHOUT the Talker decode the token path adds on top. This is the
+            model-native "which continuation is closest to what the loop
+            predicted next" score. It is a RANKING score, not a log-likelihood:
+            meaningful for multiple-choice `acc` (COPA/PIQA/HellaSwag/ARC-C), NOT
+            for perplexity tasks, and `acc_norm` (byte-length normalized) is not
+            meaningful for it. `is_greedy` is always False (argmax is undefined
+            for a latent-space score). Cosine is scale-invariant, so unlike the
+            token path this needs no _rescale_to. The online encoder is used as
+            the reference (the EMA target ~ online at convergence, and it keeps
+            inference single-encoder).
+
+        Both modes share the SAME context read and the SAME teacher-forced
+        advance; they differ ONLY in the per-chunk scoring term. Does NOT touch
+        lm_eval -- callable directly for tests.
         """
         model, chunker, cfg = self.model, self.chunker, self.cfg
+        latent_cos = (self.score_mode == "latent_cos")
 
         # ---- 1. READ the context: build gestalt memory + carry the thought.
         # Reuse generate.read_prompt verbatim so the read path is identical to
@@ -231,6 +274,8 @@ class LatentThoughtLM(TemplateLM):
         ct, cm = chunker.chunk_batch([continuation])            # (1, C, L), (1, C)
         total_nll = 0.0
         total_tok = 0
+        total_cos = 0.0
+        n_scored = 0
         all_greedy = True
 
         for t in range(ct.shape[1]):
@@ -239,40 +284,60 @@ class LatentThoughtLM(TemplateLM):
             chunk_ids = ct[:, t, :].to(self.device)             # (1, L)
 
             # a. Predict this chunk's encoder-space latent off the PREVIOUS
-            #    thought, then rescale onto the encoder-latent norm shell.
+            #    thought.
             if prev_thought is None:
                 # Empty/too-short context: no thought yet. Predict off a zero
                 # thought (the loop's own initial H-state), the only defined
                 # stance available -- degenerate but finite.
                 prev_thought = torch.zeros(1, cfg.d_latent, device=self.device)
             pred = model.pred_head(prev_thought)                # (1, d_latent)
-            ref_norm = pred.new_full((pred.shape[0], 1), self._ref_norm)
-            pred = model._rescale_to(pred, ref_norm)
 
-            # b. Teacher-forced token NLL of the TRUE tokens under the PREDICTED
-            #    latent (empty-memory codec convention). The tokens being scored
-            #    never entered `pred` -- this is the no-leak conditional score.
-            s, n = model.score_tokens(chunk_ids, pred)
-            total_nll += float(s)
-            total_tok += int(n)
-            if all_greedy:
-                all_greedy = self._chunk_is_greedy(chunk_ids, pred)
+            # Encode the TRUE continuation chunk ONCE. Used by latent_cos
+            # scoring (as the cosine reference) AND, in both modes, to advance
+            # the thought via teacher forcing in step (c).
+            latent = model.chunk_encoder(chunk_ids, chunk_ids != 0)
+
+            # b. Per-chunk score term -- the ONLY place the two modes differ.
+            if latent_cos:
+                # cosine(pred_head forecast, true chunk's encoding): the SSL
+                # objective's own target, no Talker, no rescale (scale-invariant).
+                cos = torch.nn.functional.cosine_similarity(pred, latent, dim=-1)
+                total_cos += float(cos.sum())
+                n_scored += 1
+                all_greedy = False
+            else:
+                # Teacher-forced token NLL of the TRUE tokens under the PREDICTED
+                # latent (empty-memory codec convention). The tokens being scored
+                # never entered `pred` -- this is the no-leak conditional score.
+                # Rescale onto the encoder-latent norm shell first (the Talker
+                # consumes the latent unnormalized; the cosine SSL loss trains
+                # pred_head's DIRECTION, not its scale).
+                ref_norm = pred.new_full((pred.shape[0], 1), self._ref_norm)
+                pred_rescaled = model._rescale_to(pred, ref_norm)
+                s, n = model.score_tokens(chunk_ids, pred_rescaled)
+                total_nll += float(s)
+                total_tok += int(n)
+                if all_greedy:
+                    all_greedy = self._chunk_is_greedy(chunk_ids, pred_rescaled)
 
             # c. Teacher forcing: ingest the TRUE continuation chunk to advance
             #    the thought/memory, exactly as read_prompt does per chunk.
-            latent = model.chunk_encoder(chunk_ids, chunk_ids != 0)
             h_state, _ = model.hrm_loop(latent, memory, None, h_state=h_state,
                                         l_state=l_state, grad_window=5, use_act=False)
             l_state = h_state
             memory.write(h_state.detach(), SELF)
             prev_thought = h_state
 
-        # Negative NLL is the log-likelihood the harness expects. A continuation
-        # that produced NO scorable chunks -- an empty string, or one the chunker
-        # dropped to zero chunks (whitespace-only, unusual unicode) -- must NOT
-        # score 0.0: that is the MAXIMUM possible log-likelihood and would rank a
-        # degenerate candidate above every real (negative-scoring) one. Return a
-        # large-negative score so it can never win, and is not "greedy".
+        # A continuation that produced NO scorable chunks -- an empty string, or
+        # one the chunker dropped to zero chunks (whitespace-only, unusual
+        # unicode) -- must NOT score at the top of the range (0.0 NLL is the
+        # MAXIMUM log-likelihood; a 0.0 cosine sum can outrank negative-cosine
+        # real candidates), or a degenerate candidate could win a ranking.
+        # Return a large-negative score so it can never win, and is not greedy.
+        if latent_cos:
+            if n_scored == 0:
+                return -1e30, False
+            return total_cos, False
         if total_tok == 0:
             return -1e30, False
         return -total_nll, bool(all_greedy)
@@ -426,6 +491,43 @@ def _self_test() -> int:
         print("[self-test] FAIL: empty continuation reported is_greedy=True "
               "-- nothing was scored, so nothing can have been the argmax.")
         ok = False
+
+    # ---- latent_cos mode: the model-native ranking score. Same properties we
+    # can check without a trained model: finite, continuation-dependent, and a
+    # zero-chunk continuation cannot outrank a real one. is_greedy is always
+    # False (argmax is undefined for a cosine score).
+    print("\n[self-test] building the SAME smoke model in score_mode='latent_cos' ...")
+    lm_cos = LatentThoughtLM(offline=True, preset="smoke", vocab_size=1024,
+                             score_mode="latent_cos")
+    cp_a, cg_a = lm_cos._score_continuation(context, cont_a)
+    cp_b, cg_b = lm_cos._score_continuation(context, cont_b)
+    cp_empty, _ = lm_cos._score_continuation(context, "")
+    print(f"  cont A cos-score = {cp_a:.4f}   cont B cos-score = {cp_b:.4f}   "
+          f"empty = {cp_empty:.4g}")
+    for name, cp in (("A", cp_a), ("B", cp_b)):
+        if not math.isfinite(cp):
+            print(f"[self-test] FAIL: latent_cos score {name} not finite ({cp})")
+            ok = False
+    if cp_a == cp_b:
+        print("[self-test] FAIL: latent_cos scored the two continuations "
+              "IDENTICALLY -- not continuation-dependent.")
+        ok = False
+    if not cp_empty < min(cp_a, cp_b):
+        print(f"[self-test] FAIL: latent_cos empty continuation ({cp_empty:.4g}) "
+              f"does not rank below both real ones ({cp_a:.4f}, {cp_b:.4f}).")
+        ok = False
+    if cg_a or cg_b:
+        print("[self-test] FAIL: latent_cos reported is_greedy=True "
+              "-- argmax is undefined for a latent-space score.")
+        ok = False
+    # A bad mode must be rejected at construction.
+    try:
+        LatentThoughtLM(offline=True, preset="smoke", vocab_size=1024,
+                        score_mode="bogus")
+        print("[self-test] FAIL: an invalid score_mode was accepted.")
+        ok = False
+    except ValueError:
+        pass
 
     print("\n[self-test] " + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1

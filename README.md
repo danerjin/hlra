@@ -126,9 +126,9 @@ and `files/run_lm_eval.py` is the one-command runner:
 
 ```bash
 pip install "lm_eval==0.4.4"
-python files/run_lm_eval.py --ckpt runs/scaled/model.pt                 # default tasks
-python files/run_lm_eval.py --ckpt runs/scaled/model.pt \
-    --tasks lambada_openai,hellaswag --limit 200 --output results/lm_eval.json
+python files/run_lm_eval.py --ckpt runs/scaled/model.pt                 # default: lambada_openai,hellaswag
+python files/run_lm_eval.py --ckpt runs/scaled/model.pt --tasks reasoning --output results/lm_eval.json
+python files/run_lm_eval.py --ckpt runs/scaled/model.pt --tasks arc_challenge --score-mode latent_cos
 ```
 
 **Scoring is at chunk granularity, not token.** The model has no native token-level conditional
@@ -140,12 +140,23 @@ tokens being scored never enter the latent they are scored under). The dependenc
 `_score_continuation`, is unit-testable with `lm_eval` absent: `python files/lm_eval_adapter.py`
 runs a self-test (no checkpoint, no downloads).
 
+**Two scoring modes** (`--score-mode`): `token_nll` (default) is the Talker token NLL above — a real
+conditional log-likelihood, so it works for perplexity tasks (LAMBADA) *and* multiple choice.
+`latent_cos` scores each continuation chunk by the cosine between the predicted latent and the true
+chunk's own encoding — the SSL objective's native target, read *without* the Talker decode. It is a
+**ranking** score for multiple-choice `acc` (the "which option is closest to what the loop predicted
+next" reading), not a log-likelihood: use it for MC tasks, not for perplexity or `acc_norm`.
+
 **Task choice is load-bearing.** Cloze / sentence-completion tasks map cleanly onto chunk scoring,
-so the default is `lambada_openai,hellaswag`. Multiple-choice tasks whose options differ by a
-single token — **ARC-Challenge** is the documented worst case — degenerate to a one-chunk
-`pred_head`→Talker decode and, at `small` scale, sit near chance; ARC-C is available
-(`--tasks arc_challenge`) but is not the honest headline number. Scoring runs on **CPU** (the shared
-inference path is CPU-only); datasets are fetched from the HF Hub on first run.
+so the default is `lambada_openai,hellaswag`, and the `reasoning` suite
+(`copa,piqa,hellaswag,arc_challenge`) is the multiple-choice set whose options are sentence- or
+phrase-length. **ARC-Challenge** is wired in (`--tasks arc_challenge`) for when the model is scaled
+up, but it is the hardest of these and sits near chance at `small` scale — a low number there is a
+scale limit, not a scoring artifact, so it is not a small-scale headline. Tasks like `winogrande` or
+MMLU, whose options differ by a *single token*, are the genuinely degenerate case for chunk scoring.
+StoryCloze/ROCStories also fits well but needs a manual (gated) dataset download, so it is not in the
+suite. Scoring runs on **CPU** (the shared inference path is CPU-only); datasets are fetched from the
+HF Hub on first run.
 
 ## Status and honest limits
 

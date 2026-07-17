@@ -186,9 +186,9 @@ class DialogueSession:
 
         `use_end_head=None` (default) inherits the session's setting, which is off
         unless the checkpoint says the gate was trained. Do NOT turn it on for an
-        untrained gate: sigmoid(-4.0)=0.018 is a per-CHUNK rate, so ~10% of
-        6-chunk replies would stop early at random. Off => exactly the pre-gate
-        fixed-length behavior.
+        untrained gate: sigmoid(-4.0)=0.018 is a per-CHUNK rate, and a 6-chunk reply
+        has 5 chances to stop early -- so 8.7% of them would, at random. Off =>
+        exactly the pre-gate fixed-length behavior.
         """
         if use_end_head is None:
             use_end_head = self.use_end_head
@@ -266,7 +266,16 @@ class DialogueSession:
         if float(valid.sum()) == 0:
             return
         summary = (z[0] * valid).sum(0) / valid.sum()        # masked mean -> (d,)
-        self.memory.write(self.model._gestalt(summary.unsqueeze(0)), USER)
+        # Persona 1, not None. `persona_id_tensor` maps None -> 0, and 0 is SELF's
+        # persona (model.forward_dialogue: `self_persona = 0`, "reserved for SELF"),
+        # so omitting it made a served USER turn indistinguishable from the model's
+        # own thought -- memory asserting the user's turn was spoken by the model.
+        # Training tags it 1 (dialogue_data._ROLE_MAP: "user" -> (USER, 1)); match it,
+        # or the gate is read off an h_t training never produced. Inert while
+        # persona_embed is zero-init, live under --persona (TRAINING.md's recommended
+        # fine-tune passes it). Mirrors the SELF write above, which does pass 0.
+        self.memory.write(self.model._gestalt(summary.unsqueeze(0)), USER,
+                          1 if self.cfg.persona_tags else None)
 
     @torch.no_grad()
     def add_source(self, source_text: str, ground_talker: bool = False) -> int:
@@ -294,12 +303,13 @@ def _decode_ids(tok, ids) -> str:
 # Self-test for the turn-end gate. Runs offline, no checkpoint, no downloads:
 #   .venv/bin/python files/dialogue.py
 #
-# These four checks exist because each one is a mistake that was actually MADE
+# These five checks exist because each one is a mistake that was actually MADE
 # and shipped during this feature's review (see STAGE_F.md 2.1, notes.md):
 #   [1] the RNG trap      -- constructing the head shifted every dropout mask
 #   [2] the label mask    -- correct, incl. the truncation confound
 #   [3] the LYING metric  -- end_n stays healthy while the gate learns "never end"
 #   [4] the NULL control  -- beating base-rate entropy is NOT evidence of signal
+#   [5] phantom slots    -- a row's thought depended on its batchmates' context
 # ======================================================================
 def _self_test() -> int:
     import torch.nn.functional as F

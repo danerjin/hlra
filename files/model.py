@@ -691,8 +691,10 @@ class LatentThoughtModel(nn.Module):
             col = source_mask[:, j]
             if not bool(col.any()):
                 continue
-            # Same batch-level-ANY hazard as _write_context: mark the real rows so a
-            # shorter source does not get phantom RETRIEVED slots from a longer one.
+            # DEFENSIVE: same batch-level-ANY hazard as _write_context, but currently
+            # unreachable -- the only caller is DialogueSession.add_source (B=1), where
+            # `col` is always all-True (and write() then collapses it back to None).
+            # Marked so a future batched caller cannot reintroduce the phantom.
             memory.write(self._gestalt(z[:, j]), role, valid=col)
             n += 1
         return n
@@ -838,11 +840,16 @@ class LatentThoughtModel(nn.Module):
             # Self-thought written through the same gestalt-readout as context, so
             # the bank stays homogeneous (§4/Q2). Identity when readout is off.
             write_vec = self._gestalt(h)
-            # `valid=active`: hrm_loop leaves an INACTIVE row's h unchanged, so a row
-            # whose response already ended would write a duplicate of its own last
-            # thought once per remaining column -- again making its memory depend on
-            # how long its batchmates' responses are. Not zeros like _write_context,
-            # but the same batch-coupling class.
+            # `valid=active`: DEFENSIVE, not a live fix -- measured a bit-exact no-op.
+            # An inactive row does NOT keep a stale h (an earlier version of this
+            # comment said so and was wrong; hrm_loop.py:320 says the opposite --
+            # active_mask gates only the ponder cost and halt vote, so such rows "keep
+            # evolving on pad-chunk latents" and write FRESH garbage per column). It is
+            # unobservable anyway: resp_mask is a left-packed contiguous prefix, so a
+            # row never reactivates and contributes to no loss after its last chunk,
+            # and slots are per-row so its junk never reaches a batchmate. Kept because
+            # it costs nothing and the invariant ("a slot is real only for rows that
+            # had content") should hold by construction, not by luck of left-packing.
             memory.write(write_vec.detach() if stage.detach_memory else write_vec,
                          SELF, self_persona, valid=active)
             memory.apply_grad_truncation(stage.memory_grad_window)

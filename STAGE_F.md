@@ -179,8 +179,9 @@ python train_dialogue.py ... --end-weight 0.5 --no-act      # DIAGNOSTIC only: i
                                                             # the gate from ACT's depth
 ```
 `save()` records both `end_gate_trained` and `stage_f_use_act`; `chat_core.new_dialogue_session(..., ckpt)`
-reads them (and `chat.py` / `dialogue_chat.py` / `web_chat.py` pass `ckpt`), so serving
-runs the loop the way training did instead of guessing. Resuming with different
+reads them, and both dialogue front-ends (`dialogue_chat.py`, `web_chat.py`) pass `ckpt`
+— so serving runs the loop the way training did instead of guessing. (`chat.py` has no
+dialogue path at all; it is the A→E generate/score tester.) Resuming with different
 `--end-weight`/`--no-act` flags warns, mirroring `trainer.py`'s schedule/halt guards.
 
 ```bash
@@ -232,11 +233,14 @@ tag is a fully attendable *"the user said ⟨nothing⟩"* memory.
 Note what it violated: `_encode_real_rows`' own docstring promises *"pad-row latents
 feed only dead paths"*. True for A→E — and false the moment they are written to memory.
 
-**Measured on the real default corpus** (ultrachat via `iter_hf_chat_turns`, preset
-`small`, B=8): **45.7%** of every row's context memory was fabricated, and **28% of rows
+**Measured on the real corpus** (ultrachat — `training_easy.md`'s recommended Stage-F
+data, not a code default; `--hf-chat` defaults to the offline synthetic corpus — via
+`iter_hf_chat_turns`, preset `small`, B=8; independently reproduced at 45.4% / 27.5%): **45.7%** of every row's context memory was fabricated, and **28% of rows
 had zero real context — 100% phantom**. It made a row's `h_t` a function of its
-batchmates' context *length*, it degraded `cos`/`gen` (not just the gate), and it was
-**not** mitigated by `--no-act` — the ACT halt-vote skew documented in §2.1 is a
+batchmates' context *length* — so it corrupted the `h_t` that `cos`/`gen` are computed
+from, not just the gate's input (the *sign* of the effect on those losses at random
+init is not measured, and inferring one would be the same mistake as §2.1's withdrawn
+signal claim). It was **not** mitigated by `--no-act` — the ACT halt-vote skew documented in §2.1 is a
 *different*, and measurably benign, coupling. Serving (B=1) never reproduced it.
 
 **The fix.** `GestaltMemoryBank.write(..., valid=)` takes an optional `(batch,)` bool
@@ -244,10 +248,22 @@ marking which rows the slot is real for; `valid_mask()` returns `(batch, n_slots
 **`None` when no slot carries one** — in which case the reader takes its original
 unmasked attention, byte-identical. That is the whole A→E path and every B=1 serve, so
 **A→E is untouched** (verified: losses + every per-parameter grad norm, float64).
-Three Stage-F writers now pass their real per-row mask: `_write_context`,
-`inject_source` (identical `.any()` pattern for RAG), and `forward_dialogue`'s SELF
-write — where an *inactive* row keeps a stale `h` and would re-write it once per
-remaining column, the same batch-coupling in a subtler form.
+Three Stage-F writers pass their real per-row mask, but **only one was a live bug**
+— the other two are defensive applications of the same pattern, and saying otherwise
+overstates the fix:
+- `_write_context` — **real, measured** (the 45.7% above).
+- `inject_source` — **unreachable**: its only caller is `DialogueSession.add_source`
+  (B=1 serving), where the column is always all-True. Marked so a future *batched*
+  caller cannot reintroduce it.
+- `forward_dialogue`'s SELF write — **a bit-exact no-op** (verified: every output
+  identical to 0.0e+00 with the argument removed). `resp_mask` is a left-packed
+  contiguous prefix, so a row never reactivates, contributes to no loss after its last
+  chunk, and its junk slots are per-row — unobservable. Kept so the invariant holds by
+  construction rather than by luck of left-packing. (An earlier draft justified it as
+  "an inactive row keeps a stale `h`". That is **false** — `active_mask` gates only the
+  ponder cost and halt vote, so such rows *keep evolving on pad-chunk latents*
+  (`hrm_loop.py:320`) and write fresh garbage, not a stale duplicate. The claim
+  contradicted the file it named.)
 
 One trap worth knowing: attention over a **fully-masked row is NaN, not zero**, and 28%
 of real rows have no context at all. Those rows are left unmasked and their output
@@ -255,7 +271,21 @@ zeroed explicitly — matching the reader's existing "no memory yet" branch.
 
 `python files/dialogue.py` check [5] guards this: row 0's own P(end) must not move when
 a batchmate's context length changes. It is verified *sensitive* — stubbing `valid_mask`
-to `None` makes it fail (drift 6.6e-2 vs 4.8e-7 of float32 batch-shape noise).
+to `None` makes it fail (drift 6.6e-2 vs 4.8e-7 of float32 batch-shape noise). **It
+guards `_write_context` only**: reverting either of the other two `valid=` arguments
+leaves the suite green, because both are inert (below).
+
+**Two latent hazards this does NOT close**, both measured, neither reachable today:
+- **FIFO eviction is still batch-coupled.** `valid` marks a slot dead; it does not
+  protect it from `write`'s `pop(0)`. If `memory_capacity` were below the slots written
+  per example, a long batchmate's writes would evict a *short* row's real context — the
+  same coupling at the same magnitude (1.43 vs the unfixed 1.39). Safe on every shipped
+  preset (capacity is 4–8× `max_chunks_per_doc`), so this is a config invariant, not a
+  guarantee.
+- **`filtered_stacked` ignores validity.** Its only callers are A→E (whose banks never
+  carry validity), and `_write_context`'s per-element roles are unfilterable by
+  construction — so no phantom can reach it. A future Stage-F path reading the input
+  lane would reintroduce the bug class.
 
 ## 3. Anti-sycophancy (`forward_anti_sycophancy` + `losses.anti_sycophancy_loss`)
 
@@ -353,6 +383,13 @@ MMLU-style continuations are the degenerate worst case; LAMBADA/cloze map best.
 ## 9. Honest limits
 
 - **Unvalidated** — smoke-only on synthetic data; no real dialogue run.
+- **Cross-turn memory has a train/serve granularity mismatch** (pre-existing, not
+  fixed). Training's `_write_context` writes **one slot per chunk** of each prior turn,
+  each with its own role/persona. Serving's `_age_user_turn` writes **one mean-pooled
+  slot per user turn**, and pools *before* `_gestalt` — which is non-linear, so the two
+  do not commute. A checkpoint trained against per-chunk USER gestalts is served
+  against pooled ones. Same class as the bugs §2.2 fixed; left as a design decision
+  (per-chunk aging would grow the bank fast) rather than patched blind.
 - **The turn-end gate is OFF by default** (`end_weight=0`) and, when on, is
   unvalidated: there is **no evidence it extracts signal at all** (§2.1 — the earlier
   "learns only weakly" reading was withdrawn as an invalid inference). `--end-grad` is
@@ -366,7 +403,9 @@ MMLU-style continuations are the degenerate worst case; LAMBADA/cloze map best.
   recommendation in [`antisycophancy_trust_gate_note.md`](antisycophancy_trust_gate_note.md).
 - **RAG is mechanism-only** — needs retrieval-augmented training data; the Talker
   grounding reader is untrained dead weight until then.
-- **Real HF loaders are coded, not run** against an actual dataset.
+- **Real HF loaders are coded but barely exercised.** The ultrachat stream has been
+  read for *measurement* (§2.2's context-length statistics; `TRAINING.md` reports it
+  100% multi-turn) — but never *trained* on.
 - **Multi-party persona** assumes ≤ `n_personas` distinct speakers per conversation.
 
 **2026-07-14 review (4 adversarial audits) — no target leak, no garbage-training, halt gate

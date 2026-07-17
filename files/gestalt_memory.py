@@ -76,6 +76,13 @@ class GestaltMemoryBank:
         corpus, 45.7% of every row's context memory was fabricated this way and 28%
         of rows had NO real context at all -- and it made a row's h_t depend on its
         batchmates' context length. Pass `valid` so the reader can ignore them."""
+        if valid is not None and torch.is_tensor(valid) and bool(valid.all()):
+            # Real for every row => nothing to mask. Collapsing to None here keeps
+            # `valid_mask()` returning None for an all-valid bank, so the reader takes
+            # its original unmasked attention and stays byte-identical -- which
+            # matters for the B=1 serving paths (inject_source always passes an
+            # all-True column), where a mask would otherwise cost ~3e-8 for nothing.
+            valid = None
         self.vectors.append(vector)
         self.role_ids.append(role_id)
         self.persona_ids.append(persona_id)
@@ -139,6 +146,13 @@ class GestaltMemoryBank:
         alongside masked slots broadcasts to all-True (it IS real for every row)."""
         if not self.valids or all(v is None for v in self.valids):
             return None
+        # A non-tensor, non-None `valid` (e.g. a bare bool) would otherwise fall
+        # through to a bare StopIteration out of the generator below -- which python
+        # can swallow rather than raise. No shipped caller does it; fail loudly if one
+        # ever does, rather than silently.
+        if not any(torch.is_tensor(v) for v in self.valids):
+            raise TypeError("GestaltMemoryBank.write(valid=) takes a (batch,) bool "
+                            f"tensor or None; got {[type(v).__name__ for v in self.valids]}")
         batch = next(v.shape[0] for v in self.valids if torch.is_tensor(v))
         cols = [v.to(device).bool() if torch.is_tensor(v)
                 else torch.ones(batch, device=device, dtype=torch.bool)

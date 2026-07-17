@@ -639,7 +639,7 @@ def save(out_dir, name, model, adapter, ema, optimizer, cfg, step, end_gate_trai
             "step": step,
             # Whether the turn-end gate was actually TRAINED (end_weight > 0). The
             # adapter always carries an end_head, so its presence proves nothing --
-            # and an untrained gate is NOT inert (P=0.018 per chunk => ~10% of
+            # and an untrained gate is NOT inert (P=0.018 per chunk => 8.7% of
             # 6-chunk replies stop early). Serving reads this to decide whether the
             # gate may be used at all, instead of guessing from the weights.
             "end_gate_trained": bool(end_gate_trained),

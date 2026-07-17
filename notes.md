@@ -748,11 +748,28 @@ re-validate anti-collapse at width before turning any on.
   and `--no-act` did NOT mitigate it (the ACT skew is a different, benign coupling).
   Fix: `GestaltMemoryBank.write(valid=)` + `valid_mask()` → a reader `key_padding_mask`,
   returning None when no slot carries a validity so **A→E keeps its original unmasked
-  attention, byte-identical**. Applied at all three Stage-F writers (`_write_context`,
-  `inject_source`, and `forward_dialogue`'s SELF write, where an inactive row re-wrote a
-  stale `h` per remaining column). Gotcha: attention over a fully-masked row is **NaN,
-  not zero** — those rows are zeroed explicitly. Guarded by `files/dialogue.py` check [5],
-  verified sensitive (6.6e-2 drift without the fix vs 4.8e-7 float32 noise with it).
+  attention, byte-identical**. Applied at all three Stage-F writers, but **only
+  `_write_context` was a live bug** — `inject_source` is unreachable (B=1 serving only)
+  and `forward_dialogue`'s SELF write is a bit-exact no-op (`resp_mask` is left-packed,
+  so a row never reactivates and its junk slots are per-row); both are kept as defensive
+  applications of the pattern. NB the justification first given for the SELF write was
+  **wrong**: an inactive row does NOT keep a stale `h` — `active_mask` gates only the
+  ponder cost and halt vote, so those rows *keep evolving on pad-chunk latents*
+  (`hrm_loop.py:320`) and write fresh garbage. Gotcha: attention over a fully-masked row
+  is **NaN, not zero** — those rows are zeroed explicitly. Guarded by `files/dialogue.py` check [5], verified sensitive (6.6e-2 drift without the
+  fix vs 4.8e-7 float32 noise with it) — but it guards **`_write_context` only**. Two
+  latent hazards remain, both measured, neither reachable: FIFO eviction is still
+  batch-coupled (`valid` marks a slot dead, it does not protect it from `pop(0)`; safe
+  only because every preset has capacity 4–8× `max_chunks_per_doc`), and
+  `filtered_stacked` ignores validity (only A→E calls it, and `_write_context`'s
+  per-element roles are unfilterable by construction).
+
+- **Serving mis-tagged the aged USER turn with SELF's persona (2026-07-16, FIXED).**
+  `_age_user_turn` passed no `persona_id`; `persona_id_tensor` maps None→0, and 0 is
+  SELF's persona — so memory asserted the user's own turn was spoken by the model.
+  Training tags it 1 (`dialogue_data._ROLE_MAP`). Inert while `persona_embed` is
+  zero-init, live under `--persona`, which is in TRAINING.md's recommended command.
+  Found independently by two auditors.
 
 ## Eval-tooling dry-run (2026-07-16)
 

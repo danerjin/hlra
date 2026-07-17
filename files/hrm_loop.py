@@ -302,7 +302,7 @@ class HRMInnerLoop(nn.Module):
         n_cycles = self.h_updates_per_thought
         steps_per_cycle = self.l_steps_per_h_update + 1
         if not use_act:
-            # Fixed-depth schedule (Stages A-D): run exactly n_cycles H-updates.
+            # Fixed-depth schedule (Stages A-C): run exactly n_cycles H-updates.
             # Total step count is known, so the truncation cut is exact.
             trunc = _TruncationSchedule(grad_window, total_steps=n_cycles * steps_per_cycle)
             for _ in range(n_cycles):

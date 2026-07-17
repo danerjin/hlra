@@ -750,7 +750,16 @@ def main():
                         u = dims[cfg.role_tags.index("USER")]
                         msg += (f" trustUSER[min={float(u.min()):.2f} "
                                 f"std={float(u.std()):.3f}]")
-                (bar.write(msg) if bar is not None else print(msg, flush=True))
+                # Route through tqdm ONLY when a bar is actually RENDERING. `disable=None`
+                # (progress="auto") makes tqdm HIDE itself off-TTY but still return a live
+                # object -- so `bar is not None` is True under nohup, every line went through
+                # bar.write() (which does NOT flush), and with stdout block-buffered to a file
+                # the step lines sat in the ~8KB buffer. Same bug bit trainer._emit and made a
+                # healthy A-E run look stalled for 30-50 min. Check .disable too.
+                if bar is not None and not getattr(bar, "disable", False):
+                    bar.write(msg)
+                else:
+                    print(msg, flush=True)
             if sf.checkpoint_every and step % sf.checkpoint_every == 0:
                 save(out_dir, "checkpoint.pt", model, adapter, ema, optimizer, cfg, step,
                      end_gate_trained=end_on, use_act=flags.use_act)

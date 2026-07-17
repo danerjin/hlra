@@ -758,12 +758,16 @@ re-validate anti-collapse at width before turning any on.
   (`hrm_loop.py:320`) and write fresh garbage. Gotcha: attention over a fully-masked row
   is **NaN, not zero** — those rows are zeroed explicitly. Guarded by `files/dialogue.py` check
   [5], verified sensitive (6.6e-2 drift without the
-  fix vs 4.8e-7 float32 noise with it) — but it guards **`_write_context` only**. Two
-  latent hazards remain, both measured, neither reachable: FIFO eviction is still
-  batch-coupled (`valid` marks a slot dead, it does not protect it from `pop(0)`; safe
-  only because every preset has capacity 4–8× `max_chunks_per_doc`), and
-  `filtered_stacked` ignores validity (only A→E calls it, and `_write_context`'s
-  per-element roles are unfilterable by construction).
+  fix vs 4.8e-7 float32 noise with it) — but it guards **`_write_context` only**; check
+  [6] guards the round-3/4 fixes, which shipped with none. Two hazards the mask cannot
+  close are now **enforced** instead of relied upon: FIFO eviction is batch-coupled
+  (`valid` marks a slot dead, it does not protect it from `pop(0)`, and the pop is
+  driven by the *batch's* write count) — the real headroom is **2×, not the 4–8× the
+  capacity ratio suggests**, since `forward_dialogue` writes context **plus** SELF; both
+  512-d-class presets sit at exactly 2.0×, including **`small-w3`, which is what the A→E
+  run uses**, so `train_dialogue` now refuses to start below `2 × max_chunks_per_doc`.
+  And `filtered_stacked` cannot express validity (its return has no per-row mask), so it
+  now raises rather than handing a masked slot back for every row.
 
 - **Serving mis-tagged the aged USER turn with SELF's persona (2026-07-16, FIXED).**
   `_age_user_turn` passed no `persona_id`; `persona_id_tensor` maps None→0, and 0 is

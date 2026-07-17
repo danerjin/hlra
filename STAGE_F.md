@@ -293,16 +293,19 @@ leaves the suite green, because both are inert (below). Check [6] guards the rou
 fixes (persona, the all-True collapse, the non-tensor guard), which shipped with no
 coverage at all — each is verified to turn the suite red when reverted.
 
-**Two latent hazards this does NOT close**, both measured, neither reachable today:
-- **FIFO eviction is still batch-coupled.** `valid` marks a slot dead; it does not
-  protect it from `write`'s `pop(0)`. If `memory_capacity` were below the slots written
-  per example, a long batchmate's writes would evict a *short* row's real context — the
-  same coupling at the same magnitude (1.43 vs the unfixed 1.39). The real headroom is
-  **2×, not the 4–8× the capacity ratio suggests**: `forward_dialogue` writes context
-  **plus** SELF, up to `2 × max_chunks_per_doc` slots per example — so `small` (the
-  recommended preset) has exactly 2.0× margin. **Now enforced**: `train_dialogue` refuses
-  to start when `memory_capacity < 2 × max_chunks_per_doc`, so this is a checked
-  precondition rather than a config invariant nothing verified.
+**Two hazards the mask alone does not close** — both are now enforced elsewhere rather
+than relied upon:
+- **FIFO eviction is batch-coupled.** `valid` marks a slot dead; it does not protect it
+  from `write`'s `pop(0)`, and the pop is driven by the *batch's* write count. If
+  `memory_capacity` were below the slots written per example, a long batchmate's writes
+  would evict a *short* row's real context — the same coupling at the same magnitude
+  (1.43 vs the unfixed 1.39). Masking cannot fix that. The real headroom is **2×, not
+  the 4–8× the capacity ratio suggests**: `forward_dialogue` writes context **plus**
+  SELF, up to `2 × max_chunks_per_doc` slots per example. Both 512-d-class presets sit
+  at exactly **2.0×** — `small-w3` (what the A→E run actually uses, `TRAINING.md` §3)
+  and `small`; the rest have 2.7–4×. **Now enforced**: `train_dialogue` refuses to start
+  when `memory_capacity < 2 × max_chunks_per_doc`, so this is a checked precondition
+  rather than a config invariant nothing verified.
 - **`filtered_stacked` cannot express validity.** Its return has no per-row mask, so a
   masked slot would be handed back intact for every row. Its only callers are A→E (whose
   banks never carry validity) — **now enforced**: it raises `NotImplementedError` on a

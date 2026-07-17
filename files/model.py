@@ -52,7 +52,7 @@ from talker import Talker
 from ema_target import ChunkEncoder, EMATargetEncoder
 from losses import (scaled_cosine_loss, grounded_nll_loss, ponder_cost_loss,
                     variance_regularization, anti_sycophancy_loss,
-                    supervised_halt_loss)
+                    supervised_halt_loss, turn_end_loss, turn_end_accuracy)
 
 USER, SELF, SYSTEM = 0, 1, 2  # role-tag ids, matching config.role_tags order
 # RETRIEVED (3) is the latent-RAG provenance tag (§Q3). It is only usable when
@@ -687,11 +687,42 @@ class LatentThoughtModel(nn.Module):
             n += 1
         return n
 
+    @staticmethod
+    def _turn_end_labels(resp_mask: torch.Tensor):
+        """Turn-end labels + a trustworthiness mask, both derived from `resp_mask`
+        alone (STAGE_F.md §2.1). No data-format change: the label is already in the
+        SFT batch, it was just being discarded.
+
+        For the thought h_t formed after ingesting response chunk t:
+          target_t = 1  iff chunk t is real AND there is no chunk t+1
+          valid_t  = chunk t is real, MINUS the truncation confound below.
+
+        THE TRUNCATION CONFOUND. `chunker.chunk_batch` caps a response at M =
+        max_chunks_per_doc, so a row whose mask is all-True either ended exactly
+        at M or was cut off at M -- indistinguishable here. Its FINAL position's
+        "the turn ends here" label is therefore unknown, so it is masked out.
+        Every earlier position's label ("a chunk follows" = 0) is correct whether
+        or not the row was truncated, so those are kept: only the one ambiguous
+        label per filled row is dropped. Without this the head would learn "turns
+        end after exactly M chunks" from the truncation artifact.
+
+        Returns (target (B, M) float, valid (B, M) bool).
+        """
+        B, M = resp_mask.shape
+        nxt = torch.cat(
+            [resp_mask[:, 1:], torch.zeros(B, 1, dtype=resp_mask.dtype, device=resp_mask.device)],
+            dim=1)                                          # "is there a chunk t+1"
+        target = (resp_mask & ~nxt).float()                 # last real chunk -> end
+        filled = resp_mask.all(dim=1, keepdim=True)         # (B,1) used every slot -> maybe truncated
+        valid = resp_mask & ~(target.bool() & filled)       # drop only the ambiguous final label
+        return target, valid
+
     def forward_dialogue(self, resp_chunks: torch.Tensor, resp_mask: torch.Tensor,
                          user_ids: torch.Tensor, user_mask: torch.Tensor,
                          ema: EMATargetEncoder, response_seed: torch.Tensor, stage,
                          context_chunks=None, context_mask=None, context_roles=None,
-                         context_personas=None, var_weight: float = 0.0, chunk_vecs=None):
+                         context_personas=None, var_weight: float = 0.0, chunk_vecs=None,
+                         end_head=None, end_grad: bool = False):
         """
         Stage-F supervised fine-tuning in latent space (§4, §5 stage F). One
         example is (user turn -> assistant response); the model learns to
@@ -717,8 +748,19 @@ class LatentThoughtModel(nn.Module):
           gen:  Talker(pred_head(h_{t-1})) -> z_t's TRUE tokens   # decode the prediction
         Teacher-forced: the loop always ingests the TRUE previous chunk z_{t-1}.
 
-        Returns a dict of UNWEIGHTED scalar tensors {cos, gen, var, ponder}; the
-        driver (train_dialogue.py) applies the StageFConfig weights and adds the
+        TURN-END (§2.1), active only when `end_head` is passed: after ingesting
+        chunk t and forming h_t, the head predicts "the turn ends here" against a
+        label read straight off `resp_mask` (see _turn_end_labels). This is the
+        one thing the A-E objective cannot supply -- PAD ends a CHUNK (§19.2),
+        nothing ends a TURN -- and it is what lets DialogueSession.reply stop on
+        its own instead of emitting a caller-supplied constant number of chunks.
+        `end_grad=False` (default) reads a DETACHED h_t, so the BCE trains only
+        the head and never reshapes the reasoning -- the `forward_self_supervised_halt`
+        convention. `end_grad=True` lets it shape the thought (the A/B).
+
+        Returns a dict of UNWEIGHTED scalar tensors {cos, gen, var, ponder}, plus
+        {end, end_acc, end_n} when `end_head` is given; the driver
+        (train_dialogue.py) applies the StageFConfig weights and adds the
         always-on reconstruction anchor separately.
         """
         B, M, L = resp_chunks.shape
@@ -755,6 +797,11 @@ class LatentThoughtModel(nn.Module):
         preds, targets = [], []
         gen_sum = torch.zeros((), device=device)
         gen_tok = torch.zeros((), device=device)
+        # Turn-end: labels come from resp_mask alone; collected per t and reduced
+        # once after the loop (see _turn_end_labels for the truncation masking).
+        end_target_all, end_valid_all = (self._turn_end_labels(resp_mask)
+                                         if end_head is not None else (None, None))
+        end_logits, end_targets, end_valids = [], [], []
         for t in range(M):
             active = resp_mask[:, t]
             if not active.any():          # trailing pad columns (chunks are left-packed)
@@ -784,6 +831,16 @@ class LatentThoughtModel(nn.Module):
             memory.write(write_vec.detach() if stage.detach_memory else write_vec, SELF, self_persona)
             memory.apply_grad_truncation(stage.memory_grad_window)
             prev_thought = h
+            # Turn-end: `h` here is the thought formed AFTER ingesting chunk t --
+            # precisely the state DialogueSession.reply holds when it must decide
+            # whether to emit another chunk, so train and serve read the SAME
+            # tensor off the SAME head. Detached by default: the BCE trains the
+            # head only, never the reasoning (the halt-gate convention).
+            if end_head is not None:
+                h_end = h if end_grad else h.detach()
+                end_logits.append(end_head(h_end[active]).squeeze(-1))
+                end_targets.append(end_target_all[:, t][active])
+                end_valids.append(end_valid_all[:, t][active])
 
         cos = (scaled_cosine_loss(torch.cat(preds, 0), torch.cat(targets, 0),
                                   k=self.cfg.cosine_loss_k)
@@ -796,7 +853,19 @@ class LatentThoughtModel(nn.Module):
         # all four terms are returned RAW and the driver applies StageFConfig
         # weights uniformly. `ponder` is the mean per-loop ponder cost.
         ponder = total_ponder / max(n_loops, 1)
-        return {"cos": cos, "gen": gen, "var": var, "ponder": ponder}
+        out = {"cos": cos, "gen": gen, "var": var, "ponder": ponder}
+        if end_head is not None:
+            if end_logits:
+                el = torch.cat(end_logits, 0)
+                et = torch.cat(end_targets, 0)
+                ev = torch.cat(end_valids, 0)
+            else:                          # no real response chunks in the batch
+                el = torch.zeros(0, device=device)
+                et = torch.zeros(0, device=device)
+                ev = torch.zeros(0, dtype=torch.bool, device=device)
+            out["end"], out["end_n"] = turn_end_loss(el, et, ev)
+            out["end_acc"] = turn_end_accuracy(el, et, ev)
+        return out
 
     def _premise_gestalt(self, premise_chunks: torch.Tensor, premise_mask: torch.Tensor):
         """Compress a chunked premise into one gestalt vector (masked mean of the

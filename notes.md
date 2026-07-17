@@ -671,6 +671,19 @@ re-validate anti-collapse at width before turning any on.
 - **ACT halting doesn't learn** (soft ponder cost, no compute-vs-quality gradient) — needs either a
   real ACT accumulator or the simpler TRM-style supervised halt gate (see `experiments.md` #2).
 - **Stage F** (two-lane dialogue, anti-sycophancy loss) is designed but not exercised.
+- **Turn-end gate (2026-07-16, Stage-F only, off by default).** Audited termination and
+  found the model had no end-of-*turn* at all: PAD ends a chunk (§19.2), nothing ended a
+  reply, and `DialogueSession.reply`'s only exit was dead code (`_decode_chunk` bans PAD at
+  position 0, so `if not ids` never fires). Added a learned gate on `DialogueAdapter`
+  (`STAGE_F.md` §2.1) — label read free off `resp_mask`, no data-format change, the
+  truncation-ambiguous final label of a filled row masked out. Safe for the in-flight run by
+  construction *and* by measurement: A→E `forward_grounded`/`forward_self_supervised` are
+  **byte-identical** (losses + every per-param grad norm, float64), and `end_weight=0`
+  reproduces pre-change Stage F byte-identically. **Not validated:** the detached head
+  learns only weakly at smoke scale (BCE 0.455 vs the 0.598 base-rate entropy — real but
+  thin) and `end_acc` never leaves the base rate; same failure shape as the halt gate. Try
+  `--end-grad` first on real data. Document-level end-of-text is deliberately NOT done —
+  the label is truncation-poisoned at `max_chunks_per_doc`; see `experiments.md` #5.
 - **`--amp`** validated only on synthetic tensors; run `rocm_smoke.py` on the GPU box first
   (now 6 checks — it must end `PASS`, incl. the eval-mode monitoring path added in the
   2026-07-10 pre-flight review and the gradient-finiteness gates on the SSL/ACT backwards
@@ -681,6 +694,29 @@ re-validate anti-collapse at width before turning any on.
   corrupted fallback chunks. **Now enforced** (2026-07-13): `data.CachedChunkDataset` refuses
   any cache not stamped `chunker_version == CHUNKER_VERSION` (currently 3), so a stale cache
   can't be trained by mistake — re-prep, or `LATENT_ALLOW_STALE_CHUNKER=1` to override.
+
+## Eval-tooling dry-run (2026-07-16)
+
+Exercised the whole post-run eval path CPU-only against `runs/model.pt`, before the A→E
+run lands, so nothing is discovered on results day. `generate.py --score` / generate,
+`chat_core` (both testers), and `plot_metrics.py` are green.
+
+- **`lm_eval` is NOT installed** — the ARC-C path needs `pip install lm_eval`. Nothing
+  warns you; the adapter's core is deliberately dependency-free, so only the harness
+  wrapper needs it.
+- **The `lm_eval_adapter` self-test had been failing since `999b6d3b`.** That review
+  correctly changed a zero-chunk continuation's score from `0.0` to a large-negative
+  sentinel (0.0 is the *maximum* log-likelihood and would win every multiple-choice
+  ranking) but left the self-test asserting the old `0.0` contract. Repaired the test,
+  not the scorer, and it now asserts the *property* — a zero-chunk continuation must rank
+  below every real one and cannot be `is_greedy` — so it will not rot again if the
+  sentinel changes.
+- **ARC-C is this adapter's documented worst case.** Its own module docstring: multiple
+  choice whose options differ by a token is "the least reliable use of this adapter";
+  cloze/continuation tasks (LAMBADA, HellaSwag) "sit much better on the chunking". The
+  model has no token-level conditional logprob, so scoring granularity is the chunk and a
+  short option is a single `pred_head`→Talker decode. At `small` scale ARC-C will also sit
+  near chance. If a headline benchmark is wanted, LAMBADA/HellaSwag is the honest choice.
 
 ## Post-run experiments
 

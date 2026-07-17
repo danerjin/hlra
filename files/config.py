@@ -425,6 +425,13 @@ class StageFConfig:
                             generation decodes from pred_head's off-distribution
                             latent, and only this closes that gap.
       * syco_weight      -- the anti-sycophancy contrastive term (§4.3, Layer 3).
+      * end_weight       -- the learned TURN-end BCE (§2.1). OFF by default (0.0)
+                            like every other unvalidated addition here, but it is
+                            the one term a SERVED chatbot needs: without it
+                            DialogueSession.reply emits a caller-supplied constant
+                            number of chunks and cannot end its own turn (PAD ends
+                            a CHUNK, §19.2; nothing ends a TURN). Turn it on for
+                            any run whose output you intend to actually talk to.
     """
     lr: float = 5e-5                  # lower than A-E: a fine-tune off a trained init
     weight_decay: float = 0.01
@@ -438,6 +445,11 @@ class StageFConfig:
     ponder_weight: float = 0.01       # = ModelConfig.act_ponder_cost
     syco_weight: float = 0.5
     syco_agree_weight: float = 1.0
+    # --- learned turn-end (§2.1) ---
+    end_weight: float = 0.0           # 0 = OFF (byte-identical Stage F); >0 trains the gate
+    end_grad: bool = False            # False = BCE trains the head only (halt-gate convention);
+                                      # True lets it shape the thought (the A/B)
+    end_threshold: float = 0.5        # serve-time P(end) above which reply() stops
     syco_every: int = 4               # run a contrastive step every N dialogue steps (0 = off)
     trust_prior_weight: float = 0.1   # explicit provenance prior on the gate (review #2 opt.3); used only when --trust-prior is passed
     trust_prior_margin: float = 0.1   # push trust(USER) at least this far below trust(SELF)

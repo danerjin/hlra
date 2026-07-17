@@ -53,6 +53,77 @@ gen :  Talker(rescale(pred_head(h_{t-1}))) -> z_t's TRUE tokens   # decode the p
   compressing the user turn into a thought) lives in `dialogue.DialogueAdapter`,
   deliberately OUT of the base model so the A→E `state_dict` stays byte-identical.
 
+## 2.1 The learned turn-end (`end_head`, `losses.turn_end_loss`)
+
+**The gap.** PAD is a *trained* end-of-**chunk** stop — `model._talker_target_mask`
+supervises every real token plus the first PAD of a shorter-than-max chunk (§19.2),
+and `dialogue._decode_chunk` breaks on it. Nothing was the end of a **turn**. There
+is no EOS token anywhere in the model, and `DialogueSession.reply` looped
+`for _ in range(max_chunks)` with no reachable exit (its `if not ids: break` is dead
+code — `_decode_chunk` bans PAD at position 0, so it always returns ≥ 1 id). A
+chatbot that cannot stop talking emits exactly `max_chunks` chunks every turn,
+whether the answer finished at chunk 2 or was still going at chunk 6.
+
+**The objective.** After the loop ingests response chunk *t* and forms the thought
+`h_t`, a head predicts *the turn ends here*:
+
+```
+end:  sigmoid(end_head(h_t))  ~  1[ chunk t is the last chunk of the response ]
+```
+
+`h_t` is **the same tensor** `reply()` holds when it must decide whether to emit
+another chunk, read through **the same head** — so train and serve agree by
+construction rather than by convention.
+
+**The label is free, and was being discarded.** It is already in the SFT batch:
+`resp_mask[:, t+1]` says whether a chunk *t+1* exists. So there is **no data-format
+change** — `tensorize_sft` / `collate_sft` are untouched.
+
+**The truncation confound (`model._turn_end_labels`).** The free label is not
+unconditionally correct. `chunker.chunk_batch` caps a response at
+`M = max_chunks_per_doc`, so a row that fills all *M* slots either ended exactly at
+*M* or was cut off at *M* — indistinguishable. Its final "the turn ends here" label
+is therefore **unknown, not True**; trained on naively it teaches *every turn ends
+after exactly M chunks*. Only that one ambiguous label per filled row is masked out;
+every earlier "a chunk follows" label is correct either way and is kept. `end_n` in
+the log is how many labels survived, so an over-masked batch is visible.
+
+**Where it lives.** `end_head` is in `dialogue.DialogueAdapter`, next to
+`response_seed` and for the same reason: the A→E `state_dict` stays **byte-identical**,
+so an A→E checkpoint still loads strict. Verified: `forward_grounded` /
+`forward_self_supervised` are bit-for-bit unchanged (losses + every per-parameter
+grad norm, float64), and `end_weight=0` reproduces pre-change Stage F bit-for-bit.
+
+**Gradient routing.** `end_grad=False` (default) reads a **detached** `h_t`, so the
+BCE trains only the head and never reshapes the reasoning — the
+`forward_self_supervised_halt` convention. Verified: with it off the loop and encoder
+receive **exactly zero** gradient from this term; with `--end-grad` it reaches both.
+
+**Serving.** `max_chunks` becomes a *cap*, not the reply length. An untrained head is
+a constant P(end) ≈ 0.018 (bias init −4.0), so it effectively never fires and an
+untrained adapter degrades to the old fixed-length behavior;
+`reply(use_end_head=False)` restores it exactly.
+
+```bash
+python train_dialogue.py --ckpt runs/scaled/model.pt --multi-turn --end-weight 0.5
+python train_dialogue.py ... --end-weight 0.5 --end-grad      # the A/B (see limits)
+```
+
+**Honest limits — read before trusting it.** Turning this on does *not* mean the gate
+works:
+- **Unvalidated on real dialogue.** Smoke-scale only.
+- **The detached head learns only weakly.** On a smoke overfit batch where the end is
+  *deliberately inferable* from content, the BCE beats the base-rate entropy (0.455 vs
+  0.598 — a constant head cannot), so the plumbing extracts real signal. But the margin
+  is small and `end_acc` never left the base rate. **This is the same failure shape as
+  the halt gate** (which degenerated to a constant P(halt) ≈ 0.95): a detached head can
+  only read what `cos`/`gen` already put in `h_t`, and nothing forces them to encode
+  "I am done". If the gate will not move on real data, **try `--end-grad` first**.
+- **`end_acc` is imbalance-blind** — one "end" per turn, so an always-continue head
+  scores ≈ 1 − 1/M (0.714 on the smoke batch). Read it *with* the BCE, never alone.
+  This is the `antisycophancy_trust_gate_note.md` #1 lesson applied up front: the
+  metric exists so "is it working?" is observable rather than hoped.
+
 ## 3. Anti-sycophancy (`forward_anti_sycophancy` + `losses.anti_sycophancy_loss`)
 
 Two user turns that differ ONLY in an asserted premise (asserts X vs. not-X); the
@@ -134,8 +205,9 @@ python train_dialogue.py --ckpt runs/scaled/model.pt --multi-turn \
 Flags: `--multi-turn` (role+persona-tagged aged context), `--soft-tags`,
 `--content-tags` (implies soft), `--trust-gate`, `--vector-gate`, `--persona`,
 `--gestalt-readout`, `--rag` (adds RETRIEVED; `_reconcile_role_tables` pads a
-3-role checkpoint into the 4-role model). Loss weights live in
-`config.StageFConfig`.
+3-role checkpoint into the 4-role model), `--end-weight` / `--end-grad` (the
+learned turn-end, §2.1 — **off by default; a served chatbot needs it**). Loss
+weights live in `config.StageFConfig`.
 
 ## 8. Evaluation (`lm_eval_adapter.py`)
 
@@ -148,6 +220,10 @@ MMLU-style continuations are the degenerate worst case; LAMBADA/cloze map best.
 ## 9. Honest limits
 
 - **Unvalidated** — smoke-only on synthetic data; no real dialogue run.
+- **The turn-end gate is OFF by default** (`end_weight=0`) and, when on, is
+  unvalidated on real dialogue — the detached head learns only weakly at smoke scale
+  and may need `--end-grad`. See §2.1's honest limits. With it off the model **cannot
+  end its own turn** at all; `train_dialogue.py` says so on every run.
 - **Behavioral separation (Layer 3) is not yet trained.** The 2026-07-14 review found the
   anti-sycophancy loss routes correctly but does not actually move the trust gate — SGD
   reduces it via the response seed / encoder instead, and the scalar gate is self-defeating

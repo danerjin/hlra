@@ -138,6 +138,40 @@ extra graph memory (pre-cut step graphs are freed as carried states detach).
   compute savings (currently they build then free their graphs).
 - **Watch:** wall-clock cost per step; the workload is launch-overhead-bound on MPS/ROCm.
 
+### 5. Document-level end-of-text (the A→E half of the turn-end)
+
+Found 2026-07-16 while auditing termination. **The Stage-F half of this shipped**
+(`STAGE_F.md` §2.1: a learned turn-end head on `DialogueAdapter`, off by default) —
+Stage F had not started, so it was free to change. **This entry is the A→E half,
+which is post-run by the usual rule.**
+
+The model has a trained end-of-**chunk** stop (PAD, §19.2) and now a Stage-F
+end-of-**turn** gate, but still no end-of-**document**: there is no EOS token
+anywhere, and `generate.generate` emits a caller-supplied `n_chunks` with no break.
+For A→E pretraining this is mostly benign — the objective is next-chunk latent
+prediction and docs truncate at `max_chunks_per_doc` regardless — so it is not a
+defect in the run, just a missing capability.
+
+- **Change:** mirror the Stage-F head at document level — a binary "no chunk
+  follows" head off `h_t` in `forward_self_supervised`, supervised from the chunk
+  mask (`chunk_mask[:, t+1]`), and a `break` in `generate.generate`.
+- **The blocker, and it is the whole difficulty:** the A→E label is *far* noisier
+  than Stage F's. `max_chunks_per_doc` is 12 and real documents are much longer, so
+  "no chunk t+1" overwhelmingly means *we hit the cap*, not *the document ended* —
+  the truncation case is the common case here, the reverse of dialogue, where
+  responses are short and usually end naturally. Masking every filled row (what
+  `model._turn_end_labels` does for Stage F) would mask nearly the whole corpus.
+  `data_prep` would have to **record whether each doc was truncated** at prep time
+  and carry that flag through the shard cache — a cache-format change, hence a
+  `CHUNKER_VERSION`/manifest bump and a full re-prep.
+- **Cheaper alternative:** don't do it in A→E at all. End-of-document only matters
+  for free-running generation, which is a serving concern, and Stage F already
+  covers the serving case. Consider this rejected-by-default unless a document-level
+  generation demo needs it.
+- **Compare on:** whether the Stage-F gate actually trains first (§2.1's honest
+  limits). If a *detached* head cannot learn "I am done" on clean dialogue labels,
+  it certainly will not on truncation-poisoned document labels.
+
 ## Rejected (don't transfer)
 
 - **Tiny 2-layer network / aggressive downsizing** — small-data regularization; our regime

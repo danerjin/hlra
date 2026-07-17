@@ -108,6 +108,15 @@ def main(argv=None) -> int:
                         "latent_cos = cosine(predicted latent, true chunk "
                         "encoding), the model-native ranking score for "
                         "multiple-choice acc (not for perplexity).")
+    p.add_argument("--arc-templater", default="deterministic",
+                   choices=("deterministic", "ollama"),
+                   help="backend for the opt-in `arc_challenge_statement` task, "
+                        "which rewrites each option into a full sentence. "
+                        "deterministic (default) = rule-based, no LLM. "
+                        "ollama = temp-0 LLM rewrite, cached to disk. Only used "
+                        "when arc_challenge_statement is among --tasks.")
+    p.add_argument("--arc-templater-model", default="phi3",
+                   help="ollama model tag for --arc-templater ollama (default: phi3)")
     p.add_argument("--limit", type=int, default=None,
                    help="cap examples per task (omit for the full task; "
                         "use e.g. 200 for a fast dry-run)")
@@ -127,9 +136,21 @@ def main(argv=None) -> int:
         return 2
 
     from lm_eval import simple_evaluate
+    from lm_eval.tasks import TaskManager
     from lm_eval.utils import make_table
 
     tasks = _expand_tasks(args.tasks)
+
+    # Register the custom task dir (arc_challenge_statement) and pass the
+    # templater config to arc_templater.process_docs via the environment (the
+    # lm-eval `!function` hook takes no args). Only matters if the statement task
+    # is requested, but it is harmless to set unconditionally.
+    tasks_dir = os.path.join(_HERE, "tasks")
+    os.environ["ARC_TEMPLATER_BACKEND"] = args.arc_templater
+    os.environ["ARC_TEMPLATER_MODEL"] = args.arc_templater_model
+    if args.limit is not None:
+        os.environ["ARC_TEMPLATER_LIMIT"] = str(args.limit)   # keep dry-runs cheap
+    task_manager = TaskManager(include_path=tasks_dir)
     print(f"[run_lm_eval] ckpt={args.ckpt}  tasks={tasks}  "
           f"score_mode={args.score_mode}  limit={args.limit}  device=cpu", flush=True)
 
@@ -153,6 +174,7 @@ def main(argv=None) -> int:
         limit=args.limit,
         num_fewshot=args.num_fewshot,
         bootstrap_iters=0,   # stderr via bootstrap is meaningless at chunk granularity
+        task_manager=task_manager,
     )
 
     print("\n" + make_table(res))

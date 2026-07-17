@@ -158,6 +158,16 @@ StoryCloze/ROCStories also fits well but needs a manual (gated) dataset download
 suite. Scoring runs on **CPU** (the shared inference path is CPU-only); datasets are fetched from the
 HF Hub on first run.
 
+**Opt-in ARC "statement" variant** (`--tasks arc_challenge_statement`) rewrites each answer option
+into a full declarative sentence — a longer, more differentiated span than ARC-C's short phrases —
+via `files/tasks/arc_templater.py`. `--arc-templater deterministic` (default) is a reproducible
+rule-based template; `--arc-templater ollama` (with `--arc-templater-model`) is a temp-0 LLM rewrite,
+cached to disk and guarded against content drift (a rewrite that drops the option's meaning falls back
+to the verbatim template). It is a **distinct, clearly-labelled** task, never a substitute for standard
+`arc_challenge` — report it as "ARC-C (statement-rewritten)". See the module docstring for the honest
+limits (a small local model + the faithfulness guard tend to collapse back to the deterministic
+template; the robust design slots the verbatim option into an LLM-declarativized stem).
+
 ## Status and honest limits
 
 - **Verified at smoke and `small` (512-d) scale**, on offline synthetic and real gpt2 text: full A→E

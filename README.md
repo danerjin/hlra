@@ -132,13 +132,15 @@ doc §1.1.
 - **`ssl_loss_weight`** (co-equal with reconstruction) is validated collapse-free but may want tuning
   at full scale.
 - **Stage F** (two-lane dialogue, anti-sycophancy loss) is designed but not yet exercised.
-- **Termination:** end-of-**chunk** is properly trained (PAD is a supervised stop, §19.2 —
-  measured: only ~0.9% of real-text chunks hit the length cap and so go unsupervised).
-  End-of-**turn** is a Stage-F head (`--end-weight`, **off by default**, unvalidated — see
-  `STAGE_F.md` §2.1). End-of-**document** does *not* exist: there is no EOS token and
-  `generate.py` emits a caller-supplied chunk count. Benign for A→E (the objective is
-  next-chunk prediction and docs truncate at `max_chunks_per_doc` anyway); it matters only
-  for free-running generation. See `experiments.md` #5.
+- **Termination:** end-of-**chunk** is properly trained (PAD is a supervised stop, §19.2).
+  A chunk that exactly fills `max_chunk_len` has no PAD slot and so goes unsupervised, but
+  that is rare: **0.42%** (123 of 29,568 chunks over 1401 real documents at
+  `max_chunk_len=64`; mean chunk length 19.9). End-of-**turn** is a Stage-F head
+  (`--end-weight`, **off by default**; the plumbing runs but there is *no evidence yet* it
+  learns — see `STAGE_F.md` §2.1). End-of-**document** does *not* exist: there is no EOS
+  token and `generate.py` emits a caller-supplied chunk count. Benign for A→E (the
+  objective is next-chunk prediction and docs truncate at `max_chunks_per_doc` anyway); it
+  matters only for free-running generation. See `experiments.md` #5.
 - The `--amp` path is implemented; sanity-check it on the first CUDA run (`rocm_smoke.py`,
   6 checks covering the training-mode and eval-mode/monitoring paths — it must end `PASS`).
 - A 2026-07-10 pre-flight review (gradient-routing audit, truncation severance, A→E walk,

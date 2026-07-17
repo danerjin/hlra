@@ -67,7 +67,16 @@ class DialogueAdapter(nn.Module):
     def __init__(self, d_latent: int):
         super().__init__()
         self.response_seed = nn.Parameter(torch.zeros(d_latent))
-        self.end_head = nn.Linear(d_latent, 1)
+        # `skip_init`, NOT a plain nn.Linear(...). nn.Linear.__init__ runs
+        # reset_parameters(), which CONSUMES global RNG draws -- and the zeros_/
+        # constant_ below fix the head's VALUES without rewinding the STREAM. So
+        # merely constructing this head shifted every subsequent random draw:
+        # with dropout live (cfg.dropout=0.1) that changes every Stage-F dropout
+        # mask, and a run with the gate OFF no longer reproduced a pre-gate run
+        # (measured: 130/137 base tensors differed after 3 steps at end_weight=0).
+        # This head is fully determined and needs no randomness at all, so skip
+        # the draw entirely -- unlike get/set_rng_state this holds on any device.
+        self.end_head = torch.nn.utils.skip_init(nn.Linear, d_latent, 1)
         nn.init.zeros_(self.end_head.weight)
         nn.init.constant_(self.end_head.bias, _END_BIAS_INIT)
 
@@ -129,15 +138,24 @@ class DialogueSession:
         sess = DialogueSession(model, adapter, chunker, cfg)
         print(sess.reply("Hello, who are you?"))
         print(sess.reply("What did I just ask?"))   # can recall via aged USER gestalt
+
+    `use_end_head` defaults to **False**: the turn-end gate is used only when the
+    caller knows it was trained. An UNTRAINED gate is not inert -- sigmoid(-4.0)
+    = 0.018 is a PER-CHUNK fire rate, i.e. ~10% of 6-chunk replies (and ~20% of
+    12-chunk ones) would stop early for no reason. Defaulting it on would silently
+    truncate replies from any A-E or end_weight=0 checkpoint, a regression the
+    gate is supposed to prevent, not cause. `chat_core.load_dialogue_checkpoint`
+    reads `end_gate_trained` off the checkpoint and turns it on when it is real.
     """
 
     def __init__(self, model, adapter: DialogueAdapter, chunker, cfg,
-                 use_act: bool = True):
+                 use_act: bool = True, use_end_head: bool = False):
         self.model = model
         self.adapter = adapter
         self.chunker = chunker
         self.cfg = cfg
         self.use_act = use_act
+        self.use_end_head = use_end_head
         self.device = next(model.parameters()).device
         self.memory = GestaltMemoryBank(cfg.memory_capacity, cfg.d_latent)
         self.source_memory = None   # set by add_source(): RETRIEVED gestalts for decode-time grounding
@@ -154,15 +172,20 @@ class DialogueSession:
     def reply(self, user_text: str, max_chunks: int = 6,
               temperature: float = 0.9, greedy: bool = False,
               separator: str = " ", end_threshold: float = 0.5,
-              use_end_head: bool = True) -> str:
+              use_end_head: bool = None) -> str:
         """Generate one assistant turn.
 
-        `max_chunks` is a HARD CAP, not the reply length: with a trained end head
+        `max_chunks` is a HARD CAP, not the reply length: with a TRAINED end head
         (StageFConfig.end_weight > 0) the reply stops when P(end) > `end_threshold`.
-        With an untrained head the gate is a constant P ~= 0.018 (see
-        _END_BIAS_INIT) so it effectively never fires and this degrades to the
-        old fixed-length behavior. `use_end_head=False` restores that exactly.
+
+        `use_end_head=None` (default) inherits the session's setting, which is off
+        unless the checkpoint says the gate was trained. Do NOT turn it on for an
+        untrained gate: sigmoid(-4.0)=0.018 is a per-CHUNK rate, so ~10% of
+        6-chunk replies would stop early at random. Off => exactly the pre-gate
+        fixed-length behavior.
         """
+        if use_end_head is None:
+            use_end_head = self.use_end_head
         model, cfg = self.model, self.cfg
         model.eval()
         # 1. Current user turn -> input lane ONLY (raw tokens, read-only).

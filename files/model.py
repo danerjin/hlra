@@ -865,6 +865,15 @@ class LatentThoughtModel(nn.Module):
                 ev = torch.zeros(0, dtype=torch.bool, device=device)
             out["end"], out["end_n"] = turn_end_loss(el, et, ev)
             out["end_acc"] = turn_end_accuracy(el, et, ev)
+            # end_pos: surviving POSITIVE labels -- the only honest health metric.
+            # end_n counts negatives too, and for a FILLED row the truncation mask
+            # drops that row's single positive while keeping all its negatives. So a
+            # batch of long (M-filling) responses yields end_n=44 / positives=0:
+            # BCE -> 0.000, end_acc -> 1.000, end_n -> 44, every logged number
+            # "healthy" while the head learns "never end" -- the exact failure this
+            # objective exists to prevent, wearing a perfect scorecard. If end_pos is
+            # 0 the gate is not being trained, whatever the other numbers say.
+            out["end_pos"] = (et * ev.float()).sum()
         return out
 
     def _premise_gestalt(self, premise_chunks: torch.Tensor, premise_mask: torch.Tensor):

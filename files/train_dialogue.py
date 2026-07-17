@@ -288,9 +288,25 @@ def main():
     end_on = bool(sf.end_weight > 0)
     if end_on:
         print(f"[train_dialogue] turn-end gate ON (end_weight={sf.end_weight}, "
-              f"end_grad={sf.end_grad}): the reply learns to stop. Watch end_acc "
-              f"and end_n in the log -- end_n is how many turn-end labels the batch "
-              f"actually carried after truncation masking.", flush=True)
+              f"end_grad={sf.end_grad}): the reply learns to stop. WATCH `end_pos` "
+              f"in the log -- it is the only honest health metric. end_n counts "
+              f"negatives too, and a batch of long (M-filling) responses has its "
+              f"positives masked away: end_pos=0 means the gate is NOT training, "
+              f"however good end/end_acc look.", flush=True)
+        if flags.use_act:
+            # hrm_loop.py's ACT halt vote is a BATCH MEAN, so a row's loop depth is
+            # decided by its batchmates. Training runs B=batch_size; reply() runs
+            # B=1. The gate is then supervised on an h_t the server never computes,
+            # and the measured skew straddles the 0.5 decision threshold. Not
+            # introduced here (per-row halting is experiments.md #2), but the gate
+            # is the first thing that depends on train/serve h_t agreement.
+            print("[train_dialogue] WARNING: turn-end gate is ON with ACT ON. The "
+                  "ACT halt vote is a batch MEAN, so a row's loop depth depends on "
+                  "its batchmates; at serve time reply() runs B=1 and can take a "
+                  "different depth, making its h_t a different tensor from the one "
+                  "the gate was trained on. Until per-row halting lands "
+                  "(experiments.md #2), prefer ACT off for a Stage-F run whose "
+                  "reply must stop reliably.", flush=True)
     else:
         print("[train_dialogue] NOTE: turn-end gate OFF (end_weight=0). The model "
               "cannot end its own turn -- DialogueSession.reply will emit exactly "
@@ -373,18 +389,44 @@ def main():
     # Adam/EMA cold). Absent for an A-E-foundation start (resume is None).
     start_step = 0
     if resume is not None:
+        # A Stage-F checkpoint written BEFORE the turn-end gate has no
+        # `end_head.*` in its adapter state, and its optimizer state has two
+        # fewer params. Neither is an error -- it is just an older checkpoint --
+        # so load non-strictly and say exactly what happened. (A strict load
+        # raised "Missing key(s): end_head.weight, end_head.bias" and the
+        # optimizer raised a param-group size mismatch, 138 vs 140.)
+        pre_gate = False
         if resume["adapter_state"] is not None:
-            adapter.load_state_dict(resume["adapter_state"])
+            missing, unexpected = adapter.load_state_dict(resume["adapter_state"],
+                                                          strict=False)
+            pre_gate = any(k.startswith("end_head") for k in missing)
+            if pre_gate:
+                print("[train_dialogue] NOTE: this Stage-F checkpoint predates the "
+                      "turn-end gate (no end_head in its adapter state). The seed "
+                      "resumed; end_head starts from its untrained init.", flush=True)
+            other = [k for k in missing if not k.startswith("end_head")]
+            if other or unexpected:
+                raise SystemExit(f"[train_dialogue] adapter state mismatch beyond the "
+                                 f"turn-end gate -- missing={other} unexpected={list(unexpected)}")
         if resume["ema"] is not None:
             ema.load_state_dict(resume["ema"])
         if resume["optimizer"] is not None:
-            optimizer.load_state_dict(resume["optimizer"])
+            if pre_gate:
+                # The saved moments were built over a 2-params-smaller group, so
+                # load_state_dict would ValueError. Adam restarts cold for every
+                # param, not just the head -- say so rather than fail or hide it.
+                print("[train_dialogue] WARNING: optimizer state is from before the "
+                      "turn-end gate (param group grew by 2); starting Adam cold. "
+                      "Expect a brief loss bump.", flush=True)
+            else:
+                optimizer.load_state_dict(resume["optimizer"])
         start_step = resume["step"]
         print(f"[train_dialogue] resumed Stage-F state (response seed + EMA + "
               f"optimizer) from step {start_step}.")
 
     model.train()
     step, nonfinite_streak = start_step, 0
+    end_dry = 0                      # consecutive batches with zero turn-end positives
     out_dir = os.path.join(PROJECT, args.out)
     print(f"[train_dialogue] device={device} d_latent={cfg.d_latent} steps={sf.steps} "
           f"batch={sf.batch_size} lr={sf.lr}  (offline={args.offline})")
@@ -429,6 +471,19 @@ def main():
                     + sf.ponder_weight * dlg["ponder"])
             if end_on:
                 loss = loss + sf.end_weight * dlg["end"]
+                # A batch whose responses all fill max_chunks_per_doc has every
+                # positive masked away (only its final label says "end", and that
+                # is the ambiguous one). The BCE then trains "never end" on pure
+                # negatives while end/end_acc/end_n all look healthy. Count the
+                # dry batches and say so -- this failure is otherwise invisible.
+                end_dry = end_dry + 1 if int(dlg["end_pos"]) == 0 else 0
+                if end_dry == 50:
+                    print(f"[train_dialogue] WARNING: 50 consecutive batches with "
+                          f"end_pos=0 -- NO turn-end positives are surviving the "
+                          f"truncation mask, so the gate is learning 'never end' "
+                          f"regardless of what end/end_acc say. Your responses are "
+                          f"filling max_chunks_per_doc={cfg.max_chunks_per_doc}; "
+                          f"raise it, or use shorter-response data.", flush=True)
 
             syco_val = None
             if sf.syco_every and (step % sf.syco_every == 0):
@@ -483,10 +538,12 @@ def main():
                        + (f" syco={syco_val:.4f}" if syco_val is not None else "")
                        + (f" tprior={tp_val:.4f}" if tp_val is not None else "")
                        # end_acc is imbalanced (~1 'end' per turn): a head that
-                       # always says "continue" scores ~1-1/M. Read it WITH the
-                       # BCE, and with end_n (labels surviving truncation masking).
+                       # always says "continue" scores ~1-1/M, so it is never read
+                       # alone. end_pos (surviving POSITIVES) is the honest one --
+                       # at end_pos=0 the other two look perfect and mean nothing.
                        + (f" end={float(dlg['end']):.4f} end_acc={float(dlg['end_acc']):.3f}"
-                          f" end_n={int(dlg['end_n'])}" if end_on else ""))
+                          f" end_pos={int(dlg['end_pos'])}/{int(dlg['end_n'])}"
+                          if end_on else ""))
                 # Watch trust(USER) fall relative to trust(SELF) as anti-sycophancy trains.
                 reader = model.hrm_loop.memory_reader
                 trust = reader.trust_by_role(len(cfg.role_tags), device)
@@ -503,28 +560,36 @@ def main():
                                 f"std={float(u.std()):.3f}]")
                 (bar.write(msg) if bar is not None else print(msg, flush=True))
             if sf.checkpoint_every and step % sf.checkpoint_every == 0:
-                save(out_dir, "checkpoint.pt", model, adapter, ema, optimizer, cfg, step)
+                save(out_dir, "checkpoint.pt", model, adapter, ema, optimizer, cfg, step,
+                     end_gate_trained=end_on)
 
     if bar is not None:
         bar.close()
-    save(out_dir, "model.pt", model, adapter, ema, optimizer, cfg, step)
+    save(out_dir, "model.pt", model, adapter, ema, optimizer, cfg, step,
+         end_gate_trained=end_on)
     print(f"[train_dialogue] done. {step} steps -> {os.path.join(out_dir, 'model.pt')}")
 
 
-def save(out_dir, name, model, adapter, ema, optimizer, cfg, step):
+def save(out_dir, name, model, adapter, ema, optimizer, cfg, step, end_gate_trained=False):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, name)
     tmp = path + ".tmp"
     with open(tmp, "wb") as f:
         torch.save({
             "model_state": model.state_dict(),
-            "adapter_state": adapter.state_dict(),   # Stage-F params (response seed)
+            "adapter_state": adapter.state_dict(),   # Stage-F params (seed + end_head)
             "ema": ema.state_dict(),
             "optimizer": optimizer.state_dict(),
             "model_cfg": dataclasses.asdict(cfg),
             "vocab_size": cfg.vocab_size,
             "stage_reached": "F",
             "step": step,
+            # Whether the turn-end gate was actually TRAINED (end_weight > 0). The
+            # adapter always carries an end_head, so its presence proves nothing --
+            # and an untrained gate is NOT inert (P=0.018 per chunk => ~10% of
+            # 6-chunk replies stop early). Serving reads this to decide whether the
+            # gate may be used at all, instead of guessing from the weights.
+            "end_gate_trained": bool(end_gate_trained),
             "tokenizer_name": "gpt2", "chunker": "regex_gpt2",
         }, f)
         f.flush(); os.fsync(f.fileno())

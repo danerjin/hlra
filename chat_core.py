@@ -69,27 +69,47 @@ def load_dialogue_checkpoint(ckpt_path):
     model, chunker, cfg, ckpt = load_checkpoint(ckpt_path)
     adapter = DialogueAdapter(cfg.d_latent)
     if "adapter_state" in ckpt:
-        adapter.load_state_dict(ckpt["adapter_state"])
+        # Non-strict: a Stage-F checkpoint written before the turn-end gate has no
+        # `end_head.*` and would otherwise raise "Missing key(s)" here and refuse to
+        # serve at all. Missing end_head just means an untrained gate, which never
+        # fires (bias -4.0) -- i.e. the old fixed-length behavior. Anything else
+        # missing IS a real mismatch and must not pass silently.
+        missing, unexpected = adapter.load_state_dict(ckpt["adapter_state"], strict=False)
+        other = [k for k in missing if not k.startswith("end_head")]
+        if other or unexpected:
+            raise RuntimeError(f"adapter state mismatch: missing={other} "
+                               f"unexpected={list(unexpected)}")
+        if any(k.startswith("end_head") for k in missing):
+            print("[chat_core] NOTE: checkpoint predates the turn-end gate; replies "
+                  "will run to max_chunks.")
     adapter.eval()
     return model, adapter, chunker, cfg, ckpt
 
 
-def new_dialogue_session(model, adapter, chunker, cfg):
+def new_dialogue_session(model, adapter, chunker, cfg, ckpt=None):
     """A fresh DialogueSession (the full Stage-F two-lane serving: input lane +
-    response seed + cross-turn gestalt memory). One session = one conversation."""
+    response seed + cross-turn gestalt memory). One session = one conversation.
+
+    Pass the `ckpt` dict from load_dialogue_checkpoint to enable the turn-end gate
+    when -- and only when -- that checkpoint actually trained it. The gate is off
+    otherwise: an untrained end_head fires at P=0.018 per CHUNK (~10% of 6-chunk
+    replies), so switching it on blindly would truncate replies at random."""
     from dialogue import DialogueSession
-    return DialogueSession(model, adapter, chunker, cfg, use_act=True)
+    trained = bool((ckpt or {}).get("end_gate_trained", False))
+    return DialogueSession(model, adapter, chunker, cfg, use_act=True,
+                           use_end_head=trained)
 
 
 def dialogue_reply(session, text, n_chunks=6, temperature=0.9, greedy=False,
-                   use_end_head=True, end_threshold=0.5):
+                   use_end_head=None, end_threshold=0.5):
     """One chatbot turn through the persistent session (memory carries across
     calls). Returns (reply_chunks: list[str], read_chunks: list[str]).
 
-    `n_chunks` is a CAP: a checkpoint trained with StageFConfig.end_weight > 0
-    ends its own turn when P(end) > `end_threshold` (STAGE_F.md §2.1). An
-    untrained end head effectively never fires, so this degrades to exactly
-    n_chunks chunks -- the old behavior."""
+    `n_chunks` is a CAP. `use_end_head=None` inherits the session's setting, which
+    new_dialogue_session turns on only for a checkpoint whose `end_gate_trained`
+    flag is set; otherwise the reply runs to n_chunks exactly as before the gate
+    existed. Forcing it True on an untrained gate stops ~10% of 6-chunk replies at
+    random (P=0.018 per chunk) -- don't."""
     read = input_chunks(session.chunker, text)
     joined = session.reply(text, max_chunks=n_chunks, temperature=temperature,
                            greedy=greedy, separator=_SENT,

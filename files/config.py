@@ -446,10 +446,13 @@ class StageFConfig:
     syco_weight: float = 0.5
     syco_agree_weight: float = 1.0
     # --- learned turn-end (§2.1) ---
-    end_weight: float = 0.0           # 0 = OFF (byte-identical Stage F); >0 trains the gate
+    end_weight: float = 0.0           # 0 = OFF (Stage F as it was); >0 trains the gate
     end_grad: bool = False            # False = BCE trains the head only (halt-gate convention);
                                       # True lets it shape the thought (the A/B)
-    end_threshold: float = 0.5        # serve-time P(end) above which reply() stops
+    # NOTE: the serve-time P(end) threshold is deliberately NOT here. It is an
+    # argument of DialogueSession.reply / chat_core.dialogue_reply, because serving
+    # never constructs a StageFConfig (this is the TRAINING config). A field here
+    # would be dead: settable, silently ignored.
     syco_every: int = 4               # run a contrastive step every N dialogue steps (0 = off)
     trust_prior_weight: float = 0.1   # explicit provenance prior on the gate (review #2 opt.3); used only when --trust-prior is passed
     trust_prior_margin: float = 0.1   # push trust(USER) at least this far below trust(SELF)

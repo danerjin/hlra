@@ -143,8 +143,14 @@ def turn_end_loss(end_logits: torch.Tensor, end_target: torch.Tensor,
     non-final position ("a chunk follows" = 0) is correct either way and is kept.
 
     Returns (loss, n_supervised). Loss is the mask-mean BCE, 0.0 when nothing is
-    supervised (an all-truncated batch) -- with n_supervised so a caller can log
-    how much signal a batch actually carried.
+    supervised (an all-truncated batch).
+
+    `n_supervised` is NOT a health metric -- it counts negatives too. The masking
+    above drops a filled row's single POSITIVE while keeping all of its negatives,
+    so a batch of long responses can report a large n_supervised with zero
+    positives, and BCE/accuracy both look perfect while the head learns "never
+    end". `forward_dialogue` therefore also returns `end_pos` (surviving
+    positives), which is the number to watch.
     """
     m = supervise_mask.float()
     n = m.sum()

@@ -155,22 +155,32 @@ defect in the run, just a missing capability.
 - **Change:** mirror the Stage-F head at document level — a binary "no chunk
   follows" head off `h_t` in `forward_self_supervised`, supervised from the chunk
   mask (`chunk_mask[:, t+1]`), and a `break` in `generate.generate`.
-- **The blocker, and it is the whole difficulty:** the A→E label is *far* noisier
-  than Stage F's. `max_chunks_per_doc` is 12 and real documents are much longer, so
-  "no chunk t+1" overwhelmingly means *we hit the cap*, not *the document ended* —
-  the truncation case is the common case here, the reverse of dialogue, where
-  responses are short and usually end naturally. Masking every filled row (what
-  `model._turn_end_labels` does for Stage F) would mask nearly the whole corpus.
-  `data_prep` would have to **record whether each doc was truncated** at prep time
-  and carry that flag through the shard cache — a cache-format change, hence a
-  `CHUNKER_VERSION`/manifest bump and a full re-prep.
-- **Cheaper alternative:** don't do it in A→E at all. End-of-document only matters
-  for free-running generation, which is a serving concern, and Stage F already
-  covers the serving case. Consider this rejected-by-default unless a document-level
-  generation demo needs it.
-- **Compare on:** whether the Stage-F gate actually trains first (§2.1's honest
-  limits). If a *detached* head cannot learn "I am done" on clean dialogue labels,
-  it certainly will not on truncation-poisoned document labels.
+- **This entry originally claimed a truncation blocker. That claim was wrong and is
+  withdrawn** (2026-07-16 review). It asserted `max_chunks_per_doc` is 12 and that
+  truncation is therefore the common case, so masking filled rows "would mask nearly
+  the whole corpus." Every number in that was off:
+  - **12 is the `smoke` preset only.** The real presets are **32** (`small`,
+    `small-w3`, `base`) and 48 (`large`); the in-flight run is `small-w3` → 32.
+  - **Truncation is the minority case.** Measured on the repo's own real-text cache
+    (1401 docs at `max_chunks_per_doc=32`): **39.8%** of docs fill every slot, so
+    **60.2% end naturally**. (That 39.8% is an *upper bound*: the cache was built
+    with the pre-0711 chunker, whose tiny-chunk pathology inflates chunks/doc. The
+    v3 chunker makes fewer, larger chunks → fewer filled docs → more clean labels.)
+  - **Masking costs ~2%, not "nearly the whole corpus."** `_turn_end_labels` drops
+    one label per filled row, not the row: 557 of 29568 labels = **1.88% masked,
+    98.12% retained**, leaving ~844 clean document-end positives.
+  - **No cache change is needed.** `_turn_end_labels` reads `chunk_mask` alone, and
+    that is already in every shard. No truncation flag, no `CHUNKER_VERSION` bump, no
+    re-prep. (The sub-claim that truncation is not *currently recorded* is true — it
+    is just not load-bearing.)
+- **So this is feasible; it is a cost/benefit call, not a blocked one.** The honest
+  reasons to still not do it: end-of-document only matters for free-running
+  generation, which is a serving concern Stage F already covers; and it touches
+  `forward_self_supervised`, the most heavily validated function in the repo, for a
+  capability nothing currently needs. Post-run regardless.
+- **Compare on:** whether the Stage-F gate trains at all first (§2.1's honest
+  limits). There is currently **no evidence** the detached head extracts signal even
+  on clean dialogue labels — settle that before spending a re-validation here.
 
 ## Rejected (don't transfer)
 

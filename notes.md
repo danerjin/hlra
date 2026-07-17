@@ -679,11 +679,42 @@ re-validate anti-collapse at width before turning any on.
   truncation-ambiguous final label of a filled row masked out. Safe for the in-flight run by
   construction *and* by measurement: A→E `forward_grounded`/`forward_self_supervised` are
   **byte-identical** (losses + every per-param grad norm, float64), and `end_weight=0`
-  reproduces pre-change Stage F byte-identically. **Not validated:** the detached head
-  learns only weakly at smoke scale (BCE 0.455 vs the 0.598 base-rate entropy — real but
-  thin) and `end_acc` never leaves the base rate; same failure shape as the halt gate. Try
-  `--end-grad` first on real data. Document-level end-of-text is deliberately NOT done —
-  the label is truncation-poisoned at `max_chunks_per_doc`; see `experiments.md` #5.
+  reproduces pre-change Stage F byte-identically (**only after the `skip_init` fix** —
+  see the review below). **No evidence it works:** the "BCE 0.455 vs 0.598 base-rate
+  entropy = real signal" claim was WITHDRAWN — a null head on pure noise with random
+  labels scores 0.008 and beats the base rate 20/20, so beating `H(p)` on ~14 points in
+  192-d proves nothing (and 0.455 is *worse* than the null, i.e. underfit). Needs a
+  held-out split. Try `--end-grad` first on real data. Document-level end-of-text is not
+  done — but the "truncation-poisoned label" blocker was also wrong (real presets are 32,
+  not 12; masking costs 1.88% of labels, no cache change needed); see `experiments.md` #5.
+
+- **Turn-end review (2026-07-16, 3 independent adversarial audits) — the A→E claim held,
+  three of my own claims did not.** Audits: (1) A→E safety, (2) objective correctness,
+  (3) docs/claims honesty. **A→E survived** — a stronger probe than mine (3 real optimizer
+  steps with dropout live across A–E + the halt path + input lanes, over 5 arch configs
+  incl. `norm=rms`, full `modern`, `latent_mult=3`, `core_qk_norm`; 1471 lines) diffed
+  empty, and `forward_grounded`/`forward_self_supervised`/`forward_self_supervised_halt`
+  are textually identical via `inspect.getsource`. Refuted and fixed:
+  - **`nn.Linear.__init__` consumes global RNG**, so merely constructing `end_head` shifted
+    every later dropout mask: 130/137 base tensors differed after 3 Stage-F steps at
+    `end_weight=0`. Fixed with `torch.nn.utils.skip_init` (no draw on any device, unlike
+    CPU-only `get/set_rng_state`). A→E was never affected — it never builds the adapter.
+  - **`end_n` was a lying metric.** The truncation mask drops a filled row's *only
+    positive* and keeps all its negatives, so an all-filled batch reports `end_n=44`,
+    `positives=0`, BCE→0.000, `end_acc`→1.000 — a head that learned "never end" with a
+    perfect scorecard. Added `end_pos` + a 50-dry-batch warning.
+  - **A serving regression I introduced and then understated:** sigmoid(−4) = 0.018 is
+    *per chunk*, so an untrained gate stops ~10% of 6-chunk replies — and `reply()`
+    defaulted `use_end_head=True` without consulting `end_weight`. Now off unless the
+    checkpoint's new `end_gate_trained` flag says otherwise.
+  - **ACT's halt vote is a batch mean**, so train (B=batch) and serve (B=1) take different
+    loop depths: measured end-logit gap 1.36, straddling the 0.5 threshold at the final
+    chunk. Pre-existing (per-row halting is `experiments.md` #2) but the gate is the first
+    thing to depend on train/serve `h_t` agreement — `train_dialogue` now warns.
+  - Pre-gate Stage-F checkpoints could not resume *or serve* (strict load; optimizer group
+    138→140) — both sites now load non-strictly with a clear note.
+  - `StageFConfig.end_threshold` was dead config (serving never sees StageFConfig) —
+    removed rather than left settable-but-ignored.
 - **`--amp`** validated only on synthetic tensors; run `rocm_smoke.py` on the GPU box first
   (now 6 checks — it must end `PASS`, incl. the eval-mode monitoring path added in the
   2026-07-10 pre-flight review and the gradient-finiteness gates on the SSL/ACT backwards

@@ -5,8 +5,9 @@ Stage F turns the A→E foundation model into a **chatbot**. Everything here is
 to the validated A→E model (the `latent_mult=1`-style discipline), and no A→E
 code path (`forward_grounded` / `forward_self_supervised` / `trainer.py`) is
 touched. **Status: implemented and smoke-verified on offline synthetic data;
-NOT trained, NOT validated, uncommitted-review-only.** Nothing here has seen a
-real run.
+NOT trained, NOT validated.** Nothing here has seen a real run. (The old
+"uncommitted-review-only" tag was stale — this file has been committed since
+`703d6a9c`.)
 
 > The design rationale lives in `latent-thought-architecture.md` §4. This file is
 > the map of what got built and how to drive it.
@@ -71,9 +72,23 @@ whether the answer finished at chunk 2 or was still going at chunk 6.
 end:  sigmoid(end_head(h_t))  ~  1[ chunk t is the last chunk of the response ]
 ```
 
-`h_t` is **the same tensor** `reply()` holds when it must decide whether to emit
-another chunk, read through **the same head** — so train and serve agree by
-construction rather than by convention.
+`h_t` is read at the **same point in the loop** `reply()` reaches when it must
+decide whether to emit another chunk, through **the same head** — the head is read
+after the loop ingests chunk *t*, in both paths, and the alternative (predicting off
+the thought that *generated* chunk *t*) would answer a different question the
+generation loop cannot ask.
+
+**But "the same tensor" is only true with ACT OFF, and that is a real caveat.**
+`hrm_loop`'s ACT halt vote is a **batch mean**, so a row's loop depth is decided by
+its batchmates. Training runs `B = batch_size`; `reply()` runs `B = 1`. With ACT on
+(the Stage-F default) the gate is therefore supervised on an `h_t` the server does
+not reproduce — measured on a discriminative halting head, row 0's end logit moved
+1.36 between B=8 and B=1, and the two sides landed on **opposite sides of the 0.5
+threshold** (P(end) 0.574 training vs 0.258 serving) at exactly the final chunk, the
+only "end"-labelled thought. With ACT off the two agree to ~4e-06. This is not
+introduced by the gate — per-row halting is `experiments.md` #2 — but the gate is the
+first thing that depends on train/serve `h_t` agreement, so `train_dialogue.py` warns
+when both are on. Prefer ACT off for a Stage-F run whose reply must stop reliably.
 
 **The label is free, and was being discarded.** It is already in the SFT batch:
 `resp_mask[:, t+1]` says whether a chunk *t+1* exists. So there is **no data-format
@@ -85,8 +100,22 @@ unconditionally correct. `chunker.chunk_batch` caps a response at
 *M* or was cut off at *M* — indistinguishable. Its final "the turn ends here" label
 is therefore **unknown, not True**; trained on naively it teaches *every turn ends
 after exactly M chunks*. Only that one ambiguous label per filled row is masked out;
-every earlier "a chunk follows" label is correct either way and is kept. `end_n` in
-the log is how many labels survived, so an over-masked batch is visible.
+every earlier "a chunk follows" label is correct either way and is kept.
+
+**The masking deletes only POSITIVES, so watch `end_pos`, not `end_n`.** A filled
+row's single "end" label *is* the one dropped — every label it keeps is a "continue".
+So a batch of long, M-filling responses (the realistic long-SFT-answer regime) yields
+`end_n = 44` with **zero positives**: the BCE falls to 0.000, `end_acc` rises to
+1.000, `end_n` looks generous, and the head has learned **"never end"** — the exact
+failure this objective exists to prevent, wearing a perfect scorecard. `end_pos`
+(surviving positives) is the only honest metric; at `end_pos = 0` nothing else means
+anything, and `train_dialogue.py` warns after 50 consecutive dry batches. If your
+data fills `max_chunks_per_doc`, raise it or use shorter responses.
+
+Corollary: position `t = M-1` can never be supervised (a row reaching it is filled →
+masked; a shorter row has no such position), so the gate is untrained at exactly the
+cap. And `max_chunks_per_doc = 1` masks *everything* — no shipped preset does this
+(12/32/48/64), but it fails silently to `end_pos = 0` rather than erroring.
 
 **Where it lives.** `end_head` is in `dialogue.DialogueAdapter`, next to
 `response_seed` and for the same reason: the A→E `state_dict` stays **byte-identical**,
@@ -99,10 +128,13 @@ BCE trains only the head and never reshapes the reasoning — the
 `forward_self_supervised_halt` convention. Verified: with it off the loop and encoder
 receive **exactly zero** gradient from this term; with `--end-grad` it reaches both.
 
-**Serving.** `max_chunks` becomes a *cap*, not the reply length. An untrained head is
-a constant P(end) ≈ 0.018 (bias init −4.0), so it effectively never fires and an
-untrained adapter degrades to the old fixed-length behavior;
-`reply(use_end_head=False)` restores it exactly.
+**Serving.** `max_chunks` becomes a *cap*, not the reply length — but **only for a
+checkpoint that actually trained the gate**. `train_dialogue.save` records
+`end_gate_trained`; `chat_core.new_dialogue_session(..., ckpt)` reads it and switches
+the gate on only then. `DialogueSession(use_end_head=False)` is the default, which is
+exactly the pre-gate fixed-length behavior. This is deliberate: an untrained head is
+*not* inert (P = 0.018 **per chunk** ≈ 10% of 6-chunk replies), so defaulting it on
+would truncate replies from any A→E or `end_weight=0` checkpoint.
 
 ```bash
 python train_dialogue.py --ckpt runs/scaled/model.pt --multi-turn --end-weight 0.5
@@ -112,17 +144,29 @@ python train_dialogue.py ... --end-weight 0.5 --end-grad      # the A/B (see lim
 **Honest limits — read before trusting it.** Turning this on does *not* mean the gate
 works:
 - **Unvalidated on real dialogue.** Smoke-scale only.
-- **The detached head learns only weakly.** On a smoke overfit batch where the end is
-  *deliberately inferable* from content, the BCE beats the base-rate entropy (0.455 vs
-  0.598 — a constant head cannot), so the plumbing extracts real signal. But the margin
-  is small and `end_acc` never left the base rate. **This is the same failure shape as
-  the halt gate** (which degenerated to a constant P(halt) ≈ 0.95): a detached head can
-  only read what `cos`/`gen` already put in `h_t`, and nothing forces them to encode
-  "I am done". If the gate will not move on real data, **try `--end-grad` first**.
+- **There is NO evidence yet that the gate extracts signal — the plumbing is only
+  verified to *run*.** An earlier draft of this section claimed that a smoke overfit
+  batch reaching BCE 0.455 against a 0.598 base-rate entropy showed "real signal,"
+  because a constant head cannot beat `H(p)`. That inference is **invalid** and the
+  claim is withdrawn. With ~14 supervised points in a 192-d latent the head can
+  separate *any* labeling: a null run of the identical head on **pure noise features
+  with random labels** reaches BCE 0.008 and beats the base-rate entropy in **20/20
+  seeds**. Beating `H(p)` here is what a signal-free head does. Worse, 0.455 is far
+  *above* the null's 0.008 — the measurement shows an **underfit** head, and says
+  nothing about signal in either direction. A real answer needs a **held-out split**,
+  which has not been run.
+- **The detached head may not be able to learn this at all.** `end_grad=False` lets it
+  read only what `cos`/`gen` already put in `h_t`, and nothing forces them to encode "I
+  am done" — the same shape as the halt gate degenerating to a constant P(halt) ≈ 0.95.
+  If the gate will not move on real data, **try `--end-grad` first**.
 - **`end_acc` is imbalance-blind** — one "end" per turn, so an always-continue head
-  scores ≈ 1 − 1/M (0.714 on the smoke batch). Read it *with* the BCE, never alone.
-  This is the `antisycophancy_trust_gate_note.md` #1 lesson applied up front: the
-  metric exists so "is it working?" is observable rather than hoped.
+  scores ≈ 1 − 1/M (0.714 on the smoke batch). Never read alone. And see the `end_pos`
+  warning above: at `end_pos = 0`, `end`/`end_acc` look *perfect* and mean nothing.
+- **An untrained gate is NOT inert at serve time.** sigmoid(−4.0) = 0.018 is a
+  *per-chunk* rate, so ~10% of 6-chunk replies (≈20% of 12-chunk) would stop early at
+  random. Serving therefore keeps the gate **off** unless the checkpoint's
+  `end_gate_trained` flag says it was really trained (`DialogueSession(use_end_head=)`,
+  set by `chat_core.new_dialogue_session`). Off = exactly the pre-gate behavior.
 
 ## 3. Anti-sycophancy (`forward_anti_sycophancy` + `losses.anti_sycophancy_loss`)
 

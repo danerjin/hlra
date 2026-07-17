@@ -297,15 +297,17 @@ coverage at all — each is verified to turn the suite red when reverted.
 - **FIFO eviction is still batch-coupled.** `valid` marks a slot dead; it does not
   protect it from `write`'s `pop(0)`. If `memory_capacity` were below the slots written
   per example, a long batchmate's writes would evict a *short* row's real context — the
-  same coupling at the same magnitude (1.43 vs the unfixed 1.39). Safe on every shipped
-  preset, but the real headroom is **2×, not the 4–8× the capacity ratio suggests**:
-  `forward_dialogue` writes context **plus** SELF, up to `2 × max_chunks_per_doc` slots
-  per example, against a capacity of 4–8× — so `small` (the recommended preset) has
-  exactly 2.0× margin. A config invariant, not a guarantee.
-- **`filtered_stacked` ignores validity.** Its only callers are A→E (whose banks never
-  carry validity), and `_write_context`'s per-element roles are unfilterable by
-  construction — so no phantom can reach it. A future Stage-F path reading the input
-  lane would reintroduce the bug class.
+  same coupling at the same magnitude (1.43 vs the unfixed 1.39). The real headroom is
+  **2×, not the 4–8× the capacity ratio suggests**: `forward_dialogue` writes context
+  **plus** SELF, up to `2 × max_chunks_per_doc` slots per example — so `small` (the
+  recommended preset) has exactly 2.0× margin. **Now enforced**: `train_dialogue` refuses
+  to start when `memory_capacity < 2 × max_chunks_per_doc`, so this is a checked
+  precondition rather than a config invariant nothing verified.
+- **`filtered_stacked` cannot express validity.** Its return has no per-row mask, so a
+  masked slot would be handed back intact for every row. Its only callers are A→E (whose
+  banks never carry validity) — **now enforced**: it raises `NotImplementedError` on a
+  bank with masked slots rather than silently leaking, so a future Stage-F caller hits
+  an error instead of the bug class.
 
 ## 3. Anti-sycophancy (`forward_anti_sycophancy` + `losses.anti_sycophancy_loss`)
 

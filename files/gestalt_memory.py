@@ -176,6 +176,19 @@ class GestaltMemoryBank:
         (this feeds the A-E input lane, which is int-role); per-element-role
         slots are skipped.
         """
+        # Validity is NOT representable here: the return is (batch, n_matching, d) with
+        # no per-row mask, so a slot that is real for only some rows would be handed to
+        # the caller intact for ALL of them -- silently reintroducing the phantom class
+        # this bank now guards against. Unreachable today (the only callers are A-E's
+        # forward_self_supervised/_halt, whose banks never carry validity, and
+        # _write_context's per-element roles are skipped below anyway), so refuse rather
+        # than grow a mask nothing needs: a future Stage-F caller must hit this, not a
+        # silent leak.
+        if any(v is not None for v in self.valids):
+            raise NotImplementedError(
+                "filtered_stacked() cannot express per-row slot validity; this bank has "
+                "masked slots, and returning them unmasked would leak phantom content. "
+                "Add a mask to this API before calling it on a Stage-F bank.")
         matches = [v for v, r in zip(self.vectors, self.role_ids)
                    if not torch.is_tensor(r) and r in role_ids_wanted]
         if not matches:

@@ -355,6 +355,23 @@ def main():
               "max_chunks chunks every time. Pass --end-weight 0.5 for a chatbot "
               "you intend to serve. See STAGE_F.md §2.1.", flush=True)
 
+    # FIFO headroom. forward_dialogue writes up to max_chunks_per_doc context slots PLUS
+    # max_chunks_per_doc SELF slots per example, and the bank's pop(0) is driven by the
+    # BATCH's write count -- so if capacity is short, a long batchmate's writes evict a
+    # SHORT row's real context. `valid` marks a slot dead; it does NOT protect it from
+    # eviction, so masking cannot save this. Every shipped preset clears it (small = 2.0x
+    # exactly, others 4x+), which is why it has never bitten -- but that is a config
+    # invariant nothing enforced. Enforce it.
+    _need = 2 * cfg.max_chunks_per_doc
+    if cfg.memory_capacity < _need:
+        raise SystemExit(
+            f"[train_dialogue] memory_capacity={cfg.memory_capacity} < "
+            f"2*max_chunks_per_doc={_need}. Stage F writes context + SELF slots per "
+            f"example, so the FIFO would evict a short row's real context because a LONG "
+            f"batchmate drove the write count -- a batch-composition dependence that the "
+            f"per-row validity mask cannot fix (it marks slots dead, not un-evictable). "
+            f"Raise memory_capacity to >= {_need}.")
+
     syco_on = bool(sf.syco_weight > 0 and sf.syco_every)
     if syco_on and not cfg.trust_gate:
         print(f"[train_dialogue] WARNING: anti-sycophancy loss is ON (syco_weight="

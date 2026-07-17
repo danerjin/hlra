@@ -186,16 +186,23 @@ class GestaltMemoryBank:
         # _write_context's per-element roles are skipped below anyway), so refuse rather
         # than grow a mask nothing needs: a future Stage-F caller must hit this, not a
         # silent leak.
-        if any(v is not None for v in self.valids):
-            raise NotImplementedError(
-                "filtered_stacked() cannot express per-row slot validity; this bank has "
-                "masked slots, and returning them unmasked would leak phantom content. "
-                "Add a mask to this API before calling it on a Stage-F bank.")
-        matches = [v for v, r in zip(self.vectors, self.role_ids)
+        # Filter FIRST, then object only if a slot we would actually RETURN is masked.
+        # Checking `any(self.valids)` up front was over-broad against this method's own
+        # rationale: it raised on a `_write_context` bank whose per-element-role slots
+        # the filter below skips anyway -- a provably leak-free path that returned None,
+        # turned into a crash.
+        matches = [(v, valid) for v, r, valid in
+                   zip(self.vectors, self.role_ids, self.valids)
                    if not torch.is_tensor(r) and r in role_ids_wanted]
         if not matches:
             return None
-        return torch.stack(matches, dim=1)
+        if any(valid is not None for _, valid in matches):
+            raise NotImplementedError(
+                "filtered_stacked() cannot express per-row slot validity, and a slot it "
+                "would return is masked -- handing it back unmasked would leak phantom "
+                "content to every row. Add a mask to this API before calling it on a "
+                "Stage-F bank.")
+        return torch.stack([v for v, _ in matches], dim=1)
 
     def reset(self) -> None:
         self.vectors = []

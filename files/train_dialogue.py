@@ -112,6 +112,18 @@ def _apply_feature_flags(cfg, soft_tags, trust_gate, gestalt_readout, vector_gat
     cfg.soft_role_content = cfg.soft_role_content or content_tags
     cfg.gestalt_readout = cfg.gestalt_readout or gestalt_readout
     cfg.persona_tags = cfg.persona_tags or persona
+    if cfg.persona_tags and cfg.n_personas < 2:
+        # ModelConfig.__post_init__ checks this too, but it CANNOT fire here: we are
+        # mutating the field after construction, and --persona is the only production
+        # way to turn tagging on -- so the constructor's guard never sees the config
+        # that would actually trip it. Re-check at the real mutation site. (Persona 0 is
+        # reserved for SELF, so a 1-slot table tags every speaker as the model itself,
+        # silently: dialogue.py's aged USER turn and model.py's RETRIEVED both clamp
+        # onto 0.)
+        raise SystemExit(
+            f"[train_dialogue] --persona needs n_personas >= 2 (persona 0 is reserved "
+            f"for SELF); this checkpoint's config has n_personas={cfg.n_personas}, which "
+            f"would tag every speaker as the model itself.")
     if rag and len(cfg.role_tags) < 4:
         cfg.role_tags = tuple(cfg.role_tags) + ("RETRIEVED",)
     return cfg
@@ -126,7 +138,30 @@ def load_base_model(ckpt_path, preset, device, soft_tags=False, trust_gate=False
     `trust_gate` turn on the §4.2/§4.3 memory mechanisms for the fine-tune: since
     A-E checkpoints have them off, the new tag/gate params are simply absent from
     the state_dict and initialize fresh (reported as 'missing')."""
-    if ckpt_path and os.path.exists(ckpt_path):
+    if ckpt_path:
+        # Resolve relative to the PROJECT, not the cwd -- generate.py:223 and
+        # chat_core.py:29 already do this for the identical doc string, and this file
+        # already joins `--out` to PROJECT (below). It was the lone outlier, and the
+        # only one that failed SILENTLY: every doc runs Stage F from `cd ~/hlra/files`
+        # with `--ckpt runs/scaled/model.pt`, which resolved to files/runs/scaled/... --
+        # a path that never exists, because train_scaled writes to PROJECT/runs/scaled.
+        # Control then fell through to the "NO --ckpt given" branch and trained a
+        # RANDOM-INIT model to completion, silently, at the `small` default preset
+        # instead of the checkpoint's config (the tell was d_latent=512 vs 192).
+        # training_easy.md's one-paste chain would have run 3000 ultrachat steps on a
+        # random model and written a checkpoint to show for it.
+        if not os.path.isabs(ckpt_path):
+            cand = ckpt_path if os.path.exists(ckpt_path) else os.path.join(PROJECT, ckpt_path)
+            ckpt_path = cand
+        # A supplied-but-missing --ckpt is a MISTAKE, never a request for a fresh model.
+        # Silently falling back is what made the above invisible; the fresh path is for
+        # `--offline` smokes that pass no --ckpt at all.
+        if not os.path.exists(ckpt_path):
+            raise SystemExit(
+                f"[train_dialogue] --ckpt {ckpt_path!r} does not exist. Refusing to "
+                f"silently train a FRESH random model instead -- that is what the "
+                f"no---ckpt path is for. (Relative paths resolve against the project "
+                f"root, {PROJECT}, not the cwd.)")
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         raw = dict(ckpt["model_cfg"])
         for old, new in _LEGACY_CFG_FIELDS.items():

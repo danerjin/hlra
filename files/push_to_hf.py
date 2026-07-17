@@ -33,6 +33,8 @@ import argparse
 import os
 import tempfile
 
+PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 import torch
 
 # What inference / a Stage-F fine-tune actually reads (generate.load reads
@@ -98,7 +100,14 @@ def main():
 
     from huggingface_hub import HfApi, create_repo
 
-    ckpt_path = os.path.abspath(os.path.expanduser(args.ckpt))
+    # Relative paths resolve against the PROJECT, not the cwd: TRAINING.md 6.3 sits
+    # under a `cd ~/hlra/files` block and documents `--ckpt runs/scaled/model.pt`,
+    # which train_scaled writes to PROJECT/runs/scaled. Matches generate.py:223 and
+    # chat_core.py:29. (This one at least failed loudly.)
+    ckpt_path = os.path.expanduser(args.ckpt)
+    if not os.path.isabs(ckpt_path) and not os.path.exists(ckpt_path):
+        ckpt_path = os.path.join(PROJECT, ckpt_path)
+    ckpt_path = os.path.abspath(ckpt_path)
     if not os.path.exists(ckpt_path):
         raise SystemExit(f"no checkpoint at {ckpt_path}")
 

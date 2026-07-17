@@ -182,6 +182,53 @@ defect in the run, just a missing capability.
   limits). There is currently **no evidence** the detached head extracts signal even
   on clean dialogue labels — settle that before spending a re-validation here.
 
+### 6. Muon instead of AdamW (optimizer, post-run — NOT for the in-flight run)
+
+Asked 2026-07-16. **Current optimizer is AdamW everywhere** — `train_scaled.py`,
+`train_dialogue.py` (base + adapter in one group), `baseline_gpt.py` — every training
+driver. Nothing in
+the repo uses Muon; this is a note, not a change.
+
+Muon (Jordan et al., 2024) momentum-orthogonalizes each 2D weight's update via
+Newton–Schulz, and is reported to cut wall-clock to a target loss on transformer
+pretraining. Its scope is deliberately narrow: **2D hidden weights only** — embeddings,
+the unembedding/LM head, all norms/gains, and every 1D parameter stay on AdamW. So it is
+an *additional* optimizer alongside AdamW, not a replacement.
+
+Why it is post-run, not a tweak:
+- **It changes training semantics wholesale.** Four pre-flight reviews validated this
+  run's trajectory under AdamW; swapping the optimizer invalidates every A/B and
+  collapse observation the curriculum's staging rests on.
+- **The loop's geometry is not the one Muon's results were measured in.** `hard_normalize`
+  rescales the loop's *activations* to the ‖h‖=√d shell at every step, while Muon
+  orthogonalizes *weight updates* — different objects, so nothing here predicts the
+  interaction either way. It is untested, not adverse. (An earlier draft of this note
+  claimed `latent_mult>1` makes the loop's transitions non-square: **false**, and worth
+  recording since the in-flight run is `small-w3`. `latent_mult` is a pure uniform scale
+  — `d_latent = latent_mult · d_model` with `latent_d_ff` scaling identically — so every
+  transition weight's aspect ratio is *identical* at mult 1 and 3: `B` stays square
+  (512×512 → 960×960), the residual MLP stays 2:1/1:4 at both. The transitions are
+  already non-square at mult=1, and rectangular weights are Muon's normal case anyway.)
+  `DiagonalDecayGate`'s `theta`/`log_dt` are 1D, so Muon simply never touches them — an
+  argument for irrelevance, not for non-transfer.
+- **It compounds a known open item.** `notes.md` already flags that AdamW weight-decays
+  LayerNorm gains, embeddings, and the decay gate's `theta`/`log_dt` (no param groups) —
+  and Muon *requires* the param-group split that item describes. Do that split first as
+  its own A/B; it is a prerequisite, and it is independently worth measuring.
+- **The failure mode here is not optimizer-shaped.** The one *measured* problem is the
+  halt gate degenerating to min-depth (#2). Stage-B collapse is a **watched risk that has
+  not materialized** — every measurement in the repo reports the opposite (`notes.md`:
+  `val_loss` fell 9.78 → 7.66 straight through the boundary and `latent_std` *rose*
+  0.14 → 0.79 at 512-d, the width where the risk is highest). An earlier draft of this
+  note called it a measured problem, which inverts the project's own data. Neither is a
+  convergence-speed problem, so Muon is unlikely to move the metrics this project
+  actually watches.
+
+- **If run:** small preset, A→E, budget-matched wall-clock (not step-matched — the whole
+  claim is time-to-loss). Compare `val_loss` through the Stage-B boundary and
+  `latent_collapse_metric`. Prerequisite: the AdamW param-group split above, so the
+  comparison isolates Muon rather than confounding it with decay-on-gains.
+
 ## Rejected (don't transfer)
 
 - **Tiny 2-layer network / aggressive downsizing** — small-data regularization; our regime

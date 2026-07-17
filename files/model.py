@@ -60,10 +60,18 @@ USER, SELF, SYSTEM = 0, 1, 2  # role-tag ids, matching config.role_tags order
 # "SYSTEM","RETRIEVED"); A-E ships 3 roles, so RETRIEVED is opt-in and never
 # referenced on the validated path.
 RETRIEVED = 3
-# Conversation-local persona for a RETRIEVED slot. A source has no speaker, but None
-# maps to 0 == SELF's persona, so it needs SOME distinct id; no training convention
-# exists (RAG is untrained), hence arbitrary-but-not-SELF. Clamped at use.
-_RETRIEVED_PERSONA = 3
+# Conversation-local persona for a RETRIEVED slot. A source is NOT a speaker, but None
+# maps to 0 == SELF's persona, so it needs some non-SELF id. There is no free slot:
+# personas are speaker ids numbered 0=SELF then 1,2,... by first appearance
+# (dialogue_data.transcript_to_turns), so ANY choice collides with a speaker once the
+# table fills. Take the TOP slot -- it collides only with the LAST speaker a saturated
+# table can hold -- and with every OVERFLOW speaker, since dialogue_data clamps all
+# of them into that same top bucket -- rather than with the 3rd (a
+# fixed 3 collided with speaker #3 on a 5-party transcript). The RETRIEVED *role* tag
+# is what actually separates a source; this id only has to avoid asserting it was SELF.
+# No training convention exists (RAG is untrained), so it is arbitrary by design.
+def _retrieved_persona(cfg):
+    return cfg.n_personas - 1
 
 
 @dataclass
@@ -707,8 +715,11 @@ class LatentThoughtModel(nn.Module):
             # edited without noticing it). No training convention exists for RETRIEVED
             # (RAG is mechanism-only, never trained), so this id is arbitrary -- it only
             # has to not be SELF's. Clamped like dialogue_data.py:259 does.
-            persona = (min(_RETRIEVED_PERSONA, self.cfg.n_personas - 1)
-                       if self.cfg.persona_tags else None)
+            # n_personas >= 2 is checked in ModelConfig.__post_init__ AND re-checked in
+            # train_dialogue._apply_feature_flags -- the latter is the one that matters,
+            # since --persona mutates persona_tags after the constructor has run, so the
+            # constructor's guard never sees the config that would trip it.
+            persona = _retrieved_persona(self.cfg) if self.cfg.persona_tags else None
             memory.write(self._gestalt(z[:, j]), role, persona, valid=col)
             n += 1
         return n

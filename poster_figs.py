@@ -243,11 +243,17 @@ def fig_arc(data_path, out_path):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    argv = sys.argv[1:]
     out_dir = os.path.join(PROJECT, "poster_figs")
-    if "--out" in sys.argv:
-        out_dir = sys.argv[sys.argv.index("--out") + 1]
+    if "--out" in argv:
+        i = argv.index("--out")
+        out_dir = argv[i + 1]
         out_dir = out_dir if os.path.isabs(out_dir) else os.path.join(PROJECT, out_dir)
+        argv = argv[:i] + argv[i + 2:]      # drop the flag AND its value
+    # positional = the run dir. Filtering only on `startswith("--")` left --out's VALUE
+    # in the list, so `poster_figs.py --out DIR` silently read DIR as the run dir; the
+    # documented ordering worked only by luck of args[0].
+    args = [a for a in argv if not a.startswith("--")]
     os.makedirs(out_dir, exist_ok=True)
 
     run_dir = _run_dir(args[0] if args else None)

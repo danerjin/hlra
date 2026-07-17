@@ -319,7 +319,7 @@ def _decode_ids(tok, ids) -> str:
 #   [3] the LYING metric  -- end_n stays healthy while the gate learns "never end"
 #   [4] the NULL control  -- beating base-rate entropy is NOT evidence of signal
 #   [5] phantom slots    -- a row's thought depended on its batchmates' context
-#   [6] the round-3 fixes themselves -- all three shipped with NO coverage
+#   [6] the fixes themselves -- each shipped with NO coverage when written
 # ======================================================================
 def _self_test() -> int:
     import torch.nn.functional as F
@@ -539,7 +539,42 @@ def _self_test() -> int:
     b5 = GestaltMemoryBank(8, 4); b5.write(torch.randn(3, 4), 0)
     chk(b5.filtered_stacked([0]) is not None, "an A-E bank still returns normally")
 
-    # (f) the FIFO precondition train_dialogue enforces must hold for every preset.
+    # (f) persona 0 is SELF's, so a <2-slot table cannot distinguish anyone from the
+    #     model. The clamps would silently collapse onto 0 -- the exact bug the tagging
+    #     prevents -- so the config must be refused, not clamped.
+    from config import ModelConfig
+    try:
+        ModelConfig(persona_tags=True, n_personas=1)
+        chk(False, "persona_tags with n_personas=1 must be REFUSED (every clamp lands "
+                   "on SELF's 0, silently)")
+    except ValueError:
+        chk(True, "persona_tags + n_personas=1 refused at config time (the clamps would "
+                  "otherwise collapse onto SELF's persona 0 with no error)")
+    chk(ModelConfig(persona_tags=False, n_personas=1) is not None,
+        "n_personas=1 is fine when tagging is off")
+
+    # (g) RETRIEVED takes the TOP persona slot: any id collides with some speaker
+    #     (they are numbered 1,2,... by first appearance), so collide with the LAST a
+    #     saturated table can hold, not the third. Must never be SELF's 0.
+    from model import _retrieved_persona
+
+    class _Cfg:
+        def __init__(self, n): self.n_personas = n
+    rp = {n: _retrieved_persona(_Cfg(n)) for n in (2, 4, 16)}
+    chk(all(v != 0 for v in rp.values()) and rp[16] == 15,
+        f"RETRIEVED persona is the top slot {rp}, never SELF's 0 (a fixed 3 collided "
+        f"with the 3rd speaker on a 5-party transcript)")
+
+    # (h) filtered_stacked must refuse only a slot it would RETURN. Raising on a bank
+    #     whose per-element-role slots the filter skips turned a leak-free path
+    #     (returns None) into a crash.
+    b6 = GestaltMemoryBank(8, 4)
+    b6.write(torch.randn(2, 4), torch.tensor([0, 1]), valid=torch.tensor([True, False]))
+    chk(b6.filtered_stacked([0, 1]) is None,
+        "filtered_stacked returns None for a masked TENSOR-role bank -- the filter skips "
+        "those slots, so there is nothing to leak and nothing to raise about")
+
+    # (i) the FIFO precondition train_dialogue enforces must hold for every preset.
     #     forward_dialogue writes context + SELF, i.e. up to 2*max_chunks_per_doc.
     bad_presets = []
     for name in MODEL_PRESETS:

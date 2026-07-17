@@ -56,7 +56,7 @@ python train_scaled.py --preset "$PRESET" --cache "$DRY/cache" --device cuda --a
   --batch-size 4 --stage-steps 2,2,2,2,2,0 --var-weight 3.0 --log-every 2 --out "$DRY/run" | tail -3
 
 echo "== [4/4] Stage-F chatbot path (offline smoke) =="
-python train_dialogue.py --offline --preset "$PRESET" --multi-turn --persona --trust-gate --vector-gate \
+python train_dialogue.py --offline --preset "$PRESET" --multi-turn --persona --trust-gate --vector-gate --trust-prior \
   --steps 6 --batch-size 2 --device cuda --out "$DRY/dlg" | tail -2
 
 rm -rf "$DRY"
@@ -145,7 +145,7 @@ fi
 if [ "$RUN_STAGE_F" = "1" ]; then
   log "STATUS: A→E done — starting Stage-F fine-tune on $HF_CHAT (foundation READ-ONLY -> runs/dialogue)"
   "$PY" train_dialogue.py --ckpt runs/scaled/model.pt --hf-chat "$HF_CHAT" --split "$SPLIT" \
-    --multi-turn --soft-tags --content-tags --trust-gate --vector-gate --persona --gestalt-readout \
+    --multi-turn --soft-tags --content-tags --trust-gate --vector-gate --trust-prior --persona --gestalt-readout --end-weight 0.5 \
     --steps "$STAGEF_STEPS" --batch-size "$STAGEF_BATCH" --out runs/dialogue
   log "STATUS: train_dialogue.py exited (rc=$?) -> runs/dialogue/model.pt"
 else
@@ -226,7 +226,7 @@ test -f ~/hlra/"$FOUNDATION" || { echo "no foundation at $FOUNDATION — finish 
 # NOTE: do NOT pass --preset with --ckpt — the checkpoint's config wins.
 nohup python train_dialogue.py --ckpt "$FOUNDATION" \
   --hf-chat "$HF_CHAT" --split "$SPLIT" \
-  --multi-turn --soft-tags --content-tags --trust-gate --vector-gate --persona --gestalt-readout \
+  --multi-turn --soft-tags --content-tags --trust-gate --vector-gate --trust-prior --persona --gestalt-readout --end-weight 0.5 \
   --steps "$STEPS" --batch-size "$BATCH" --out "$OUT" > dialogue.log 2>&1 &
 echo "STAGE-F fine-tune started (PID $!) -> tail -f ~/hlra/files/dialogue.log"
 echo "   foundation (read-only): $FOUNDATION"

@@ -309,6 +309,19 @@ class ModelConfig:
             warnings.warn("trust_gate_vector has no effect without trust_gate (ignored).")
         if self.halt_mode not in ("ponder", "supervised"):
             raise ValueError(f"halt_mode must be 'ponder' or 'supervised', got {self.halt_mode!r}")
+        if self.persona_tags and self.n_personas < 2:
+            # Persona 0 is RESERVED for SELF (model.forward_dialogue's self_persona),
+            # so a 1-slot table cannot distinguish ANY other speaker from the model
+            # itself -- every write lands on SELF's id. Callers clamp into the table
+            # (dialogue_data.py's min(p, n_personas-1), dialogue.py's aged USER turn,
+            # model.py's RETRIEVED), and at n_personas=1 those clamps silently collapse
+            # onto 0, i.e. memory asserting the user's turn was spoken by the model --
+            # the exact bug the tagging exists to prevent, with no error. Refuse the
+            # config instead of tagging everything SELF.
+            raise ValueError(
+                f"persona_tags=True needs n_personas >= 2 (persona 0 is reserved for "
+                f"SELF); got n_personas={self.n_personas}, which would tag every "
+                f"speaker as the model itself.")
         if self.halt_target not in ("marginal", "best_relative"):
             raise ValueError(f"halt_target must be 'marginal' or 'best_relative', got {self.halt_target!r}")
         # The supervised halt gate selects a per-row depth in [h_updates_per_thought,

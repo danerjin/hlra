@@ -245,10 +245,11 @@ feed only dead paths"*. True for A→E — and false the moment they are written
 
 **Measured on the real corpus** (ultrachat — `training_easy.md`'s recommended Stage-F
 data, not a code default; `--hf-chat` defaults to the offline synthetic corpus — via
-`iter_hf_chat_turns`, preset `small`, B=8): **~45%** of every row's context memory was fabricated, and **~28% of rows
-had zero real context — 100% phantom**. (Two independent draws: 45.7/28.0 and
-45.4/27.5 — a sampling distribution over batches, so read them as ~45/~28, not to
-three significant figures.) It made a row's `h_t` a function of its
+`iter_hf_chat_turns`, preset `small`, B=8): **~45% of all context-memory slots, across
+the batch,** were fabricated, and **~28% of rows had zero real context — 100% phantom**.
+Note ~45% is a batch *average*, not a per-row fact: the 28% sit at 100%, and a
+longest-context row at 0%. (Two independent draws: 45.7/28.0 and 45.4/27.5 — a sampling
+distribution over batches, so read them as ~45/~28, not to three significant figures.) It made a row's `h_t` a function of its
 batchmates' context *length* — so it corrupted the `h_t` that `cos`/`gen` are computed
 from, not just the gate's input (the *sign* of the effect on those losses at random
 init is not measured, and inferring one would be the same mistake as §2.1's withdrawn

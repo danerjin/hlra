@@ -73,9 +73,11 @@ class GestaltMemoryBank:
         latent, tagged with a real role. That is not inert: the reader computes
         `kv = stacked + tags`, so a zero vector plus the USER tag is a fully
         attendable "the user said <nothing>" slot. Measured on the real dialogue
-        corpus, ~45% of every row's context memory was fabricated this way and ~28%
-        of rows had NO real context at all (two draws: 45.7/28.0, 45.4/27.5) -- and it made a row's h_t depend on its
-        batchmates' context length. Pass `valid` so the reader can ignore them."""
+        corpus, ~45% of all context-memory slots ACROSS THE BATCH were fabricated this
+        way, and ~28% of rows had NO real context at all -- i.e. 45% is an average, not
+        a per-row fact: those 28% sit at 100% (two draws: 45.7/28.0, 45.4/27.5). It made
+        a row's h_t depend on its batchmates' context length. Pass `valid` so the reader
+        can ignore them."""
         if valid is not None and torch.is_tensor(valid) and bool(valid.all()):
             # Real for every row => nothing to mask. Collapsing to None here keeps
             # `valid_mask()` returning None for an all-valid bank, so the reader takes

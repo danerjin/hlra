@@ -742,15 +742,16 @@ re-validate anti-collapse at width before turning any on.
   `_encode_real_rows`' exact-zero latent tagged role 0 (**USER**), a fully attendable
   "the user said nothing" memory (`kv = stacked + tags`). It violated
   `_encode_real_rows`' own documented invariant ("pad-row latents feed only dead
-  paths" — true until you write them to memory). Measured on the real corpus: **45.7%
-  of context memory fabricated, 28% of rows 100% phantom**; a row's `h_t` depended on
+  paths" — true until you write them to memory). Measured on the real corpus: **~45%
+  of context memory fabricated across the batch, ~28% of rows 100% phantom** (two draws:
+  45.7/28.0 and 45.4/27.5); a row's `h_t` depended on
   its batchmates' context LENGTH; it degraded `cos`/`gen`, not just the turn-end gate;
   and `--no-act` did NOT mitigate it (the ACT skew is a different, benign coupling).
   Fix: `GestaltMemoryBank.write(valid=)` + `valid_mask()` → a reader `key_padding_mask`,
   returning None when no slot carries a validity so **A→E keeps its original unmasked
   attention, byte-identical**. Applied at all three Stage-F writers, but **only
   `_write_context` was a live bug** — `inject_source` is unreachable (B=1 serving only)
-  and `forward_dialogue`'s SELF write is a bit-exact no-op (`resp_mask` is left-packed,
+  and `forward_dialogue`'s SELF write is semantically inert (`resp_mask` is left-packed,
   so a row never reactivates and its junk slots are per-row); both are kept as defensive
   applications of the pattern. NB the justification first given for the SELF write was
   **wrong**: an inactive row does NOT keep a stale `h` — `active_mask` gates only the

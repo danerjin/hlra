@@ -854,7 +854,7 @@ class LatentThoughtModel(nn.Module):
             # Self-thought written through the same gestalt-readout as context, so
             # the bank stays homogeneous (§4/Q2). Identity when readout is off.
             write_vec = self._gestalt(h)
-            # `valid=active`: DEFENSIVE, not a live fix -- measured a bit-exact no-op.
+            # `valid=active`: DEFENSIVE, not a live fix -- measured SEMANTICALLY inert.
             # An inactive row does NOT keep a stale h (an earlier version of this
             # comment said so and was wrong; hrm_loop.py:320 says the opposite --
             # active_mask gates only the ponder cost and halt vote, so such rows "keep

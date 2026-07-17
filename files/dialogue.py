@@ -467,45 +467,89 @@ def _self_test() -> int:
         "a row with ZERO real context stays finite -- attention over a fully-masked "
         "row is NaN, not zero, so those rows are zeroed explicitly")
 
-    print("[6] round-3 fixes -- each of these was shipped UNGUARDED and could be")
-    print("    silently reverted with the suite green (round-4 finding)")
+    print("[6] the fixes themselves. NB an earlier version of this check was a")
+    print("    TAUTOLOGY: it re-implemented the persona fix inline and asserted the")
+    print("    bank stored what it had just been handed, never calling the fixed code.")
     from gestalt_memory import GestaltMemoryBank
+    from data import build_offline_chunker
+    from config import MODEL_PRESETS
 
-    # (a) persona: a served USER turn must NOT carry SELF's persona 0.
+    # (a) persona: drive the REAL _age_user_turn. Do NOT hand-build a bank -- that
+    #     tests persona_id_tensor (which nobody changed), not the site of the fix.
+    cfgA = model_config("smoke"); cfgA.vocab_size = 256; cfgA.persona_tags = True
     torch.manual_seed(0)
-    cfg6 = model_config("smoke"); cfg6.vocab_size = 64; cfg6.persona_tags = True
-    bank = GestaltMemoryBank(8, cfg6.d_latent)
-    bank.write(torch.randn(1, cfg6.d_latent), SELF, 0)                      # a self thought
-    bank.write(torch.randn(1, cfg6.d_latent), USER,
-               min(1, cfg6.n_personas - 1))                                # an aged user turn
-    pid = bank.persona_id_tensor("cpu").tolist()
-    chk(pid == [0, 1],
-        f"aged USER turn keeps its own persona {pid} != SELF's -- omitting it let "
-        f"persona_id_tensor map None->0, i.e. memory asserting the user's turn was "
-        f"spoken by the model")
+    mdlA = LatentThoughtModel(cfgA, _Stub(cfgA)); mdlA.eval()
+    chunkA = build_offline_chunker(cfgA)
+    sessA = DialogueSession(mdlA, DialogueAdapter(cfgA.d_latent), chunkA, cfgA)
+    sessA.reply("hello there friend", max_chunks=1, greedy=True)   # writes SELF, then ages USER
+    # persona_id_tensor is (n_slots,) when every persona is scalar, (batch, n_slots)
+    # once any is per-element -- handle both rather than assume.
+    _pt = sessA.memory.persona_id_tensor("cpu")
+    pids = (_pt[0] if _pt.dim() == 2 else _pt).tolist()
+    roles = [int(r) if not torch.is_tensor(r) else int(r[0]) for r in sessA.memory.role_ids]
+    user_pids = [p for p, r in zip(pids, roles) if r == USER]
+    chk(user_pids and all(p != 0 for p in user_pids),
+        f"_age_user_turn tags the USER turn {user_pids}, not SELF's 0 (roles={roles}) -- "
+        f"omitting persona_id let persona_id_tensor map None->0, i.e. memory asserting "
+        f"the user's turn was spoken by the model")
 
-    # (b) all-True `valid` must collapse to None, so an all-valid bank keeps the
-    #     reader's ORIGINAL unmasked attention (byte-identity for B=1 serving).
+    # (b) inject_source (round-4's headline fix) -- also drive the real method.
+    cfgB = model_config("smoke"); cfgB.vocab_size = 256; cfgB.persona_tags = True
+    cfgB.role_tags = tuple(cfgB.role_tags) + ("RETRIEVED",)   # RAG needs the 4th role
+    torch.manual_seed(0)
+    mdlB = LatentThoughtModel(cfgB, _Stub(cfgB)); mdlB.eval()
+    bankB = GestaltMemoryBank(cfgB.memory_capacity, cfgB.d_latent)
+    src = torch.randint(1, cfgB.vocab_size, (1, 2, cfgB.max_chunk_len))
+    with torch.no_grad():
+        mdlB.inject_source(bankB, src, torch.ones(1, 2, dtype=torch.bool))
+    _st = bankB.persona_id_tensor("cpu")
+    src_pids = (_st[0] if _st.dim() == 2 else _st).tolist()
+    chk(all(p != 0 for p in src_pids),
+        f"inject_source tags a RETRIEVED source {src_pids}, not SELF's 0 -- else memory "
+        f"asserts the retrieved document was the model's own thought")
+
+    # (c) all-True valid collapses to None (byte-identity for the B=1 serve paths).
     b2 = GestaltMemoryBank(8, 4)
     b2.write(torch.randn(3, 4), 0, valid=torch.tensor([True, True, True]))
     chk(b2.valid_mask("cpu") is None,
-        "an all-True valid collapses to None -- otherwise every later read takes the "
-        "masked branch for nothing and byte-identity is not absolute")
+        "an all-True valid collapses to None -- else every later read takes the masked "
+        "branch for nothing and byte-identity is not absolute")
     b2.write(torch.randn(3, 4), 0, valid=torch.tensor([True, False, True]))
     chk(b2.valid_mask("cpu") is not None, "a genuinely mixed valid still masks")
 
-    # (c) a non-tensor `valid` must RAISE. The broadcast turns any non-tensor into an
-    #     all-True column, so a bare False would silently UNMASK -- worse than an error.
+    # (d) a non-tensor valid must RAISE: the broadcast turns any non-tensor into an
+    #     all-True column, so a bare False would silently UNMASK.
     for bad, label in ((False, "bare False"), (True, "bare True")):
         b3 = GestaltMemoryBank(8, 4)
         b3.write(torch.randn(3, 4), 0, valid=torch.tensor([True, False, True]))
         b3.write(torch.randn(3, 4), 0, valid=bad)
         try:
-            b3.valid_mask("cpu")
-            chk(False, f"{label} mixed with tensors must raise, not silently unmask")
+            b3.valid_mask("cpu"); chk(False, f"{label} must raise, not silently unmask")
         except TypeError:
-            chk(True, f"{label} mixed with tensors raises TypeError (was silently "
-                      f"treated as ALL-TRUE)")
+            chk(True, f"{label} mixed with tensors raises (was silently ALL-TRUE)")
+
+    # (e) filtered_stacked must refuse a masked bank rather than leak it unmasked.
+    b4 = GestaltMemoryBank(8, 4)
+    b4.write(torch.randn(3, 4), 0, valid=torch.tensor([True, False, True]))
+    try:
+        b4.filtered_stacked([0]); chk(False, "filtered_stacked must refuse a masked bank")
+    except NotImplementedError:
+        chk(True, "filtered_stacked refuses a masked bank (its return has no per-row "
+                  "mask, so it would hand a phantom back for every row)")
+    b5 = GestaltMemoryBank(8, 4); b5.write(torch.randn(3, 4), 0)
+    chk(b5.filtered_stacked([0]) is not None, "an A-E bank still returns normally")
+
+    # (f) the FIFO precondition train_dialogue enforces must hold for every preset.
+    #     forward_dialogue writes context + SELF, i.e. up to 2*max_chunks_per_doc.
+    bad_presets = []
+    for name in MODEL_PRESETS:
+        c = model_config(name)
+        if c.memory_capacity < 2 * c.max_chunks_per_doc:
+            bad_presets.append((name, c.memory_capacity, 2 * c.max_chunks_per_doc))
+    chk(not bad_presets,
+        f"every preset clears memory_capacity >= 2*max_chunks_per_doc (else the FIFO "
+        f"evicts a short row's context because a LONG batchmate drove the write count, "
+        f"which `valid` cannot fix); violations: {bad_presets}")
 
     print("\n[self-test] " + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1

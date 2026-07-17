@@ -359,9 +359,14 @@ def main():
     # max_chunks_per_doc SELF slots per example, and the bank's pop(0) is driven by the
     # BATCH's write count -- so if capacity is short, a long batchmate's writes evict a
     # SHORT row's real context. `valid` marks a slot dead; it does NOT protect it from
-    # eviction, so masking cannot save this. Every shipped preset clears it (small = 2.0x
-    # exactly, others 4x+), which is why it has never bitten -- but that is a config
-    # invariant nothing enforced. Enforce it.
+    # eviction, so masking cannot save this. Every shipped preset clears it, but the
+    # margin is 2.0x -- NOT "4x+" -- at BOTH 512-d-class presets, INCLUDING `small-w3`,
+    # which is what the A-E run actually uses (TRAINING.md 3); `smoke` is 2.67x and the
+    # rest 4x. The thinnest margin sits on the preset that matters, which is why this is
+    # a checked precondition now rather than a config invariant nothing verified. Enforce it. NB the margin is 2.0x -- NOT "4x+" -- at
+    # BOTH 512-d-class presets, including `small-w3`, which is the one the A-E run
+    # actually uses (TRAINING.md 3); `smoke` is 2.67x and the rest 4x. The thinnest
+    # margin is on the preset that matters.
     _need = 2 * cfg.max_chunks_per_doc
     if cfg.memory_capacity < _need:
         raise SystemExit(

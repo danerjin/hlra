@@ -498,19 +498,53 @@ python ~/hlra/files/plot_metrics.py ~/hlra/runs/scaled     # -> runs/scaled/loss
 ```
 
 ### 9.2 Benchmarks (needs the GPU → run ON the box)
+
 ```bash
-python ~/hlra/files/run_lm_eval.py --ckpt ~/hlra/runs/scaled/model.pt \
-  --limit 200 --output ~/hlra/results/lm_eval_quick.json          # sanity, a few minutes
-python ~/hlra/files/run_lm_eval.py --ckpt ~/hlra/runs/scaled/model.pt \
-  --output ~/hlra/results/lm_eval.json                            # headline = lambada_openai
-python ~/hlra/files/run_lm_eval.py --ckpt ~/hlra/runs/scaled/model.pt \
-  --tasks lambada_openai,hellaswag --output ~/hlra/results/lm_eval_full.json
+E=~/hlra/files/run_lm_eval.py; CK=~/hlra/runs/scaled/model.pt
+
+# 1) fast dry-run FIRST -- proves the harness+adapter path before you spend real time
+python $E --ckpt $CK --limit 200 --output ~/hlra/results/lm_eval_quick.json
+
+# 2) headline (default tasks = lambada_openai,hellaswag)
+python $E --ckpt $CK --output ~/hlra/results/lm_eval.json
+
+# 3) the reasoning suite = copa,piqa,hellaswag,arc_challenge
+python $E --ckpt $CK --tasks reasoning --output ~/hlra/results/lm_eval_reasoning.json
+
+# 4) same suite under the latent scoring mode, for the A/B that matters to this architecture
+python $E --ckpt $CK --tasks reasoning --score-mode latent_cos \
+  --output ~/hlra/results/lm_eval_reasoning_latentcos.json
 ```
-**Which number is honest:** this model scores continuations at **chunk** granularity off
-the predictive chain — there is no token-level conditional logprob. So `lambada_openai`
-(cloze/last-word, sentence-length context) is the **honest headline**, and `hellaswag`
-fits too (sentence-length options). Token-level tasks are NOT a fair comparison. Read
-`run_lm_eval.py`'s module docstring before quoting anything.
+
+**Task choice is load-bearing.** The model scores continuations at **chunk** granularity
+off the predictive chain — there is no token-level conditional logprob. So:
+- **`lambada_openai`** — cloze/last-word with sentence-length context. The **honest
+  headline**, reported as perplexity + accuracy.
+- **`reasoning` suite** (`copa,piqa,hellaswag,arc_challenge`) — multiple choice whose
+  options are sentence/phrase-length, which is what fits chunk-granularity scoring.
+- **`arc_challenge` sits near chance at `small` scale** — it's in the suite for
+  **scale-up comparison**, *not* as a small-scale headline. Don't quote it as one.
+- Token-level tasks are **not** a fair comparison here. Read `run_lm_eval.py`'s module
+  docstring before quoting any number.
+
+**Two scoring modes** (`--score-mode`), worth running both:
+| mode | what it is | use for |
+|---|---|---|
+| `token_nll` *(default)* | Talker token NLL — a real log-likelihood | **required** for perplexity tasks (lambada) |
+| `latent_cos` | cosine in latent space off the predictive chain | the architecture-native view on multiple-choice |
+
+**Optional — `arc_challenge_statement`** rewrites each ARC option into a full sentence
+(better fit for chunk scoring). Backends via `--arc-templater`:
+`deterministic` (default, no LLM) · `regex` · `ollama` (`--arc-templater-model gemma4`,
+measured 100% faithful vs phi3's 46% on a 24-option bake-off).
+```bash
+python $E --ckpt $CK --tasks arc_challenge_statement --arc-templater deterministic \
+  --output ~/hlra/results/lm_eval_arc_stmt.json
+```
+
+Other flags: `--limit N` (cap examples/task), `--num-fewshot N` (default: the task's
+own), `--device`. **StoryCloze/ROCStories** also fits the scoring model but needs a
+manual gated-HF download, so it's deliberately not in the suite.
 
 ### 9.3 Qualitative — does it produce sense?
 ```bash

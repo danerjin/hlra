@@ -467,6 +467,84 @@ ls -lh --time-style=+%H:%M ~/hlra/runs/scaled/    # checkpoint.pt + checkpoint_N
 
 ---
 
+## 9. Results day — the run finished, now what
+
+> **Use ABSOLUTE paths.** The scripts resolve relative paths *inconsistently*:
+> `plot_metrics.py` / `push_to_hf.py` fall back to **PROJECT** (`~/hlra`),
+> `run_lm_eval.py` does **not** for `--ckpt` (only for `--output`), and
+> `generate.py` defaults to `PROJECT/runs/model.pt`. Absolute paths are correct in all
+> of them (`os.path.join(PROJECT, "/abs")` returns the absolute path unchanged).
+> Also note `runs/` is at the **repo root**, and `dialogue_chat.py` / `web_chat.py`
+> live at the **repo root**, not in `files/`.
+
+**Do this NOW, while the GPU is still busy** — don't discover a missing harness at the
+finish line (the whole point of `run_lm_eval.py` is that nothing is discovered on
+results day):
+```bash
+python -c "import lm_eval; print('lm_eval', lm_eval.__version__)" || pip install lm_eval
+python ~/hlra/files/run_lm_eval.py --help | head -5
+```
+
+### 9.0 Confirm it actually finished
+```bash
+cd ~/hlra && source ~/hlra/.venv-rocm/bin/activate && mkdir -p ~/hlra/results
+ls -1 ~/hlra/runs/*/model.pt                       # model.pt exists ONLY after stage E completes
+grep -E "done\.|exited" ~/hlra/files/train.log ~/hlra/files/stage_f.log | tail -4
+```
+
+### 9.1 Loss curves
+```bash
+python ~/hlra/files/plot_metrics.py ~/hlra/runs/scaled     # -> runs/scaled/loss_curves.png
+```
+
+### 9.2 Benchmarks (needs the GPU → run ON the box)
+```bash
+python ~/hlra/files/run_lm_eval.py --ckpt ~/hlra/runs/scaled/model.pt \
+  --limit 200 --output ~/hlra/results/lm_eval_quick.json          # sanity, a few minutes
+python ~/hlra/files/run_lm_eval.py --ckpt ~/hlra/runs/scaled/model.pt \
+  --output ~/hlra/results/lm_eval.json                            # headline = lambada_openai
+python ~/hlra/files/run_lm_eval.py --ckpt ~/hlra/runs/scaled/model.pt \
+  --tasks lambada_openai,hellaswag --output ~/hlra/results/lm_eval_full.json
+```
+**Which number is honest:** this model scores continuations at **chunk** granularity off
+the predictive chain — there is no token-level conditional logprob. So `lambada_openai`
+(cloze/last-word, sentence-length context) is the **honest headline**, and `hellaswag`
+fits too (sentence-length options). Token-level tasks are NOT a fair comparison. Read
+`run_lm_eval.py`'s module docstring before quoting anything.
+
+### 9.3 Qualitative — does it produce sense?
+```bash
+python ~/hlra/files/generate.py --ckpt ~/hlra/runs/scaled/model.pt --score "The capital of France is Paris."
+python ~/hlra/dialogue_chat.py ~/hlra/runs/dialogue/model.pt    # CLI REPL (:source · :reset · :temp · :n)
+python ~/hlra/web_chat.py      ~/hlra/runs/dialogue/model.pt    # web UI -> "Chat" toggle
+```
+
+### 9.4 Get it off the box
+```bash
+# --- push to HuggingFace (multi-GB safe; repo is PRIVATE by default, --public to share) ---
+hf auth login                                                    # once; paste a WRITE token
+python ~/hlra/files/push_to_hf.py --ckpt ~/hlra/runs/scaled/model.pt   --repo <you>/hlra-smallw3      --strip --bf16
+python ~/hlra/files/push_to_hf.py --ckpt ~/hlra/runs/dialogue/model.pt --repo <you>/hlra-smallw3-chat --strip --bf16
+#   --strip = inference-only weights (~4x smaller) · --bf16 halves it again
+#   HF repo ids are exactly owner/name -- no deeper nesting; it lands on your profile's Models tab.
+
+# --- OR rsync to your laptop (run these ON YOUR LAPTOP) ---
+mkdir -p ~/hlra/runs/scaled ~/hlra/runs/dialogue ~/hlra/results
+rsync -avP daniel@<BOX>:~/hlra/runs/scaled/{model.pt,metrics.json,loss_curves.png} ~/hlra/runs/scaled/
+rsync -avP daniel@<BOX>:~/hlra/runs/dialogue/model.pt                              ~/hlra/runs/dialogue/
+rsync -avP daniel@<BOX>:~/hlra/results/                                            ~/hlra/results/
+```
+`-P` resumes a partial transfer — the raw `model.pt` is ~1.9 GB (it carries optimizer +
+EMA + the full metrics history). Grab `metrics.json` too: it's small and it IS your
+training history (the text log is disposable). `push_to_hf.py --strip` does the
+slimming for you, which is why the HF path is less fiddly than rsyncing raw checkpoints.
+
+### 9.5 Same again for the base run
+Identical commands with `~/hlra/runs/scaled_base/` and `~/hlra/runs/dialogue_base/`.
+`plot_comparison.py` plots small-w3 vs base-w3 side by side.
+
+---
+
 **In doubt:** the run is healthy as long as **`val_loss` trends down with no jump when
 Stage B turns the predictor on**, and `latent_std` holds its Stage-A band. Watch `val_loss`
 above all; keep checkpoints. Full Strix-Halo path + troubleshooting:

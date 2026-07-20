@@ -51,7 +51,9 @@ from gestalt_memory import GestaltMemoryBank, GestaltReadout
 from talker import Talker
 from ema_target import ChunkEncoder, EMATargetEncoder
 from losses import (scaled_cosine_loss, grounded_nll_loss, ponder_cost_loss,
-                    variance_regularization, anti_sycophancy_loss,
+                    variance_regularization, prediction_variance_loss,
+                    prediction_contrastive_loss,
+                    prediction_collapse_metric, anti_sycophancy_loss,
                     supervised_halt_loss, turn_end_loss, turn_end_accuracy)
 
 USER, SELF, SYSTEM = 0, 1, 2  # role-tag ids, matching config.role_tags order
@@ -187,7 +189,11 @@ class LatentThoughtModel(nn.Module):
         # slow EMA target, not by an isolation head.
         # Maps a finished thought to the next chunk's EMA-target latent -- both
         # are chunk-level, so this is d_latent -> d_latent.
-        self.pred_head = nn.Linear(cfg.d_latent, cfg.d_latent)
+        _phh = getattr(cfg, "pred_head_hidden", 0)
+        self.pred_head = (
+            nn.Sequential(nn.Linear(cfg.d_latent, _phh), nn.GELU(), nn.Linear(_phh, cfg.d_latent))
+            if _phh and _phh > 0 else nn.Linear(cfg.d_latent, cfg.d_latent)
+        )
 
         # --- Gestalt-readout projection (§4 / Q2, Stage-F/RAG only) ---------
         # Homogenizes what gets written to memory: self-thoughts AND external
@@ -278,7 +284,9 @@ class LatentThoughtModel(nn.Module):
                                  raw_token_ids: torch.Tensor, raw_mask: torch.Tensor,
                                  memory: GestaltMemoryBank, role_id: int, stage: StageFlags,
                                  ema: EMATargetEncoder, cos_weight: float = 1.0,
-                                 var_weight: float = 0.0, ponder_weight: float = 0.0,
+                                 var_weight: float = 0.0, pred_var_weight: float = 0.0,
+                                 contrastive_weight: float = 0.0, contrastive_temp: float = 0.07,
+                                 ponder_weight: float = 0.0,
                                  chunk_vecs=None):
         """
         The predictive branch (§2.1), run ON the HRM loop and SEQUENTIALLY so the
@@ -342,7 +350,7 @@ class LatentThoughtModel(nn.Module):
         h_state = l_state = None
         total_ponder = torch.zeros((), device=device)
         n_valid = 0
-        preds, targets = [], []
+        preds, targets, hs_all = [], [], []
         for t in range(n_chunks):
             active = chunk_mask[:, t]
             if not active.any():
@@ -365,15 +373,34 @@ class LatentThoughtModel(nn.Module):
                 if pair.any():
                     preds.append(self.pred_head(h_state)[pair])
                     targets.append(tgt[:, t + 1][pair])
+                    hs_all.append(h_state[pair])
 
-        cos = (scaled_cosine_loss(torch.cat(preds, 0), torch.cat(targets, 0), k=self.cfg.cosine_loss_k)
+        pred_cat = torch.cat(preds, 0) if preds else None
+        cos = (scaled_cosine_loss(pred_cat, torch.cat(targets, 0), k=self.cfg.cosine_loss_k)
                if preds else torch.zeros((), device=device))
+        # Anti-collapse on the PREDICTIONS themselves (the encoder-side twin is
+        # `var` below). Dormant at the default weight 0.0 -> byte-identical.
+        pvw = pred_var_weight
+        pred_var = (prediction_variance_loss(pred_cat)
+                    if (pvw > 0 and pred_cat is not None) else torch.zeros((), device=device))
+        contrast = (prediction_contrastive_loss(pred_cat, torch.cat(targets, 0), contrastive_temp)
+                    if (contrastive_weight > 0 and pred_cat is not None) else torch.zeros((), device=device))
+        # Diagnose WHERE a collapse lives: pred_collapse is pred_head's OUTPUT, but if
+        # the loop's h_state is itself constant the information is already gone upstream
+        # and no predictor-side term can recover it (that distinction decides whether a
+        # collapsed checkpoint can be RESUMED or must be retrained).
+        self.last_pred_collapse = (prediction_collapse_metric(pred_cat)
+                                   if pred_cat is not None else 0.0)
+        self.last_hstate_collapse = (prediction_collapse_metric(torch.cat(hs_all, 0))
+                                     if hs_all else 0.0)
         flat_valid = chunk_mask.reshape(batch * n_chunks)
         var = (variance_regularization(chunk_vecs.reshape(batch * n_chunks, -1)[flat_valid])
                if var_weight > 0 else torch.zeros((), device=device))
         if n_valid > 0:
             total_ponder = total_ponder / n_valid
-        return cos_weight * cos + var_weight * var, ponder_cost_loss(total_ponder, ponder_weight)
+        return (cos_weight * cos + var_weight * var + pvw * pred_var
+                + contrastive_weight * contrast,
+                ponder_cost_loss(total_ponder, ponder_weight))
 
     # ------------------------------------------------------------------
     # Supervised halt gate (experiments.md #2): the ACT-alternative predictor.

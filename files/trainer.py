@@ -153,6 +153,9 @@ class Trainer:
             ssl, ponder = self.model.forward_self_supervised(
                 ct, cm, ri, rm, memory, SELF, flags, self.ema,
                 cos_weight=self.train_cfg.ssl_loss_weight, var_weight=self.train_cfg.ssl_var_weight,
+                pred_var_weight=getattr(self.train_cfg, 'ssl_pred_var_weight', 0.0),
+                contrastive_weight=getattr(self.train_cfg, 'ssl_contrastive_weight', 0.0),
+                contrastive_temp=getattr(self.train_cfg, 'ssl_contrastive_temp', 0.07),
                 ponder_weight=self.model_cfg.act_ponder_cost, chunk_vecs=chunk_vecs)
             total = (ssl if total is None else total + ssl) + ponder
             if want_logs:
@@ -337,10 +340,22 @@ class Trainer:
                 # ("latent_std"). They used to differ (log said `lstd=`, JSON stored
                 # `latent_std`), so grepping the log for the name you saw in the
                 # curves silently found nothing. Keep them identical.
+                # pred_collapse: mean cos(pred_i, mean(pred)). ~1.0 == the predictor emits a
+                # CONSTANT vector -- the degenerate optimum of the cosine SSL objective, which
+                # `ssl` cannot distinguish from a healthy plateau and `latent_std` (encoder-only)
+                # never sees. A finished small-w3 run hit 0.98 here while every other logged
+                # number looked fine. Assigned BEFORE the emit that reads it.
+                pc = getattr(self.model, "last_pred_collapse", None)
+                hc = getattr(self.model, "last_hstate_collapse", None)
                 self._emit(f"[step {self.global_step}] stage={self.curriculum.stage.name} lr={lr:.2e} "
-                           f"logs={step_logs} val_loss={val_loss:.4f} latent_std={lstd:.4f}")
+                           f"logs={step_logs} val_loss={val_loss:.4f} latent_std={lstd:.4f}"
+                           + (f" pred_collapse={pc:.4f}" if pc else "")
+                           + (f" hstate_collapse={hc:.4f}" if hc else ""))
                 self.metrics.append({"step": self.global_step, "stage": self.curriculum.stage.name,
-                                     "val_loss": val_loss, "latent_std": round(lstd, 4), **step_logs})
+                                     "val_loss": val_loss, "latent_std": round(lstd, 4),
+                                     **({"pred_collapse": round(pc, 4)} if pc else {}),
+                                     **({"hstate_collapse": round(hc, 4)} if hc else {}),
+                                     **step_logs})
 
             # Advance the curriculum BEFORE checkpointing: the checkpoint must
             # capture the post-step curriculum state (stage_idx/step_in_stage),
@@ -445,7 +460,26 @@ class Trainer:
                 f"are NOT interchangeable (a different module family is built). Re-pass the "
                 f"original arch flags (e.g. --norm layer), or start a FRESH run with a new "
                 f"--out to train the new architecture from scratch.")
-        self.model.load_state_dict(ckpt["model_state"])
+        # SURGICAL RESUME (--reinit-pred-head): keep the encoder / HRM loop / Talker,
+        # throw away pred_head. This is the rescue for a MEAN-COLLAPSED predictor --
+        # measured on a finished small-w3 run, cos(pred, mean(pred)) = 0.98 while the
+        # loop's h_state still varied (0.88), i.e. the thoughts were fine and only the
+        # head had degenerated. Also the only way to load an old Linear-head checkpoint
+        # into a new MLP head (pred_head_hidden > 0), whose keys/shapes differ.
+        _state = ckpt["model_state"]
+        if getattr(self.train_cfg, "reinit_pred_head", False):
+            dropped = [k for k in _state if k.startswith("pred_head.")]
+            _state = {k: v for k, v in _state.items() if not k.startswith("pred_head.")}
+            missing, unexpected = self.model.load_state_dict(_state, strict=False)
+            missing = [k for k in missing if not k.startswith("pred_head.")]
+            if missing or unexpected:
+                raise RuntimeError(f"--reinit-pred-head: unexpected key drift beyond pred_head "
+                                   f"(missing={missing}, unexpected={unexpected})")
+            print(f"[trainer] --reinit-pred-head: dropped {len(dropped)} pred_head tensor(s); "
+                  f"the head starts FRESH on top of the restored encoder/loop. "
+                  f"Everything else resumed.", flush=True)
+        else:
+            self.model.load_state_dict(_state)
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.ema.load_state_dict(ckpt["ema"])
         if self.scaler is not None and ckpt.get("scaler") is not None:

@@ -126,6 +126,18 @@ class ModelConfig:
     # (constant) latent; a slower target (higher momentum) is a stronger
     # anti-collapse defense (§3.4). Retune per scale.
     ema_momentum: float = 0.996
+    # ---- predictor head capacity -----------------------------------------
+    # pred_head maps a finished thought -> the next chunk's EMA-target latent. It was
+    # a single nn.Linear(d_latent, d_latent), and on a finished small-w3 run it
+    # MEAN-COLLAPSED: cos(pred, mean(pred)) = 0.98 while the loop's own h_state still
+    # varied (self-cos 0.88) -- i.e. the thoughts were informative and one linear map
+    # threw them away. A small MLP gives the head enough capacity to express a
+    # non-degenerate map. 0 = plain Linear (DEFAULT, byte-identical to every existing
+    # checkpoint); >0 builds Linear(d_latent,h) -> GELU -> Linear(h,d_latent).
+    # NOTE: changing this CHANGES THE STATE_DICT -- an existing checkpoint cannot be
+    # resumed into it without --reinit-pred-head (which is the intended rescue: keep
+    # the good encoder/loop/Talker, discard the collapsed head).
+    pred_head_hidden: int = 0
 
     # ---- adaptive computation time / test-time compute dial (§1.1, §5.5) -
     act_ponder_cost: float = 0.01
@@ -382,6 +394,27 @@ class TrainConfig:
     # this weight where the old linear SSL flirted with collapse. RE-TUNE at scale.)
     ssl_loss_weight: float = 1.0              # weight on the on-loop SSL cosine prediction term
     ssl_var_weight: float = 2.0              # weight on the anti-collapse variance regularizer
+    # Anti-collapse for the PREDICTOR (losses.prediction_variance_loss). The cosine
+    # SSL objective's degenerate optimum is emitting ONE constant vector near the
+    # target centroid: good cosine, zero information. `ssl_var_weight` above guards
+    # only the ENCODER, so nothing caught it -- a finished small-w3 run measured
+    # cos(pred, mean(pred)) = 0.98 while cos(pred, true next) = 0.705 barely beat
+    # cos(pred, WRONG next) = 0.673. DEFAULT 0.0 == byte-identical to every existing
+    # run; set it (e.g. 3.0, mirroring ssl_var_weight) to make "do not emit a
+    # constant" a first-class objective on a NEW run.
+    ssl_pred_var_weight: float = 0.0
+    # InfoNCE over the next-latent prediction (losses.prediction_contrastive_loss).
+    # More targeted than the variance hinge above: the hinge stops CONSTANT output but
+    # does not require INFORMATIVE output, while InfoNCE directly optimizes the
+    # matched-vs-shuffled margin that a collapsed predictor fails. Use ALONGSIDE the
+    # cosine term (which anchors the prediction to the decodable EMA space), never
+    # instead of it. DEFAULT 0.0 == byte-identical to every existing run.
+    ssl_contrastive_weight: float = 0.0
+    ssl_contrastive_temp: float = 0.07
+    # Drop pred_head on resume and start it fresh (see trainer.resume). Run-time
+    # choice, not architecture -- pairs with pred_head_hidden for the rescue path.
+    reinit_pred_head: bool = False
+
     log_every: int = 10                       # full metric line (runs eval -> val_loss; feeds metrics.json/curves)
     heartbeat_every: int = 0                  # cheap "[step N] stage=X" liveness ping every N steps, NO eval/metrics;
                                               # 0 = off. Decoupled from log_every so slow GPUs still show progress

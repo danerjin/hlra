@@ -224,6 +224,88 @@ def variance_regularization(z: torch.Tensor, target_std: float = 0.1, eps: float
     return torch.clamp(target_std - std, min=0.0).mean()
 
 
+def prediction_variance_loss(pred: torch.Tensor, target_std: float = 0.1,
+                             eps: float = 1e-4) -> torch.Tensor:
+    """
+    Anti-collapse for the PREDICTOR (the twin of `variance_regularization`, which
+    guards only the ENCODER).
+
+    Why this exists: `scaled_cosine_loss(pred, target)` has a degenerate optimum --
+    emit one constant vector near the centroid of the target distribution. It scores
+    a respectable cosine against everything while carrying ZERO information about
+    which chunk comes next. Nothing in the A-E objective penalized that, and it is
+    what a small-w3 run actually did: measured on the finished checkpoint,
+    cos(pred_i, mean(pred)) = 0.98 (sd 0.011) -- the predictions were ~one vector --
+    while cos(pred, TRUE next) = 0.705 barely beat cos(pred, WRONG next) = 0.673.
+    `ssl` sat at ~1.57 the whole time and looked like a healthy plateau.
+
+    Same hinge shape as the encoder term so it is dormant in normal operation and
+    only bites as the predictions converge: penalize per-dimension std of the batch
+    of predictions falling below `target_std`. It constrains SPREAD, not direction,
+    so it cannot fight the cosine objective for any non-degenerate solution.
+
+    pred: (N, d) a batch of predicted latents. Returns a scalar.
+    """
+    if pred.shape[0] < 2:
+        return torch.zeros((), device=pred.device)
+    std = torch.sqrt(pred.var(dim=0, unbiased=False) + eps)      # (d,)
+    return torch.clamp(target_std - std, min=0.0).mean()
+
+
+@torch.no_grad()
+def prediction_collapse_metric(pred: torch.Tensor) -> float:
+    """
+    Diagnostic: mean cos(pred_i, mean(pred)). ~1.0 == the predictor emits a constant.
+
+    This is the number whose ABSENCE let a mean-collapsed predictor look healthy for
+    an entire run: `ssl` cannot distinguish "learned all it can" from "gave up and
+    outputs a constant", and `latent_std` only watches the encoder. Log it.
+    """
+    if pred.shape[0] < 2:
+        return 0.0
+    m = pred.mean(0, keepdim=True).expand_as(pred)
+    return float(F.cosine_similarity(pred, m, dim=-1).mean())
+
+
+def prediction_contrastive_loss(pred: torch.Tensor, target: torch.Tensor,
+                                temperature: float = 0.07) -> torch.Tensor:
+    """
+    InfoNCE over the next-latent prediction, with IN-BATCH negatives.
+
+    Why this and not just the cosine regression: `scaled_cosine_loss` says "be close
+    to the target" but never "be CLOSER to THIS target than to other chunks", so a
+    constant at the target centroid satisfies it. InfoNCE makes exactly that margin
+    the objective -- a constant predictor produces identical logits for every
+    candidate, i.e. a uniform softmax, i.e. the WORST possible loss. The degenerate
+    solution stops being a solution.
+
+    Measured motivation: on a finished small-w3 run, cos(pred, TRUE next) = 0.705 vs
+    cos(pred, WRONG next) = 0.673 -- the predictor barely distinguished the true
+    continuation from a random one. That 3-point margin is what this optimizes.
+
+    Negatives are free: for pred_i the positive is target_i and every other target_j
+    in the batch is a negative. Because preds/targets are concatenated over BOTH the
+    chunk index and the batch, the negatives naturally mix HARD ones (other chunks of
+    the same document, semantically adjacent) with EASY ones (other documents).
+
+    IMPORTANT -- use this IN ADDITION TO the cosine term, not instead of it. InfoNCE
+    is invariant to scale/offset (it only constrains relative similarity), but the
+    Talker DECODES pred_head's output at generation, so the prediction must stay in
+    the EMA-encoder's space. Pure contrastive can rank candidates perfectly while
+    drifting to a scale nothing can decode -- fixing the metric, not the model.
+
+    pred, target: (N, d). `target` should already be detached (EMA, no_grad).
+    """
+    n = pred.shape[0]
+    if n < 2:
+        return torch.zeros((), device=pred.device)
+    p = F.normalize(pred, dim=-1)
+    t = F.normalize(target, dim=-1)
+    logits = (p @ t.t()) / max(temperature, 1e-4)              # (N, N)
+    labels = torch.arange(n, device=pred.device)
+    return F.cross_entropy(logits, labels)
+
+
 def trust_prior_loss(trust_by_role: torch.Tensor, user_idx: int, self_idx: int,
                      margin: float = 0.1, floor: float = 0.2) -> torch.Tensor:
     """

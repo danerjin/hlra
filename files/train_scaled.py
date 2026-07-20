@@ -71,6 +71,25 @@ def main():
     ap.add_argument("--ssl-weight", type=float, default=None,
                     help="override ssl_loss_weight (default 1.0, co-equal with reconstruction; "
                          "the on-loop SSL that trains the HRM loop to predict forward)")
+    ap.add_argument("--pred-var-weight", type=float, default=0.0,
+                    help="anti-collapse weight on the PREDICTIONS (losses.prediction_variance_loss). "
+                         "The cosine SSL objective's degenerate optimum is emitting one constant "
+                         "vector; --var-weight guards only the ENCODER. 0.0 (default) = today's "
+                         "behaviour; try 3.0 (mirroring --var-weight) on a NEW run. Watch "
+                         "pred_collapse in the log: ~1.0 means the predictor went constant.")
+    ap.add_argument("--pred-contrastive-weight", type=float, default=0.0,
+                    help="InfoNCE weight on the next-latent prediction (in-batch negatives). More "
+                         "targeted than --pred-var-weight: the hinge stops CONSTANT output, InfoNCE "
+                         "requires INFORMATIVE output. Use alongside the cosine term, never instead "
+                         "of it. 0.0 = today's behaviour; try 1.0 on a NEW run.")
+    ap.add_argument("--pred-head-hidden", type=int, default=0,
+                    help="make pred_head an MLP: Linear(d_latent,H)->GELU->Linear(H,d_latent). "
+                         "0 (default) = the plain Linear, byte-identical to existing checkpoints. "
+                         "CHANGES THE STATE_DICT -- to load an old checkpoint into it, add "
+                         "--reinit-pred-head.")
+    ap.add_argument("--reinit-pred-head", action="store_true",
+                    help="on resume, discard pred_head and start it fresh on top of the restored "
+                         "encoder/loop/Talker. The rescue for a mean-collapsed predictor.")
     ap.add_argument("--var-weight", type=float, default=None,
                     help="override ssl_var_weight (default 2.0, the VICReg-style per-dim variance "
                          "floor that resists latent collapse). At wider d_latent the latent starts "
@@ -115,7 +134,8 @@ def main():
     total_steps = sum(stage_steps)
     max_steps = args.max_steps if args.max_steps is not None else total_steps
 
-    model_cfg = model_config(args.preset, halt_mode=args.halt_mode,
+    model_cfg = model_config(args.preset, pred_head_hidden=args.pred_head_hidden,
+                             halt_mode=args.halt_mode,
                              halt_target=args.halt_target,
                              norm=args.norm)                # defaults == unchanged
     cache_dir = os.path.join(PROJECT, args.cache)
@@ -145,6 +165,9 @@ def main():
         checkpoint_every=args.checkpoint_every,
         checkpoint_archive_every=args.archive_every,
         warmup_steps=max(100, total_steps // 50), total_steps=total_steps,
+        ssl_pred_var_weight=args.pred_var_weight,
+        ssl_contrastive_weight=args.pred_contrastive_weight,
+        reinit_pred_head=args.reinit_pred_head,
         grounded_loss_min_frequency=1.0,   # reconstruction stays the always-on anchor
         stage_steps=stage_steps,
         per_stage_lr=(args.lr_schedule == "per-stage"),

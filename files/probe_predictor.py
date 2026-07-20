@@ -72,7 +72,7 @@ def collect(model, ema, batch, flags, device):
     tgt = model._encode_real_rows(flat, ema.encode).reshape(batch_n, n_chunks, -1)
 
     memory = GestaltMemoryBank(model.cfg.memory_capacity, model.cfg.d_latent)
-    preds, targets = [], []
+    preds, targets, hstates = [], [], []
     for t in range(n_chunks):
         valid = cm[:, t]
         if not bool(valid.any()):
@@ -87,9 +87,10 @@ def collect(model, ema, batch, flags, device):
             if bool(pair.any()):
                 preds.append(model.pred_head(h_state)[pair])
                 targets.append(tgt[:, t + 1][pair])
+                hstates.append(h_state[pair])
     if not preds:
-        return None, None
-    return torch.cat(preds, 0), torch.cat(targets, 0)
+        return None, None, None
+    return torch.cat(preds, 0), torch.cat(targets, 0), torch.cat(hstates, 0)
 
 
 def main(argv=None):
@@ -126,16 +127,16 @@ def main(argv=None):
     flags = StageFlags(use_hrm_loop=True, detach_memory=False, inner_loop_grad_window=5,
                        memory_grad_window=5, use_act=args.act, use_input_lanes=False)
 
-    P, T = [], []
+    P, T, H = [], [], []
     for i, batch in enumerate(loader):
         if i >= args.batches:
             break
-        p, t = collect(model, ema, batch, flags, device)
+        p, t, h = collect(model, ema, batch, flags, device)
         if p is not None:
-            P.append(p); T.append(t)
+            P.append(p); T.append(t); H.append(h)
     if not P:
         raise SystemExit("no valid (chunk_t, chunk_t+1) pairs found -- try more --batches")
-    pred, target = torch.cat(P, 0), torch.cat(T, 0)
+    pred, target, hstate = torch.cat(P, 0), torch.cat(T, 0), torch.cat(H, 0)
     n = pred.shape[0]
 
     perm = torch.randperm(n)
@@ -153,7 +154,9 @@ def main(argv=None):
     print(f"  MATCHED   pred vs true next    : {f(matched)}   -> ssl = k*(1-cos) = {k*(1-matched.mean().item()):.3f}")
     print(f"  SHUFFLED  pred vs wrong next   : {f(shuffled)}   <- chance")
     print(f"  MEAN-BASE mean(target) vs true : {f(meanbase)}   <- the degenerate strategy")
+    hself = F.cosine_similarity(hstate, hstate.mean(0, keepdim=True).expand_as(hstate), dim=-1)
     print(f"  PRED-SELF pred vs mean(pred)   : {f(predself)}   <- 1.0 means constant output")
+    print(f"  HSTATE    h_t  vs mean(h)      : {f(hself)}   <- WHERE the collapse lives")
 
     gap = (matched - shuffled).mean().item()
     lift = matched.mean().item() - meanbase.mean().item()
@@ -163,6 +166,14 @@ def main(argv=None):
     if predself.mean().item() > 0.98:
         print("  VERDICT: predictions are ~a CONSTANT vector -> mean-collapse. The SSL number is")
         print("           meaningless as a capability measure; fix the predictor before tuning it.")
+        if hself.mean().item() > 0.98:
+            print("           ...and h_state is ALSO ~constant: the collapse is UPSTREAM, in the")
+            print("           loop/encoder. pred_head cannot be blamed and no predictor-side term")
+            print("           can recover it -> a fresh run is required, resuming will not help.")
+        else:
+            print(f"           ...but h_state still VARIES (self-cos {hself.mean().item():.3f}): the loop")
+            print("           computes informative thoughts and only pred_head threw them away.")
+            print("           A RESUME with a contrastive/variance term can plausibly recover.")
     elif gap < 0.05:
         print("  VERDICT: matched ~= shuffled -> the predictor is NOT resolving which chunk comes")
         print("           next. Pushing ssl lower will not help; it is optimizing a content-free term.")

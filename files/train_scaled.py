@@ -95,6 +95,14 @@ def main():
                          "--pred-contrastive-weight 1.0). --resume would instead restore the optimizer "
                          "(param groups mismatch if the head changed) AND the curriculum position "
                          "(step 45450 vs a 3000-step budget -> the loop exits immediately).")
+    ap.add_argument("--freeze-except-pred-head", action="store_true",
+                    help="freeze EVERY parameter except pred_head. Turns the run into a pure probe of "
+                         "the frozen thoughts: can a head extract the next-chunk signal from h_state as "
+                         "it already is? REQUIRED when pairing --reinit-pred-head with a contrastive "
+                         "term -- a randomly-initialized head produces a huge InfoNCE loss whose "
+                         "gradient backprops into the pretrained HRM loop and COLLAPSES it (measured: "
+                         "hstate_collapse 0.86 -> 0.99 within 100 steps, invisible to val_loss because "
+                         "forward_grounded is encoder->Talker with no loop).")
     ap.add_argument("--reinit-pred-head", action="store_true",
                     help="on resume, discard pred_head and start it fresh on top of the restored "
                          "encoder/loop/Talker. The rescue for a mean-collapsed predictor.")
@@ -238,6 +246,18 @@ def main():
               + ". FRESH optimizer + curriculum; training starts at step 0.", flush=True)
     elif resume:
         trainer.load(resume)
+
+    if args.freeze_except_pred_head:
+        frozen = trainable = 0
+        for n, prm in model.named_parameters():
+            if n.startswith("pred_head."):
+                trainable += prm.numel()
+            else:
+                prm.requires_grad_(False); frozen += prm.numel()
+        print(f"[train_scaled] --freeze-except-pred-head: {frozen:,} params FROZEN, "
+              f"{trainable:,} trainable (pred_head only). The encoder/loop/Talker cannot move, "
+              f"so hstate_collapse must stay flat -- if it drifts, something else is training.",
+              flush=True)
 
     trainer.train(max_steps=max_steps, progress=args.progress)
     trainer.save("model.pt")

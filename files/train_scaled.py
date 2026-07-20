@@ -103,6 +103,17 @@ def main():
                          "gradient backprops into the pretrained HRM loop and COLLAPSES it (measured: "
                          "hstate_collapse 0.86 -> 0.99 within 100 steps, invisible to val_loss because "
                          "forward_grounded is encoder->Talker with no loop).")
+    ap.add_argument("--reinit-loop", action="store_true",
+                    help="on --init-from, discard the HRM loop (hrm_loop.*) and start it FRESH. Pairs "
+                         "with --reinit-pred-head + --freeze-encoder to ask the clean question: given "
+                         "the foundation's converged representations, can a fresh loop learn to PREDICT "
+                         "the next chunk? (The finished checkpoint's own loop cannot -- its h_state has "
+                         "no next-chunk signal; measured GAP ~0.03 frozen.)")
+    ap.add_argument("--freeze-encoder", action="store_true",
+                    help="freeze the chunk encoder + EMA target + Talker (chunk_encoder/talker/input_lane). "
+                         "Keeps the SSL targets STATIONARY so the mean-baseline (LIFT) is not inflated by "
+                         "a still-warming encoder -- the confound in the half-warm A-checkpoint run. Trains "
+                         "only the loop + pred_head.")
     ap.add_argument("--reinit-pred-head", action="store_true",
                     help="on resume, discard pred_head and start it fresh on top of the restored "
                          "encoder/loop/Talker. The rescue for a mean-collapsed predictor.")
@@ -233,11 +244,13 @@ def main():
         src = args.init_from if os.path.isabs(args.init_from) else os.path.join(PROJECT, args.init_from)
         sd = torch.load(src, map_location=device, weights_only=False)["model_state"]
         dropped = 0
-        if args.reinit_pred_head:
-            dropped = len([k for k in sd if k.startswith("pred_head.")])
-            sd = {k: v for k, v in sd.items() if not k.startswith("pred_head.")}
+        drop_prefixes = tuple(
+            pfx for pfx, on in [("pred_head.", args.reinit_pred_head), ("hrm_loop.", args.reinit_loop)] if on)
+        if drop_prefixes:
+            dropped = len([k for k in sd if k.startswith(drop_prefixes)])
+            sd = {k: v for k, v in sd.items() if not k.startswith(drop_prefixes)}
         missing, unexpected = model.load_state_dict(sd, strict=False)
-        missing = [k for k in missing if not (args.reinit_pred_head and k.startswith("pred_head."))]
+        missing = [k for k in missing if not k.startswith(drop_prefixes)]
         if missing or unexpected:
             raise SystemExit(f"--init-from {src}: state_dict mismatch beyond pred_head "
                              f"(missing={missing[:6]}, unexpected={unexpected[:6]})")
@@ -246,6 +259,17 @@ def main():
               + ". FRESH optimizer + curriculum; training starts at step 0.", flush=True)
     elif resume:
         trainer.load(resume)
+
+    if args.freeze_encoder:
+        FREEZE = ("chunk_encoder.", "talker.", "input_lane.")
+        fz = tr = 0
+        for n, prm in model.named_parameters():
+            if n.startswith(FREEZE): prm.requires_grad_(False); fz += prm.numel()
+            else: tr += prm.numel()
+        # the EMA target is a momentum copy of chunk_encoder; with the encoder frozen it
+        # is already stationary (update() moves it toward an unchanging online encoder).
+        print(f"[train_scaled] --freeze-encoder: {fz:,} params frozen (encoder/talker/input_lane), "
+              f"{tr:,} trainable (loop + head). SSL targets are stationary.", flush=True)
 
     if args.freeze_except_pred_head:
         frozen = trainable = 0

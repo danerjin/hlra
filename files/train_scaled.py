@@ -87,6 +87,14 @@ def main():
                          "0 (default) = the plain Linear, byte-identical to existing checkpoints. "
                          "CHANGES THE STATE_DICT -- to load an old checkpoint into it, add "
                          "--reinit-pred-head.")
+    ap.add_argument("--init-from", default=None,
+                    help="initialize MODEL WEIGHTS from this checkpoint, then train from step 0 with "
+                         "a fresh optimizer and curriculum. This is NOT --resume: use it to continue "
+                         "TRAINING A MODEL under a new objective/architecture (e.g. the mean-collapse "
+                         "rescue: --init-from runs/scaled/model.pt --reinit-pred-head "
+                         "--pred-contrastive-weight 1.0). --resume would instead restore the optimizer "
+                         "(param groups mismatch if the head changed) AND the curriculum position "
+                         "(step 45450 vs a 3000-step budget -> the loop exits immediately).")
     ap.add_argument("--reinit-pred-head", action="store_true",
                     help="on resume, discard pred_head and start it fresh on top of the restored "
                          "encoder/loop/Talker. The rescue for a mean-collapsed predictor.")
@@ -209,7 +217,26 @@ def main():
               f"(pass --fresh to start over, or --resume PATH for a specific checkpoint).")
     else:
         resume = None
-    if resume:
+    if args.init_from and resume:
+        raise SystemExit("--init-from and --resume are mutually exclusive: --init-from starts a NEW "
+                         "run from borrowed weights; --resume continues an existing one. Add --fresh "
+                         "if <out>/checkpoint.pt exists and you meant --init-from.")
+    if args.init_from:
+        src = args.init_from if os.path.isabs(args.init_from) else os.path.join(PROJECT, args.init_from)
+        sd = torch.load(src, map_location=device, weights_only=False)["model_state"]
+        dropped = 0
+        if args.reinit_pred_head:
+            dropped = len([k for k in sd if k.startswith("pred_head.")])
+            sd = {k: v for k, v in sd.items() if not k.startswith("pred_head.")}
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        missing = [k for k in missing if not (args.reinit_pred_head and k.startswith("pred_head."))]
+        if missing or unexpected:
+            raise SystemExit(f"--init-from {src}: state_dict mismatch beyond pred_head "
+                             f"(missing={missing[:6]}, unexpected={unexpected[:6]})")
+        print(f"[train_scaled] --init-from {src}: loaded weights"
+              + (f" (dropped {dropped} pred_head tensor(s) -> fresh head)" if dropped else "")
+              + ". FRESH optimizer + curriculum; training starts at step 0.", flush=True)
+    elif resume:
         trainer.load(resume)
 
     trainer.train(max_steps=max_steps, progress=args.progress)

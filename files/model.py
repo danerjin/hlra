@@ -286,6 +286,7 @@ class LatentThoughtModel(nn.Module):
                                  ema: EMATargetEncoder, cos_weight: float = 1.0,
                                  var_weight: float = 0.0, pred_var_weight: float = 0.0,
                                  contrastive_weight: float = 0.0, contrastive_temp: float = 0.07,
+                                 contrastive_hard: bool = False, token_weight: float = 0.0,
                                  ponder_weight: float = 0.0,
                                  chunk_vecs=None):
         """
@@ -350,7 +351,8 @@ class LatentThoughtModel(nn.Module):
         h_state = l_state = None
         total_ponder = torch.zeros((), device=device)
         n_valid = 0
-        preds, targets, hs_all = [], [], []
+        preds, targets, hs_all, groups, next_tok = [], [], [], [], []
+        batch_idx = torch.arange(batch, device=device)   # doc id per row, for hard-negative InfoNCE
         for t in range(n_chunks):
             active = chunk_mask[:, t]
             if not active.any():
@@ -374,6 +376,9 @@ class LatentThoughtModel(nn.Module):
                     preds.append(self.pred_head(h_state)[pair])
                     targets.append(tgt[:, t + 1][pair])
                     hs_all.append(h_state[pair])
+                    groups.append(batch_idx[pair])
+                    if token_weight > 0:
+                        next_tok.append(chunk_tensor[:, t + 1][pair])   # (n_active, L) tokens of t+1
 
         pred_cat = torch.cat(preds, 0) if preds else None
         cos = (scaled_cosine_loss(pred_cat, torch.cat(targets, 0), k=self.cfg.cosine_loss_k)
@@ -383,7 +388,9 @@ class LatentThoughtModel(nn.Module):
         pvw = pred_var_weight
         pred_var = (prediction_variance_loss(pred_cat)
                     if (pvw > 0 and pred_cat is not None) else torch.zeros((), device=device))
-        contrast = (prediction_contrastive_loss(pred_cat, torch.cat(targets, 0), contrastive_temp)
+        group_cat = torch.cat(groups, 0) if (contrastive_hard and groups) else None
+        contrast = (prediction_contrastive_loss(pred_cat, torch.cat(targets, 0),
+                                                contrastive_temp, group_ids=group_cat)
                     if (contrastive_weight > 0 and pred_cat is not None) else torch.zeros((), device=device))
         # Diagnose WHERE a collapse lives: pred_collapse is pred_head's OUTPUT, but if
         # the loop's h_state is itself constant the information is already gone upstream
@@ -393,13 +400,28 @@ class LatentThoughtModel(nn.Module):
                                    if pred_cat is not None else 0.0)
         self.last_hstate_collapse = (prediction_collapse_metric(torch.cat(hs_all, 0))
                                      if hs_all else 0.0)
+        # TOKEN-GROUNDED prediction (JEPA-Reasoner's next-token phase on our reasoner):
+        # decode the PREDICTED next latent through the codec Talker, teacher-forced
+        # against chunk t+1's own tokens. Distributional over the vocabulary, so a
+        # centroid latent (which beats the cosine/InfoNCE terms) pays high NLL here --
+        # it decodes to generic tokens, not THIS chunk's. The prediction is put on the
+        # target's norm shell first (cosine trains direction only; the Talker consumes
+        # unnormalized -- same rescale generation uses).
+        if token_weight > 0 and pred_cat is not None:
+            tgt_cat = torch.cat(targets, 0)
+            pred_scaled = self._rescale_to(pred_cat, tgt_cat.norm(dim=-1))
+            nll_sum, n_tok = self.score_tokens(torch.cat(next_tok, 0), pred_scaled)
+            token_nll = nll_sum / n_tok.clamp_min(1.0)
+        else:
+            token_nll = torch.zeros((), device=device)
+        self.last_token_nll = float(token_nll) if token_weight > 0 else 0.0
         flat_valid = chunk_mask.reshape(batch * n_chunks)
         var = (variance_regularization(chunk_vecs.reshape(batch * n_chunks, -1)[flat_valid])
                if var_weight > 0 else torch.zeros((), device=device))
         if n_valid > 0:
             total_ponder = total_ponder / n_valid
         return (cos_weight * cos + var_weight * var + pvw * pred_var
-                + contrastive_weight * contrast,
+                + contrastive_weight * contrast + token_weight * token_nll,
                 ponder_cost_loss(total_ponder, ponder_weight))
 
     # ------------------------------------------------------------------

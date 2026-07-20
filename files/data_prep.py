@@ -172,6 +172,10 @@ def main():
     ap.add_argument("--docs", type=int, default=None, help="cap #documents (single-dataset path)")
     ap.add_argument("--max-tokens", type=int, default=None)
     ap.add_argument("--min-chunks", type=int, default=None)
+    ap.add_argument("--max-chunk-len", type=int, default=None,
+                    help="override the preset's max_chunk_len (thought granularity) for this cache. "
+                         "Train against it with train_scaled --max-chunk-len <same>. Used by the "
+                         "granularity sweep (probe_granularity_sweep.sh).")
     args = ap.parse_args()
     torch.set_grad_enabled(False)   # prep is inference-only (SaT + chunking); no autograd to accumulate
 
@@ -185,8 +189,9 @@ def main():
 
     # vocab_size is set from the chunker's tokenizer; the model built later must
     # match it, so we record it in the manifest.
+    _mcl = {"max_chunk_len": args.max_chunk_len} if args.max_chunk_len else {}
     if args.offline:
-        model_cfg = model_config(args.preset, vocab_size=8000)
+        model_cfg = model_config(args.preset, vocab_size=8000, **_mcl)
         chunker = build_offline_chunker(model_cfg)
         vocab_size = model_cfg.vocab_size
         text_iter = iter(SyntheticTextCorpus(n_docs=args.docs or 2000, seed=0))
@@ -197,7 +202,7 @@ def main():
         # (build_pipeline), so the cache matches the intended pipeline instead of
         # a regex approximation. Lazy-imported so --offline needs no wtpsplit.
         # Pin the tokenizer to the local gpt2 dir: offline + deterministic ids.
-        model_cfg = model_config(args.preset)  # vocab fixed after chunker build
+        model_cfg = model_config(args.preset, **_mcl)  # vocab fixed after chunker build
         if args.regex:
             from data import build_regex_gpt2_chunker
             chunker, vocab_size = build_regex_gpt2_chunker(model_cfg, TOKENIZER_DIR)

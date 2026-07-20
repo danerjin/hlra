@@ -82,6 +82,25 @@ def main():
                          "targeted than --pred-var-weight: the hinge stops CONSTANT output, InfoNCE "
                          "requires INFORMATIVE output. Use alongside the cosine term, never instead "
                          "of it. 0.0 = today's behaviour; try 1.0 on a NEW run.")
+    ap.add_argument("--pred-contrastive-hard", action="store_true",
+                    help="HARD-NEGATIVE InfoNCE: restrict each row's negatives to other chunks of the "
+                         "SAME document, dropping the trivial cross-document negatives. The clean "
+                         "experiment showed the all-negatives loss is won by topic separation, not by "
+                         "resolving the next chunk; this forces the fine distinction. Needs "
+                         "--pred-contrastive-weight > 0; pair with a SMALL --ssl-weight (e.g. 0.2) so "
+                         "cosine keeps predictions decodable without re-imposing the mean.")
+    ap.add_argument("--pred-token-weight", type=float, default=0.0,
+                    help="TOKEN-GROUNDED prediction (JEPA-Reasoner's next-token phase, on our loop): "
+                         "decode the PREDICTED next latent through the Talker and score chunk t+1's "
+                         "actual tokens (NLL). Distributional over the vocab, so a centroid latent "
+                         "can't satisfy it -- the direct attack on mean-collapse. 0.0 = off; try 1.0. "
+                         "Logs `tok_nll` (must fall). Pair with --freeze-encoder so it trains the "
+                         "loop+head to hit the fixed codec, not the codec to the collapsed prediction.")
+    ap.add_argument("--max-chunk-len", type=int, default=None,
+                    help="override the preset's max_chunk_len (thought granularity). MUST match the "
+                         "cache built by data_prep --max-chunk-len. Smaller = lower-entropy next-latent "
+                         "target (closer to JEPA-Reasoner's near-token regime) -- the granularity sweep "
+                         "that tests whether the centroid collapse is a granularity wall.")
     ap.add_argument("--pred-head-hidden", type=int, default=0,
                     help="make pred_head an MLP: Linear(d_latent,H)->GELU->Linear(H,d_latent). "
                          "0 (default) = the plain Linear, byte-identical to existing checkpoints. "
@@ -161,10 +180,11 @@ def main():
     total_steps = sum(stage_steps)
     max_steps = args.max_steps if args.max_steps is not None else total_steps
 
+    _mcl = {"max_chunk_len": args.max_chunk_len} if args.max_chunk_len else {}
     model_cfg = model_config(args.preset, pred_head_hidden=args.pred_head_hidden,
                              halt_mode=args.halt_mode,
                              halt_target=args.halt_target,
-                             norm=args.norm)                # defaults == unchanged
+                             norm=args.norm, **_mcl)        # defaults == unchanged
     cache_dir = os.path.join(PROJECT, args.cache)
     ds = CachedChunkDataset(cache_dir, expect={
         "max_chunk_len": model_cfg.max_chunk_len,
@@ -194,6 +214,8 @@ def main():
         warmup_steps=max(100, total_steps // 50), total_steps=total_steps,
         ssl_pred_var_weight=args.pred_var_weight,
         ssl_contrastive_weight=args.pred_contrastive_weight,
+        ssl_contrastive_hard=args.pred_contrastive_hard,
+        ssl_token_weight=args.pred_token_weight,
         reinit_pred_head=args.reinit_pred_head,
         grounded_loss_min_frequency=1.0,   # reconstruction stays the always-on anchor
         stage_steps=stage_steps,

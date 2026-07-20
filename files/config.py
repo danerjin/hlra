@@ -411,6 +411,24 @@ class TrainConfig:
     # instead of it. DEFAULT 0.0 == byte-identical to every existing run.
     ssl_contrastive_weight: float = 0.0
     ssl_contrastive_temp: float = 0.07
+    # HARD-NEGATIVE InfoNCE: restrict each row's negatives to other chunks of the
+    # SAME document (semantically adjacent, hard) and drop the trivial cross-document
+    # negatives. The clean-experiment probe showed the all-negatives loss is won by
+    # gross topic separation, not by resolving the next chunk (matched 0.689 vs
+    # shuffled 0.643); this forces the fine distinction. Only matters when
+    # ssl_contrastive_weight > 0. DEFAULT False == the original all-in-batch negatives.
+    ssl_contrastive_hard: bool = False
+    # TOKEN-GROUNDED prediction (JEPA-Reasoner's next-token pretraining, adapted to
+    # our reasoner): decode the loop's PREDICTED next latent through the codec Talker
+    # and score it against chunk t+1's actual TOKENS (teacher-forced NLL via
+    # model.score_tokens). Unlike the cosine/InfoNCE latent terms, this is a
+    # distribution over the vocabulary -- a centroid latent decodes to generic tokens
+    # and pays high NLL on specific next chunks, so it CANNOT satisfy this by
+    # collapsing (that is the whole point: attack the mean-collapse in token space,
+    # where JEPA-Reasoner grounds its latents before the latent SSL). The prediction
+    # is rescaled onto the encoder-latent norm shell first (cosine trains direction,
+    # the Talker consumes unnormalized). DEFAULT 0.0 == byte-identical.
+    ssl_token_weight: float = 0.0
     # Drop pred_head on resume and start it fresh (see trainer.resume). Run-time
     # choice, not architecture -- pairs with pred_head_hidden for the rescue path.
     reinit_pred_head: bool = False

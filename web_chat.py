@@ -94,6 +94,18 @@ PAGE = r"""<!doctype html>
   .dbg .read{margin-top:4px}
   .dbg .read .pill{background:#2a2a26;border-color:var(--line)}
   .score{display:inline-block;margin-top:6px;background:#2a2a26;border:1px solid var(--line);border-radius:7px;padding:4px 10px;font-variant-numeric:tabular-nums}
+  .ae{margin-top:4px}
+  .ae .row2{background:#2a2a26;border:1px solid var(--line);border-radius:9px;padding:10px 12px;margin-bottom:8px}
+  .ae .io{display:grid;grid-template-columns:34px 1fr;gap:4px 8px;align-items:baseline}
+  .ae .io .k{color:var(--muted);font-size:11px;text-transform:uppercase}
+  .ae .io .v{white-space:pre-wrap;word-break:break-word}
+  .ae .io .v.in{color:var(--accent2)} .ae .io .v.out{color:var(--text)}
+  .ae .exact{color:#6bbf6b;font-size:11px;margin-left:6px}
+  .ae .miss{color:var(--accent);font-size:11px;margin-left:6px}
+  .ae .stat{margin-top:6px;color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
+  .ae .latbtn{background:none;border:0;color:var(--accent);cursor:pointer;font:inherit;font-size:11px;padding:0;margin-top:4px}
+  .ae .latvec{display:none;margin-top:6px;max-height:150px;overflow:auto;background:#191917;border:1px solid var(--line);
+              border-radius:7px;padding:8px;font:11px/1.5 ui-monospace,Menlo,monospace;color:var(--muted);white-space:pre-wrap;word-break:break-all}
   /* composer */
   .composer{border-top:1px solid var(--line);background:var(--bg)}
   .composer .wrap{padding:14px 22px 18px;display:flex;gap:10px;align-items:flex-end}
@@ -116,8 +128,9 @@ PAGE = r"""<!doctype html>
       <button data-mode="generate" class="on">Generate</button>
       <button data-mode="dialogue">Chat</button>
       <button data-mode="score">Score</button>
+      <button data-mode="autoencode">Codec</button>
     </div>
-    <div class="sub" style="margin-top:2px">Chat = Stage-F two-lane serving (cross-turn memory); Clear resets it.</div>
+    <div class="sub" style="margin-top:2px">Chat = Stage-F two-lane serving (cross-turn memory); Clear resets it. Codec = encode→decode round-trip (no loop) to check the autoencoder + inspect raw latents.</div>
   </div>
 
   <div class="card">
@@ -174,7 +187,9 @@ function refreshMeta(){fetch("/api/info").then(r=>r.json()).then(m=>{
 $("#mode").addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;
   mode=b.dataset.mode;[...$("#mode").children].forEach(x=>x.classList.toggle("on",x===b));
   box.placeholder = mode==="score" ? "Text to score (perplexity)…"
-                  : mode==="dialogue" ? "Message the chatbot…" : "Message the model…";});
+                  : mode==="dialogue" ? "Message the chatbot…"
+                  : mode==="autoencode" ? "Text to encode → decode (codec round-trip)…"
+                  : "Message the model…";});
 
 $("#temp").oninput=e=>$("#tempv").textContent=(+e.target.value).toFixed(2);
 $("#nchunks").oninput=e=>$("#nv").textContent=e.target.value;
@@ -203,6 +218,29 @@ function renderChunks(container, chunks, viz){
   else{container.appendChild(el("div","txt",chunks.join(" ")));}
 }
 
+function renderAutoencode(container, rows){
+  if(!rows || !rows.length){container.appendChild(el("div","txt","(nothing encodable)"));return;}
+  const wrap=el("div","ae");
+  rows.forEach((r,i)=>{
+    const box2=el("div","row2");
+    const io=el("div","io");
+    io.appendChild(el("span","k","in")); io.appendChild(el("div","v in",r.original));
+    io.appendChild(el("span","k","out"));
+    const out=el("div","v out"); out.appendChild(document.createTextNode(r.recon));
+    out.appendChild(el("span",r.exact?"exact":"miss",r.exact?"exact match":"differs"));
+    io.appendChild(out); box2.appendChild(io);
+    box2.appendChild(el("div","stat",`#${i+1} · latent dim=${r.dim} · norm=${r.norm.toFixed(4)} · std=${r.std.toFixed(4)}`));
+    const btn=el("button","latbtn","▸ show raw latent vector");
+    const vec=el("div","latvec","["+r.latent.map(v=>v.toFixed(6)).join(", ")+"]");
+    btn.onclick=()=>{const open=vec.style.display==="block";
+      vec.style.display=open?"none":"block";
+      btn.textContent=(open?"▸ show":"▾ hide")+" raw latent vector";};
+    box2.appendChild(btn); box2.appendChild(vec);
+    wrap.appendChild(box2);
+  });
+  container.appendChild(wrap);
+}
+
 function send(){
   const text=box.value.trim(); if(!text) return;
   const viz=$("#viz").checked, showread=$("#showread").checked, showppl=$("#showppl").checked;
@@ -228,6 +266,13 @@ function send(){
         if(showread){const d=el("div","dbg");
           d.appendChild(el("div",null,`you → ${r.read.length} chunks · reply → ${r.reply.length} thoughts`));
           const rr=el("div","read");renderChunks(rr,r.read,true);d.appendChild(rr);bot.appendChild(d);}}
+      $("#send").disabled=false;box.focus();});
+    return;
+  }
+  if(mode==="autoencode"){
+    api("/api/autoencode",{text,temperature:temp}).then(r=>{bot.innerHTML="";
+      if(r.error){bot.appendChild(el("div","txt","error: "+r.error));$("#send").disabled=false;box.focus();return;}
+      renderAutoencode(bot, r.rows);
       $("#send").disabled=false;box.focus();});
     return;
   }
@@ -320,6 +365,11 @@ class Handler(BaseHTTPRequestHandler):
                                        "read": chat_core.input_chunks(ch, text)})
                 if self.path == "/api/chunks":
                     return self._json({"read": chat_core.input_chunks(ch, text)})
+                if self.path == "/api/autoencode":
+                    temp = float(body.get("temperature", 0.9))
+                    rows = chat_core.autoencode_json(m, ch, cfg, text, temperature=temp)
+                    return self._json({"rows": rows,
+                                       "read": chat_core.input_chunks(ch, text)})
                 if self.path == "/api/generate":
                     n = int(body.get("n_chunks", 3))
                     temp = float(body.get("temperature", 0.9))

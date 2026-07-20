@@ -16,7 +16,9 @@ FILES = os.path.join(HERE, "files")
 if FILES not in sys.path:
     sys.path.insert(0, FILES)
 
-from generate import load, generate as _generate, score as _score, _decode  # noqa: E402
+import torch  # noqa: E402
+from generate import (load, generate as _generate, score as _score,  # noqa: E402
+                      _decode, talker_decode as _talker_decode)
 
 # Rare control char used to split generate()'s joined output back into a list of
 # per-chunk strings without re-implementing the (subtle) generation loop.
@@ -57,6 +59,58 @@ def generate_chunks(model, chunker, cfg, text, n_chunks=3, temperature=0.9, gree
 def score_text(model, chunker, cfg, text):
     """Teacher-forced reconstruction perplexity of `text`. Returns (nll, ppl)."""
     return _score(model, chunker, cfg, text)
+
+
+@torch.no_grad()
+def autoencode(model, chunker, cfg, text, temperature=0.9, greedy=True):
+    """Pure encoder->Talker autoencoder round-trip, per chunk. This is exactly the
+    `forward_grounded` reconstruction anchor's inference form: encode a chunk to its
+    ENCODER-space latent, decode THAT SAME latent back to tokens with the codec
+    Talker (empty memory, NO HRM loop). It isolates the codec from the reasoning
+    loop, so it answers "does the autoencoder round-trip?" without prediction in the
+    way.
+
+    Defaults to greedy decode -- for checking codec fidelity you want the argmax
+    reconstruction, not a sampled one. Returns a list of per-chunk dicts:
+        {"original": str, "recon": str, "latent": Tensor(d_latent,)}
+    where `latent` is the RAW encoder latent vector (detached, on CPU)."""
+    ct, cm = chunker.chunk_batch([text])          # (1, C, L)
+    tok = chunker.tokenizer
+    out = []
+    for t in range(ct.shape[1]):
+        if not bool(cm[0, t]):
+            continue
+        chunk_ids = ct[:, t, :]                    # (1, L)
+        original = _decode(tok, chunk_ids[0]).strip()
+        if not original:
+            continue
+        latent = model.chunk_encoder(chunk_ids, chunk_ids != 0)   # (1, d_latent)
+        ids = _talker_decode(model, latent, cfg, temperature=temperature, greedy=greedy)
+        recon = _decode(tok, ids).strip()
+        out.append({"original": original,
+                    "recon": recon,
+                    "latent": latent[0].detach().cpu()})
+    return out
+
+
+def autoencode_json(model, chunker, cfg, text, temperature=0.9):
+    """JSON-serializable form of autoencode() for the web UI: the raw latent tensor
+    is rendered to a plain float list, with norm/std precomputed so the frontend
+    (which never imports torch) can display them directly."""
+    rows = autoencode(model, chunker, cfg, text, temperature=temperature, greedy=True)
+    out = []
+    for r in rows:
+        lat = r["latent"]
+        out.append({
+            "original": r["original"],
+            "recon": r["recon"],
+            "exact": r["recon"] == r["original"],
+            "dim": int(lat.numel()),
+            "norm": float(lat.norm()),
+            "std": float(lat.std()),
+            "latent": [round(float(v), 6) for v in lat.tolist()],
+        })
+    return out
 
 
 def load_dialogue_checkpoint(ckpt_path):

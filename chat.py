@@ -12,6 +12,10 @@ At the prompt:
     <any text>       -> generate a continuation from that text
     :score <text>    -> teacher-forced reconstruction perplexity of <text>
     :chunks <text>   -> just show how <text> splits into chunks (no generation)
+    :auto <text>     -> autoencoder round-trip: encode each chunk to its latent,
+                        then decode that same latent back (encoder->Talker, no loop)
+    :latent <text>   -> :auto plus a dump of the RAW latent vector per chunk
+                        (norm, first components, full vector)
     :sep             -> toggle the '|' chunk-border markers on/off
     :temp <float>    -> set sampling temperature (default 0.9)
     :n <int>         -> set how many chunks to generate (default 3)
@@ -45,7 +49,8 @@ def main():
     info = chat_core.ckpt_summary(cfg, ckpt)
     print(f"[chat] ready. stage={info['stage_reached']} step={info['global_step']} "
           f"d_model={info['d_model']} vocab={info['vocab_size']}")
-    print("[chat] commands: <text> | :score <t> | :chunks <t> | :sep | :temp f | :n k | :q")
+    print("[chat] commands: <text> | :score <t> | :chunks <t> | :auto <t> | :latent <t> "
+          "| :sep | :temp f | :n k | :q")
     print("[chat] chunk borders shown as '|'  (output coherence depends on the run's scale)\n")
 
     show_borders = True
@@ -93,6 +98,30 @@ def main():
                 print("  (nothing to score)\n"); continue
             nll, ppl = chat_core.score_text(model, chunker, cfg, payload)
             print(f"  avg NLL/token = {nll:.3f}   perplexity = {ppl:.1f}\n")
+            continue
+        if text.startswith(":auto") or text.startswith(":latent"):
+            dump_latent = text.startswith(":latent")
+            cue = ":latent" if dump_latent else ":auto"
+            payload = text[len(cue):].strip()
+            if not payload:
+                print("  (no text to autoencode)\n"); continue
+            # greedy: for a codec-fidelity check we want the argmax reconstruction
+            rows = chat_core.autoencode(model, chunker, cfg, payload, greedy=True)
+            if not rows:
+                print("  (nothing encodable)\n"); continue
+            for i, r in enumerate(rows):
+                lat = r["latent"]
+                match = "  <-- exact" if r["recon"] == r["original"] else ""
+                print(f"  chunk {i}:")
+                print(f"    in : {r['original']!r}")
+                print(f"    out: {r['recon']!r}{match}")
+                print(f"    latent: dim={lat.numel()} norm={lat.norm():.4f} "
+                      f"std={lat.std():.4f}")
+                if dump_latent:
+                    head = ", ".join(f"{v:+.4f}" for v in lat[:8].tolist())
+                    print(f"    latent[:8] = [{head}, ...]")
+                    print(f"    latent full = {lat.tolist()}")
+            print()
             continue
 
         sep = " | " if show_borders else " "

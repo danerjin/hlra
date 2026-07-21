@@ -101,6 +101,11 @@ def main():
                          "cache built by data_prep --max-chunk-len. Smaller = lower-entropy next-latent "
                          "target (closer to JEPA-Reasoner's near-token regime) -- the granularity sweep "
                          "that tests whether the centroid collapse is a granularity wall.")
+    ap.add_argument("--n-cycles", type=int, default=None,
+                    help="override h_updates_per_thought (HRM-Text recurrent depth; default 2). The "
+                         "FIXED-DEPTH sweep: train at n_cycles 2/3/4 and compare -- does more TRAINED "
+                         "recurrent depth help (unlike inference-time ACT extension, which probe_depth "
+                         "showed does not). Must stay <= act_max_ponder_steps (6).")
     ap.add_argument("--pred-head-hidden", type=int, default=0,
                     help="make pred_head an MLP: Linear(d_latent,H)->GELU->Linear(H,d_latent). "
                          "0 (default) = the plain Linear, byte-identical to existing checkpoints. "
@@ -181,6 +186,8 @@ def main():
     max_steps = args.max_steps if args.max_steps is not None else total_steps
 
     _mcl = {"max_chunk_len": args.max_chunk_len} if args.max_chunk_len else {}
+    if args.n_cycles:
+        _mcl["h_updates_per_thought"] = args.n_cycles   # HRM-Text recurrent depth (fixed-depth sweep)
     model_cfg = model_config(args.preset, pred_head_hidden=args.pred_head_hidden,
                              halt_mode=args.halt_mode,
                              halt_target=args.halt_target,

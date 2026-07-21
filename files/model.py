@@ -409,7 +409,9 @@ class LatentThoughtModel(nn.Module):
         # unnormalized -- same rescale generation uses).
         if token_weight > 0 and pred_cat is not None:
             tgt_cat = torch.cat(targets, 0)
-            pred_scaled = self._rescale_to(pred_cat, tgt_cat.norm(dim=-1))
+            # ref_norm must be a per-row column (N, 1) so it broadcasts over d_latent
+            # (keepdim=True) -- same shape predict_next_latent passes to _rescale_to.
+            pred_scaled = self._rescale_to(pred_cat, tgt_cat.norm(dim=-1, keepdim=True))
             nll_sum, n_tok = self.score_tokens(torch.cat(next_tok, 0), pred_scaled)
             token_nll = nll_sum / n_tok.clamp_min(1.0)
         else:

@@ -409,14 +409,25 @@ class LatentThoughtModel(nn.Module):
         # unnormalized -- same rescale generation uses).
         if token_weight > 0 and pred_cat is not None:
             tgt_cat = torch.cat(targets, 0)
+            ntok_cat = torch.cat(next_tok, 0)
+            p_cat = pred_cat
+            # score_tokens materializes an (N, L, vocab) logits tensor -- ~12 GiB at
+            # batch 32 (N ~ batch x chunks, L=64, vocab ~ 50k), which OOMs in backward.
+            # Cap the decoded transitions to a random subset per step: an unbiased
+            # estimate of the same per-token NLL that bounds peak memory independent of
+            # batch size and still covers every transition over training.
+            max_rows = 256
+            if p_cat.shape[0] > max_rows:
+                idx = torch.randperm(p_cat.shape[0], device=device)[:max_rows]
+                p_cat, tgt_cat, ntok_cat = p_cat[idx], tgt_cat[idx], ntok_cat[idx]
             # ref_norm must be a per-row column (N, 1) so it broadcasts over d_latent
             # (keepdim=True) -- same shape predict_next_latent passes to _rescale_to.
-            pred_scaled = self._rescale_to(pred_cat, tgt_cat.norm(dim=-1, keepdim=True))
-            nll_sum, n_tok = self.score_tokens(torch.cat(next_tok, 0), pred_scaled)
+            pred_scaled = self._rescale_to(p_cat, tgt_cat.norm(dim=-1, keepdim=True))
+            nll_sum, n_tok = self.score_tokens(ntok_cat, pred_scaled)
             token_nll = nll_sum / n_tok.clamp_min(1.0)
         else:
             token_nll = torch.zeros((), device=device)
-        self.last_token_nll = float(token_nll) if token_weight > 0 else 0.0
+        self.last_token_nll = float(token_nll.detach()) if token_weight > 0 else 0.0
         flat_valid = chunk_mask.reshape(batch * n_chunks)
         var = (variance_regularization(chunk_vecs.reshape(batch * n_chunks, -1)[flat_valid])
                if var_weight > 0 else torch.zeros((), device=device))

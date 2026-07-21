@@ -30,6 +30,10 @@
 # (broken native LayerNorm-backward kernel); harmless elsewhere.
 set -euo pipefail
 
+# Python interpreter: default `python`, but the ROCm torch lives in a venv, so under
+# nohup (no shell activation) set PYTHON to the venv binary, e.g.
+#   PYTHON=~/hlra/.venv/bin/python ./probe_granularity_sweep.sh
+PY="${PYTHON:-python}"
 PRESET="${PRESET:-small-w3}"
 L_LIST="${L_LIST:-8 16 32 64}"
 STAGE_A="${STAGE_A:-1500}"          # codec (encoder+Talker) warmup
@@ -43,7 +47,7 @@ OUTROOT="${OUTROOT:-runs/gran_sweep}"
 export LATENT_MANUAL_LAYERNORM="${LATENT_MANUAL_LAYERNORM:-1}"
 mkdir -p "$OUTROOT"
 SUMMARY="$OUTROOT/summary.txt"
-: > "$SUMMARY"
+touch "$SUMMARY"   # preserve prior L rows across a resumed/partial sweep (rm it for a clean slate)
 
 echo "[sweep] preset=$PRESET  L_LIST='$L_LIST'  stages A=$STAGE_A B=$STAGE_B  device=$DEVICE"
 echo "[sweep] results -> $OUTROOT   summary -> $SUMMARY"
@@ -55,17 +59,17 @@ for L in $L_LIST; do
   echo "=================== L = $L ==================="
 
   echo "[sweep] (1/3) building cache $CACHE at max_chunk_len=$L ..."
-  python files/data_prep.py --preset "$PRESET" --max-chunk-len "$L" \
+  "$PY" files/data_prep.py --preset "$PRESET" --max-chunk-len "$L" \
       --max-tokens "$MAX_TOKENS" --out "$CACHE"
 
   echo "[sweep] (2/3) training fresh A+B at L=$L -> $OUT ..."
-  python files/train_scaled.py --preset "$PRESET" --max-chunk-len "$L" \
+  "$PY" files/train_scaled.py --preset "$PRESET" --max-chunk-len "$L" \
       --cache "$CACHE" --stage-steps "${STAGE_A},${STAGE_B},0,0,0,0" \
       --device "$DEVICE" --out "$OUT" $EXTRA_TRAIN
 
   echo "[sweep] (3/3) probing $OUT/model.pt ..."
   PROBE_OUT="$OUT/probe.txt"
-  python files/probe_predictor.py --ckpt "$OUT/model.pt" --cache "$CACHE" \
+  "$PY" files/probe_predictor.py --ckpt "$OUT/model.pt" --cache "$CACHE" \
       --batches "$BATCHES" --device "$DEVICE" | tee "$PROBE_OUT"
 
   # Pull the two verdict numbers (probe prints "GAP ... = +0.0458" / "LIFT ... = -0.0148").

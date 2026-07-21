@@ -64,9 +64,18 @@ for L in $L_LIST; do
       --max-tokens "$MAX_TOKENS" --out "$CACHE"
 
   echo "[sweep] (2/3) training fresh A+B at L=$L -> $OUT ..."
+  rm -rf "$OUT"   # each arm is a FRESH run: a stale checkpoint.pt would auto-resume, and the
+                  # rebuilt cache differs slightly (GPU SaT is nondeterministic) so the resume
+                  # dataset-identity guard would then reject it. Clean dir => no resume.
   "$PY" files/train_scaled.py --preset "$PRESET" --max-chunk-len "$L" \
       --cache "$CACHE" --stage-steps "${STAGE_A},${STAGE_B},0,0,0,0" \
       --device "$DEVICE" --out "$OUT" $EXTRA_TRAIN
+
+  if [ ! -f "$OUT/model.pt" ]; then
+    echo "[sweep] L=$L: training produced no model.pt -- skipping probe, marking TRAIN-FAIL"
+    printf "L=%-4s  GAP=%-9s  LIFT=%-9s  (%s)\n" "$L" "TRAIN-FAIL" "TRAIN-FAIL" "$OUT" | tee -a "$SUMMARY"
+    continue
+  fi
 
   echo "[sweep] (3/3) probing $OUT/model.pt ..."
   PROBE_OUT="$OUT/probe.txt"

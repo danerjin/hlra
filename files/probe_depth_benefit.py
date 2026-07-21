@@ -66,6 +66,7 @@ def collect_by_depth(model, ema, batch, device, min_depth, cap):
 
     memory = GestaltMemoryBank(model.cfg.memory_capacity, model.cfg.d_latent)
     per_depth = [[] for _ in range(cap)]
+    hstep = [[] for _ in range(cap)]   # cos(h_k, h_{k-1}): does the STATE converge?
     for t in range(n_chunks):
         valid = cm[:, t]
         if not bool(valid.any()):
@@ -80,9 +81,13 @@ def collect_by_depth(model, ema, batch, device, min_depth, cap):
                 for k in range(cap):
                     pred = F.normalize(model.pred_head(trace[k])[pair], dim=-1)
                     per_depth[k].append((pred * target).sum(-1))   # cosine per pair
+                    if k > 0:  # how much did the H-state move from the previous cycle?
+                        a = F.normalize(trace[k][pair], dim=-1)
+                        b = F.normalize(trace[k - 1][pair], dim=-1)
+                        hstep[k].append((a * b).sum(-1))
         # Continue the sequence on the DEPLOYED min-depth H-state (index min_depth-1).
         memory.write(trace[min_depth - 1], SELF)
-    return per_depth
+    return per_depth, hstep
 
 
 def main(argv=None):
@@ -116,18 +121,20 @@ def main(argv=None):
     loader = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, shuffle=False)
 
     pooled = [[] for _ in range(cap)]
+    hpooled = [[] for _ in range(cap)]
     for i, batch in enumerate(loader):
         if i >= args.batches:
             break
-        pd = collect_by_depth(model, ema, batch, device, min_depth, cap)
+        pd, hs = collect_by_depth(model, ema, batch, device, min_depth, cap)
         for k in range(cap):
             pooled[k].extend(pd[k])
+            hpooled[k].extend(hs[k])
     if not pooled[0]:
         raise SystemExit("no valid (chunk_t, chunk_t+1) pairs found -- try more --batches")
 
-    print(f"\n[depth] cos(pred_head(h_at_cycle_k), EMA(true next)) vs loop depth "
-          f"({sum(x.numel() for x in pooled[0])} pairs):\n")
-    print(f"  {'depth':>5}  {'cos':>8}  {'Δ vs prev':>10}  {'Δ vs depth1':>12}   note")
+    print(f"\n[depth] cos(pred_head(h_at_cycle_k), EMA(true next)) vs loop depth, and "
+          f"cos(h_k, h_k-1) = how much the H-STATE moved ({sum(x.numel() for x in pooled[0])} pairs):\n")
+    print(f"  {'depth':>5}  {'pred_cos':>9}  {'Δ vs prev':>10}  {'h moved (cos h_k,h_k-1)':>24}   note")
     base = None
     prev = None
     for k in range(cap):
@@ -135,11 +142,11 @@ def main(argv=None):
         if base is None:
             base = cos_k
         d_prev = "" if prev is None else f"{cos_k - prev:+.4f}"
-        d_base = f"{cos_k - base:+.4f}"
+        hmoved = "" if k == 0 else f"{float(torch.cat(hpooled[k]).mean()):.4f}"
         note = ""
         if k + 1 == min_depth:
             note = "<- min-depth floor (deployed)"
-        print(f"  {k+1:>5}  {cos_k:>8.4f}  {d_prev:>10}  {d_base:>12}   {note}")
+        print(f"  {k+1:>5}  {cos_k:>9.4f}  {d_prev:>10}  {hmoved:>24}   {note}")
         prev = cos_k
 
     total_gain = float(torch.cat(pooled[cap - 1]).mean()) - float(torch.cat(pooled[min_depth - 1]).mean())

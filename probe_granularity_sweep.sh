@@ -59,6 +59,7 @@ for L in $L_LIST; do
   echo "=================== L = $L ==================="
 
   echo "[sweep] (1/3) building cache $CACHE at max_chunk_len=$L ..."
+  rm -rf "$CACHE"   # data_prep insists on a FRESH dir; clear any partial cache from a crashed run
   "$PY" files/data_prep.py --preset "$PRESET" --max-chunk-len "$L" \
       --max-tokens "$MAX_TOKENS" --out "$CACHE"
 

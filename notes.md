@@ -821,6 +821,86 @@ run lands, so nothing is discovered on results day. `generate.py --score` / gene
   short option is a single `pred_head`→Talker decode. At `small` scale ARC-C will also sit
   near chance. If a headline benchmark is wanted, LAMBADA/HellaSwag is the honest choice.
 
+## Predictor mean-collapse investigation (2026-07-20/21) — IMPORTANT
+
+The first big A→E run reached a near-lossless codec (`val_loss` ~0.0067) but **generated mush.**
+Root cause and the reframe that followed — the load-bearing findings:
+
+**1. The failure is the PREDICTOR, not the codec.** Good codec (round-trips), but the on-loop
+predictor (`pred_head(h_t) → next latent`) mean-collapsed: on the foundation, `probe_predictor`
+showed PRED-SELF **0.98** (predictions ~constant) while HSTATE was 0.88 (the loop's states were
+still diverse). So the loop reasons, but `pred_head` crushes its diverse states into a near-constant
+vector — which decodes to generic tokens → mush. `pred_collapse` / `hstate_collapse` were added to the
+train log + `metrics.json` precisely because `ssl` and `latent_std` **cannot see this** (a collapsed
+predictor and a good one score the same `ssl`; `latent_std` only watches the encoder).
+
+**2. The "mean-collapse is fatal / a scale wall" verdict was largely a FROZEN-ENCODER ARTIFACT.**
+The clean experiment (frozen foundation encoder + fresh loop+head + contrastive) probed at LIFT
+**−0.015** (predictor *worse* than emitting the target centroid) — read at the time as "the loop can't
+predict, H1 scale wall." But a **granularity sweep** (fresh A+B per `L`, encoder CO-TRAINED with the
+loop, plain cosine) told a different story:
+
+| max_chunk_len | GAP (matched−shuffled) | LIFT (matched−meanbase) |
+|---|---|---|
+| 8  | +0.080 | +0.041 |
+| 16 | +0.109 | +0.054 |
+| 32 | +0.116 | +0.055 |
+| 64 | +0.152 | **+0.078** |
+
+LIFT is **positive at every granularity and rises as thoughts get coarser** — so (a) **granularity is
+NOT the wall** (the sentence-sized-thought worry is unfounded; L=64 predicts best), and (b) a
+co-trained predictor is **informative** (beats the centroid). The I-JEPA "condition the predictor on
+the target position" idea was considered and **retracted** — it doesn't map: we always predict t+1
+(one target, no position to disambiguate), and our entropy is *generative* (many valid futures), not
+*positional* like a masked image patch.
+
+**3. What flipped the sign was UNFREEZING THE ENCODER, not the loss or granularity.** The tell: the
+clean experiment used **contrastive** (the *better* anti-collapse loss) + frozen → collapsed; the sweep
+used plain **cosine** (the mean-seeker) + co-trained → informative. The loss points the *wrong* way, so
+encoder co-training dominates it. Caveat: co-training lets the encoder shape its own targets to be
+predictable (a possible shortcut), so "informative" still needs the downstream meaning check.
+
+**4. The remaining bottleneck is the TRAIN/SERVE GAP.** Even informative, MATCHED cos is only ~0.50 —
+the predicted latent is half-aligned to the true next. The Talker is trained on REAL latents
+(reconstruction, cos~1.0) but at generation decodes PREDICTED (~0.5-cos) latents it never practiced on.
+Measured directly by the new **token-grounding** loss (`--pred-token-weight`, `ssl_token_weight`):
+decode the PREDICTED latent through the Talker vs the real next tokens (`model.score_tokens`, rescaled
+onto the encoder norm shell). On a short run the `tok_nll − nll` gap sat at **~1.5 nats** and did not
+close — likely near an information floor (a 0.5-cos latent genuinely carries less about the next tokens).
+NOTE: `tok_nll` is **teacher-forced**, so it closes the *latent* exposure gap but is blind to the
+*token* one (autoregressive decode from the Talker's own samples) — `web_chat` free-running generation
+stays the final arbiter.
+
+**5. THE OPEN QUESTION — collapse is a LATE-TRAINING ATTRACTOR.** The foundation (long, co-trained,
+good codec) collapsed to PRED-SELF 0.98; the short co-trained runs (sweep, token-grounding test) sit at
+~0.76–0.87 and do NOT collapse. The only systematic difference is **training length + data**. So the
+short runs likely just haven't fallen into the attractor yet, and a naive big run would reproduce the
+mush. Crucially, the *only* training-level difference between the proposed big run and the foundation
+is the added losses — so those losses must be a **real, well-placed** difference, not a sprinkle.
+
+**The anti-collapse regime (what the next big run actually changes):**
+- **Token-grounding from Stage B** (moved from D+; `curriculum.loss_plan`). Its gradient into
+  `pred_head` is centroid-PROOF (a constant prediction decodes to generic tokens → high token NLL), so
+  it must run *during* the whole collapse-prone window as a PREVENTATIVE, not arrive in D as a fix. A
+  D+ gate is too late if the attractor forms in B/C.
+- **Hard-negative InfoNCE from Stage B** (`--pred-contrastive-weight --pred-contrastive-hard`). The
+  *most direct* anti-collapse pressure: a centroid predictor gives a uniform softmax = the worst
+  InfoNCE loss. Hard negatives (same-document chunks) force the fine next-chunk distinction rather than
+  cross-doc topic separation. Kept alongside the cosine anchor so it can't drift to an undecodable
+  scale. (Was at chance in the frozen clean experiment — plausibly because frozen refined targets
+  weren't rankable; co-training should give it traction. Unproven.)
+- Both hit the confirmed collapse point (`pred_head`) via complementary mechanisms (decodability vs
+  ranking margin). All default-off; the A→E semantics are byte-identical without the flags.
+
+**Decision criterion for the big run** (instrument `pred_collapse` over time, probe intermediate
+checkpoints — do NOT wait for the end): `pred_collapse` stays down through long training → the attractor
+is broken (then ablate which lever mattered). `pred_collapse` climbs back toward 0.98 with BOTH losses
+on → it is **not** a loss problem (architectural / scale) and we stop tuning losses.
+
+Tooling added this round: autoencoder round-trip in the chat interfaces (`chat.py` `:auto`/`:latent`,
+`web_chat.py` Codec mode) to separate codec failures from predictor failures; `--max-chunk-len`
+override on `data_prep`/`train_scaled` + `probe_granularity_sweep.sh` for the sweep.
+
 ## Post-run experiments
 
 See [`experiments.md`](experiments.md) — TRM-inspired ablations (arXiv:2510.04871) mapped onto this

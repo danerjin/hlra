@@ -257,13 +257,18 @@ class Curriculum:
         # autoencoder is cheap (codec, parallel) so it runs every step; the SSL is
         # the sequential/expensive one now.
         #
-        # Token-grounded consolidation from Stage D: once fixed-depth prediction is
-        # stable (post-C) the loop's PREDICTED latents are informative enough to
-        # ground the Talker on -- so decode them through the Talker vs the real next
-        # tokens (train/serve exposure fix, StageLossPlan.token_ground_weight). Held
-        # off in B/C where predictions are still maturing. Effective only when
-        # train_cfg.ssl_token_weight > 0 (default 0 => byte-identical A-E).
-        token_ground = 1.0 if stage.value >= Stage.D.value else 0.0
+        # Token-grounded prediction from Stage B (notes 2026-07-21): decode the loop's
+        # PREDICTED latent through the Talker vs the real next tokens
+        # (StageLossPlan.token_ground_weight). Originally gated to D+ ("ground on mature
+        # predictions"), but the foundation collapsed as a LATE-TRAINING attractor, and
+        # this term's gradient into pred_head is centroid-PROOF (a constant prediction
+        # decodes to generic tokens => high token NLL). So it must run DURING the whole
+        # collapse-prone window as a PREVENTATIVE, not arrive in D as a fix -- if the
+        # attractor forms in B/C, a D+ gate is too late. On from B here. The cost
+        # (grounding the Talker on noisier early predictions) is accepted; the codec's
+        # reconstruction anchor still trains it on real latents in parallel. Effective
+        # only when train_cfg.ssl_token_weight > 0 (default 0 => byte-identical A-E).
+        token_ground = 1.0 if stage.value >= Stage.B.value else 0.0
         return StageLossPlan(use_grounded_loss=True, use_self_supervised_loss=True,
                               grounded_loss_weight=1.0, self_supervised_loss_weight=1.0,
                               token_ground_weight=token_ground)

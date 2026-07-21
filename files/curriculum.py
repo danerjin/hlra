@@ -59,6 +59,16 @@ class StageLossPlan:
     use_self_supervised_loss: bool = False
     grounded_loss_weight: float = 1.0
     self_supervised_loss_weight: float = 0.0
+    # Token-grounded consolidation (train/serve exposure fix): per-stage multiplier
+    # on the token-grounding loss. The Talker is trained (Stage A/B) to decode REAL
+    # encoder latents, but at generation it decodes the loop's PREDICTED latents,
+    # which are only ~0.5-cos aligned (the probe's train/serve gap). This term
+    # decodes the PREDICTED latent through the Talker vs the real next tokens, so the
+    # Talker learns to decode imperfect predictions. Effective weight = this *
+    # train_cfg.ssl_token_weight (0 by default => byte-identical; --pred-token-weight
+    # enables it). Gated to Stage D+ in loss_plan() so it grounds on mature, not noisy,
+    # predictions.
+    token_ground_weight: float = 0.0
 
 
 class Curriculum:
@@ -246,5 +256,14 @@ class Curriculum:
         # predictor (which trains the loop + memory to reason forward). The
         # autoencoder is cheap (codec, parallel) so it runs every step; the SSL is
         # the sequential/expensive one now.
+        #
+        # Token-grounded consolidation from Stage D: once fixed-depth prediction is
+        # stable (post-C) the loop's PREDICTED latents are informative enough to
+        # ground the Talker on -- so decode them through the Talker vs the real next
+        # tokens (train/serve exposure fix, StageLossPlan.token_ground_weight). Held
+        # off in B/C where predictions are still maturing. Effective only when
+        # train_cfg.ssl_token_weight > 0 (default 0 => byte-identical A-E).
+        token_ground = 1.0 if stage.value >= Stage.D.value else 0.0
         return StageLossPlan(use_grounded_loss=True, use_self_supervised_loss=True,
-                              grounded_loss_weight=1.0, self_supervised_loss_weight=1.0)
+                              grounded_loss_weight=1.0, self_supervised_loss_weight=1.0,
+                              token_ground_weight=token_ground)

@@ -157,17 +157,18 @@ class Trainer:
                 contrastive_weight=getattr(self.train_cfg, 'ssl_contrastive_weight', 0.0),
                 contrastive_temp=getattr(self.train_cfg, 'ssl_contrastive_temp', 0.07),
                 contrastive_hard=getattr(self.train_cfg, 'ssl_contrastive_hard', False),
-                token_weight=getattr(self.train_cfg, 'ssl_token_weight', 0.0),
+                token_weight=(getattr(plan, 'token_ground_weight', 0.0)
+                              * getattr(self.train_cfg, 'ssl_token_weight', 0.0)),
                 ponder_weight=self.model_cfg.act_ponder_cost, chunk_vecs=chunk_vecs)
             total = (ssl if total is None else total + ssl) + ponder
             if want_logs:
                 logs["ssl"] = round(ssl.item(), 4)
                 logs["ponder"] = round(ponder.item(), 4)
-                if getattr(self.train_cfg, 'ssl_token_weight', 0.0) > 0:
-                    # token-grounded next-chunk NLL (JEPA pretraining term); the value
-                    # that MUST fall if the prediction is resolving the next chunk --
-                    # unlike ssl, a centroid can't fake it. Perplexity-scale, so it is
-                    # readable next to val_loss (reconstruction NLL).
+                if getattr(plan, 'token_ground_weight', 0.0) * getattr(self.train_cfg, 'ssl_token_weight', 0.0) > 0:
+                    # token-grounded next-chunk NLL (train/serve exposure fix); the
+                    # value that MUST fall if the Talker is learning to decode the
+                    # loop's PREDICTED latents -- unlike ssl, a centroid can't fake it.
+                    # Only logged in the stages where it is active (Stage D+).
                     logs["tok_nll"] = round(getattr(self.model, "last_token_nll", 0.0), 4)
         # want_logs=False skips the .item() calls: each is a host-device sync,
         # and three syncs per micro-batch on a launch-overhead-bound workload

@@ -392,6 +392,9 @@ class TrainConfig:
     # (VICReg-style) hard-floors the shared latent's per-dim variance as the
     # anti-collapse backstop. (Notes §25.1: on-loop SSL held latent_std healthy at
     # this weight where the old linear SSL flirted with collapse. RE-TUNE at scale.)
+    recon_loss_weight: float = 1.0            # weight on the reconstruction (autoencoder) anchor;
+                                              # lower it to trade codec sharpness for tolerance to
+                                              # predicted latents (see trainer). Default 1.0 = unchanged.
     ssl_loss_weight: float = 1.0              # weight on the on-loop SSL cosine prediction term
     ssl_var_weight: float = 2.0              # weight on the anti-collapse variance regularizer
     # Anti-collapse for the PREDICTOR (losses.prediction_variance_loss). The cosine

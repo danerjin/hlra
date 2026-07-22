@@ -142,7 +142,14 @@ class Trainer:
             # Autoencoder anchor (encoder -> Talker, no loop): cheap, parallel,
             # always on -- the anchor never thins.
             nll = self.model.forward_grounded(ct, cm, chunk_vecs=chunk_vecs)
-            total = nll
+            # recon_loss_weight (default 1.0) lets an experiment TRADE reconstruction
+            # sharpness for codec TOLERANCE: reconstruction keeps the Talker a rigid
+            # exact-latent decoder (probe: wrong latent -> nll 41), which fights
+            # token-grounding's push to decode imperfect PREDICTED latents. Lowering it
+            # lets the Talker generalize to predicted latents (tok_nll falls) -- at the
+            # cost of higher val_loss and a weaker encoder anchor (watch latent_std).
+            rw = getattr(self.train_cfg, 'recon_loss_weight', 1.0)
+            total = rw * nll if rw != 1.0 else nll
             if want_logs:
                 logs["nll"] = round(nll.item(), 4)
         if plan.use_self_supervised_loss:

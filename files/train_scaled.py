@@ -71,6 +71,11 @@ def main():
     ap.add_argument("--ssl-weight", type=float, default=None,
                     help="override ssl_loss_weight (default 1.0, co-equal with reconstruction; "
                          "the on-loop SSL that trains the HRM loop to predict forward)")
+    ap.add_argument("--recon-weight", type=float, default=1.0,
+                    help="weight on the reconstruction (autoencoder) anchor (default 1.0). Lower it "
+                         "(e.g. 0.5) to trade codec SHARPNESS for TOLERANCE to predicted latents so "
+                         "token-grounding can lower tok_nll -- at the cost of higher val_loss and a "
+                         "weaker encoder anchor (watch latent_std for encoder collapse).")
     ap.add_argument("--pred-var-weight", type=float, default=0.0,
                     help="anti-collapse weight on the PREDICTIONS (losses.prediction_variance_loss). "
                          "The cosine SSL objective's degenerate optimum is emitting one constant "
@@ -227,6 +232,7 @@ def main():
         grounded_loss_min_frequency=1.0,   # reconstruction stays the always-on anchor
         stage_steps=stage_steps,
         per_stage_lr=(args.lr_schedule == "per-stage"),
+        recon_loss_weight=args.recon_weight,
         ssl_loss_weight=(args.ssl_weight if args.ssl_weight is not None else TrainConfig.ssl_loss_weight),
         ssl_var_weight=(args.var_weight if args.var_weight is not None else TrainConfig.ssl_var_weight),
     )

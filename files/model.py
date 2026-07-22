@@ -52,7 +52,7 @@ from talker import Talker
 from ema_target import ChunkEncoder, EMATargetEncoder
 from losses import (scaled_cosine_loss, grounded_nll_loss, ponder_cost_loss,
                     variance_regularization, prediction_variance_loss,
-                    prediction_contrastive_loss,
+                    prediction_contrastive_loss, simcse_loss,
                     prediction_collapse_metric, anti_sycophancy_loss,
                     supervised_halt_loss, turn_end_loss, turn_end_accuracy)
 
@@ -287,6 +287,7 @@ class LatentThoughtModel(nn.Module):
                                  var_weight: float = 0.0, pred_var_weight: float = 0.0,
                                  contrastive_weight: float = 0.0, contrastive_temp: float = 0.07,
                                  contrastive_hard: bool = False, token_weight: float = 0.0,
+                                 simcse_weight: float = 0.0, simcse_temp: float = 0.05,
                                  ponder_weight: float = 0.0,
                                  chunk_vecs=None):
         """
@@ -431,10 +432,23 @@ class LatentThoughtModel(nn.Module):
         flat_valid = chunk_mask.reshape(batch * n_chunks)
         var = (variance_regularization(chunk_vecs.reshape(batch * n_chunks, -1)[flat_valid])
                if var_weight > 0 else torch.zeros((), device=device))
+        # SimCSE (anti-anisotropy, opt-in): a SECOND independent dropout encoding of the
+        # same chunks -- pulled to its twin, pushed off every other chunk -- to spread
+        # the reconstruction-arbitrary cone (random-pair cos ~0.5) toward isotropy /
+        # semantic structure. Trains the shared encoder alongside reconstruction. The
+        # second encoder pass is the cost; gated to zero by default (byte-identical).
+        if simcse_weight > 0:
+            v1 = chunk_vecs.reshape(batch * n_chunks, -1)[flat_valid]
+            v2 = self._encode_real_rows(flat_ids, self.chunk_encoder)[flat_valid]
+            simcse = simcse_loss(v1, v2, simcse_temp)
+        else:
+            simcse = torch.zeros((), device=device)
+        self.last_simcse = float(simcse.detach()) if simcse_weight > 0 else 0.0
         if n_valid > 0:
             total_ponder = total_ponder / n_valid
         return (cos_weight * cos + var_weight * var + pvw * pred_var
-                + contrastive_weight * contrast + token_weight * token_nll,
+                + contrastive_weight * contrast + token_weight * token_nll
+                + simcse_weight * simcse,
                 ponder_cost_loss(total_ponder, ponder_weight))
 
     # ------------------------------------------------------------------

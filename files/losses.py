@@ -224,6 +224,34 @@ def variance_regularization(z: torch.Tensor, target_std: float = 0.1, eps: float
     return torch.clamp(target_std - std, min=0.0).mean()
 
 
+def simcse_loss(view1: torch.Tensor, view2: torch.Tensor,
+                temperature: float = 0.05) -> torch.Tensor:
+    """
+    Unsupervised SimCSE (arXiv:2104.08821) on the chunk encoder. Two independent
+    DROPOUT encodings of the SAME chunks are positives; every other chunk in the batch
+    is a negative. The InfoNCE denominator (the negatives) spreads distinct chunks
+    APART, pushing the latent space off its reconstruction-arbitrary cone (measured:
+    random-pair cos ~0.5, near-degenerate) toward isotropy and semantic structure --
+    the smooth, spread geometry that makes next-latent prediction tractable. The
+    positive (dropout-invariance) keeps each chunk's identity stable.
+
+    Used ALONGSIDE reconstruction, not instead: distinct chunks stay distinct (they are
+    negatives, pushed apart), so the codec stays decodable -- and clause-sized chunks in
+    a wide d_latent leave capacity for both the semantic geometry and reconstruction.
+
+    view1, view2: (N, d), two independent dropout encodings of the same N valid chunks
+    (encode the same chunk_ids twice with the encoder in train mode).
+    """
+    n = view1.shape[0]
+    if n < 2:
+        return torch.zeros((), device=view1.device)
+    z1 = F.normalize(view1, dim=-1)
+    z2 = F.normalize(view2, dim=-1)
+    logits = (z1 @ z2.t()) / max(temperature, 1e-4)          # (N, N)
+    labels = torch.arange(n, device=view1.device)           # positive = same chunk's other view
+    return F.cross_entropy(logits, labels)
+
+
 def prediction_variance_loss(pred: torch.Tensor, target_std: float = 0.1,
                              eps: float = 1e-4) -> torch.Tensor:
     """

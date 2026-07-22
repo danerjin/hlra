@@ -87,6 +87,13 @@ def main():
                          "targeted than --pred-var-weight: the hinge stops CONSTANT output, InfoNCE "
                          "requires INFORMATIVE output. Use alongside the cosine term, never instead "
                          "of it. 0.0 = today's behaviour; try 1.0 on a NEW run.")
+    ap.add_argument("--simcse-weight", type=float, default=0.0,
+                    help="unsupervised SimCSE on the chunk encoder (two dropout views/chunk): spreads "
+                         "the latent space off its reconstruction-arbitrary cone (measured random-pair "
+                         "cos ~0.5) toward isotropy/semantic structure so next-latent targets are more "
+                         "predictable. Costs a second encoder pass. 0.0 = off; try 0.1-1.0. Logs simcse.")
+    ap.add_argument("--simcse-temp", type=float, default=0.05,
+                    help="SimCSE InfoNCE temperature (default 0.05).")
     ap.add_argument("--pred-contrastive-hard", action="store_true",
                     help="HARD-NEGATIVE InfoNCE: restrict each row's negatives to other chunks of the "
                          "SAME document, dropping the trivial cross-document negatives. The clean "
@@ -227,6 +234,8 @@ def main():
         ssl_pred_var_weight=args.pred_var_weight,
         ssl_contrastive_weight=args.pred_contrastive_weight,
         ssl_contrastive_hard=args.pred_contrastive_hard,
+        ssl_simcse_weight=args.simcse_weight,
+        ssl_simcse_temp=args.simcse_temp,
         ssl_token_weight=args.pred_token_weight,
         reinit_pred_head=args.reinit_pred_head,
         grounded_loss_min_frequency=1.0,   # reconstruction stays the always-on anchor

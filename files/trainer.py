@@ -166,6 +166,8 @@ class Trainer:
                 contrastive_hard=getattr(self.train_cfg, 'ssl_contrastive_hard', False),
                 token_weight=(getattr(plan, 'token_ground_weight', 0.0)
                               * getattr(self.train_cfg, 'ssl_token_weight', 0.0)),
+                simcse_weight=getattr(self.train_cfg, 'ssl_simcse_weight', 0.0),
+                simcse_temp=getattr(self.train_cfg, 'ssl_simcse_temp', 0.05),
                 ponder_weight=self.model_cfg.act_ponder_cost, chunk_vecs=chunk_vecs)
             total = (ssl if total is None else total + ssl) + ponder
             if want_logs:
@@ -177,6 +179,8 @@ class Trainer:
                     # loop's PREDICTED latents -- unlike ssl, a centroid can't fake it.
                     # Only logged in the stages where it is active (Stage D+).
                     logs["tok_nll"] = round(getattr(self.model, "last_token_nll", 0.0), 4)
+                if getattr(self.train_cfg, 'ssl_simcse_weight', 0.0) > 0:
+                    logs["simcse"] = round(getattr(self.model, "last_simcse", 0.0), 4)
         # want_logs=False skips the .item() calls: each is a host-device sync,
         # and three syncs per micro-batch on a launch-overhead-bound workload
         # is measurable -- the values are only ever printed on log steps.

@@ -414,6 +414,13 @@ class TrainConfig:
     # instead of it. DEFAULT 0.0 == byte-identical to every existing run.
     ssl_contrastive_weight: float = 0.0
     ssl_contrastive_temp: float = 0.07
+    # Unsupervised SimCSE on the chunk encoder (losses.simcse_loss): a second dropout
+    # view of each chunk is its positive, other chunks are negatives. The negatives
+    # spread the latent space off its reconstruction-arbitrary cone (measured random-pair
+    # cos ~0.5) toward isotropy / semantic structure -> more predictable next-latent
+    # targets. Costs a second encoder pass. DEFAULT 0.0 == byte-identical.
+    ssl_simcse_weight: float = 0.0
+    ssl_simcse_temp: float = 0.05
     # HARD-NEGATIVE InfoNCE: restrict each row's negatives to other chunks of the
     # SAME document (semantically adjacent, hard) and drop the trivial cross-document
     # negatives. The clean-experiment probe showed the all-negatives loss is won by

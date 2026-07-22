@@ -138,6 +138,10 @@ class ModelConfig:
     # resumed into it without --reinit-pred-head (which is the intended rescue: keep
     # the good encoder/loop/Talker, discard the collapsed head).
     pred_head_hidden: int = 0
+    # SBERT-distill projection: >0 creates model.sbert_proj (Linear d_latent -> this dim)
+    # used only by the distill loss (organizes a latent subspace to a pretrained sentence
+    # encoder's geometry). 0 = no projection created (byte-identical state_dict).
+    sbert_distill_dim: int = 0
 
     # ---- adaptive computation time / test-time compute dial (§1.1, §5.5) -
     act_ponder_cost: float = 0.01
@@ -421,6 +425,11 @@ class TrainConfig:
     # targets. Costs a second encoder pass. DEFAULT 0.0 == byte-identical.
     ssl_simcse_weight: float = 0.0
     ssl_simcse_temp: float = 0.05
+    # SBERT distillation: pull a projection of the chunk latent toward a frozen sentence
+    # encoder's embedding (losses.sbert_distill_loss), importing its semantic geometry.
+    # The trainer decodes chunks + runs SBERT on-the-fly. DEFAULT 0.0 == off.
+    sbert_distill_weight: float = 0.0
+    sbert_model: str = "all-MiniLM-L6-v2"
     # HARD-NEGATIVE InfoNCE: restrict each row's negatives to other chunks of the
     # SAME document (semantically adjacent, hard) and drop the trivial cross-document
     # negatives. The clean-experiment probe showed the all-negatives loss is won by

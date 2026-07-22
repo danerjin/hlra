@@ -26,6 +26,7 @@ from dataclasses import asdict
 import torch
 
 from model import SELF
+from losses import sbert_distill_loss
 from gestalt_memory import GestaltMemoryBank
 from curriculum import Curriculum, Stage
 
@@ -133,6 +134,31 @@ class Trainer:
             batch = next(self._train_iter)
         return tuple(t.to(self.device) for t in batch)
 
+    def _ensure_sbert(self):
+        """Lazy-load the frozen sentence encoder + gpt2 tokenizer once (distill only)."""
+        if getattr(self, "_sbert", None) is None:
+            from sentence_transformers import SentenceTransformer
+            try:
+                from transformers import GPT2TokenizerFast
+                self._gpt2 = GPT2TokenizerFast.from_pretrained("gpt2")
+            except Exception:
+                from transformers import AutoTokenizer
+                self._gpt2 = AutoTokenizer.from_pretrained("gpt2")
+            self._sbert = SentenceTransformer(
+                getattr(self.train_cfg, "sbert_model", "all-MiniLM-L6-v2"), device=str(self.device))
+
+    @torch.no_grad()
+    def _sbert_targets(self, ct):
+        """Decode chunks to text and SBERT-encode them -> (B*C, sbert_dim), detached."""
+        self._ensure_sbert()
+        b, c, L = ct.shape
+        flat = ct.reshape(b * c, L)
+        texts = [(self._gpt2.decode([int(x) for x in flat[i] if int(x) != 0]).strip() or " ")
+                 for i in range(b * c)]
+        emb = self._sbert.encode(texts, convert_to_tensor=True, normalize_embeddings=False,
+                                 show_progress_bar=False, device=str(self.device))
+        return emb.to(self.device)
+
     def _loss_on(self, batch, flags, plan, want_logs=True):
         ct, cm, ri, rm = batch
         total, logs = None, {}
@@ -181,6 +207,19 @@ class Trainer:
                     logs["tok_nll"] = round(getattr(self.model, "last_token_nll", 0.0), 4)
                 if getattr(self.train_cfg, 'ssl_simcse_weight', 0.0) > 0:
                     logs["simcse"] = round(getattr(self.model, "last_simcse", 0.0), 4)
+        # SBERT distillation (opt-in): pull a projection of the chunk latent toward a
+        # frozen sentence encoder's embedding of the same chunk, importing its semantic
+        # geometry (probe_predictability: ~2.4x more predictable than our cone). Decode +
+        # SBERT run on the fly here; the model holds only the projection.
+        dw = getattr(self.train_cfg, 'sbert_distill_weight', 0.0)
+        if dw > 0 and getattr(self.model, 'sbert_proj', None) is not None:
+            tgt = self._sbert_targets(ct)                      # (B*C, sbert_dim)
+            valid = cm.reshape(-1).bool()
+            flat_lat = chunk_vecs.reshape(-1, chunk_vecs.shape[-1])[valid]
+            distill = sbert_distill_loss(self.model.sbert_proj(flat_lat), tgt[valid])
+            total = (dw * distill) if total is None else total + dw * distill
+            if want_logs:
+                logs["distill"] = round(distill.item(), 4)
         # want_logs=False skips the .item() calls: each is a host-device sync,
         # and three syncs per micro-batch on a launch-overhead-bound workload
         # is measurable -- the values are only ever printed on log steps.

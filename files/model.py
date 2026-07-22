@@ -202,6 +202,13 @@ class LatentThoughtModel(nn.Module):
         # forward_self_supervised, so the A-E path is untouched.
         self.gestalt_readout = GestaltReadout(cfg.d_latent) if cfg.gestalt_readout else None
 
+        # SBERT-distill projection (opt-in): only created when sbert_distill_dim>0, so
+        # the default A-E state_dict is byte-identical. Maps the latent to the sentence
+        # encoder's dim; the distill loss (computed in the trainer with the SBERT target)
+        # pulls it toward SBERT's geometry, importing semantic structure into the encoder.
+        _sd = getattr(cfg, "sbert_distill_dim", 0)
+        self.sbert_proj = nn.Linear(cfg.d_latent, _sd) if _sd and _sd > 0 else None
+
     # ------------------------------------------------------------------
     def _encode_real_rows(self, flat_ids: torch.Tensor, encode_fn) -> torch.Tensor:
         """

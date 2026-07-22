@@ -94,6 +94,14 @@ def main():
                          "predictable. Costs a second encoder pass. 0.0 = off; try 0.1-1.0. Logs simcse.")
     ap.add_argument("--simcse-temp", type=float, default=0.05,
                     help="SimCSE InfoNCE temperature (default 0.05).")
+    ap.add_argument("--sbert-distill-weight", type=float, default=0.0,
+                    help="distill a frozen sentence encoder (SBERT) into the chunk encoder: pull a "
+                         "projection of the latent toward SBERT's embedding of the chunk, importing its "
+                         "semantic geometry (probe_predictability: ~2.4x more predictable than our cone). "
+                         "Needs sentence-transformers; the trainer decodes+encodes on the fly. 0.0 = off; "
+                         "try 0.5-1.0. Logs distill (1-cos, -> 0 as it aligns).")
+    ap.add_argument("--sbert-model", default="all-MiniLM-L6-v2",
+                    help="sentence-transformers model for --sbert-distill-weight (default all-MiniLM-L6-v2, 384-d).")
     ap.add_argument("--pred-contrastive-hard", action="store_true",
                     help="HARD-NEGATIVE InfoNCE: restrict each row's negatives to other chunks of the "
                          "SAME document, dropping the trivial cross-document negatives. The clean "
@@ -200,6 +208,16 @@ def main():
     _mcl = {"max_chunk_len": args.max_chunk_len} if args.max_chunk_len else {}
     if args.n_cycles:
         _mcl["h_updates_per_thought"] = args.n_cycles   # HRM-Text recurrent depth (fixed-depth sweep)
+    if args.sbert_distill_weight > 0:
+        # Load SBERT once to learn its embedding dim, so model.sbert_proj matches it.
+        try:
+            from sentence_transformers import SentenceTransformer
+        except Exception as e:
+            raise SystemExit(f"--sbert-distill-weight needs sentence-transformers ({e}). "
+                             f"pip install sentence-transformers")
+        _sd = SentenceTransformer(args.sbert_model).get_sentence_embedding_dimension()
+        _mcl["sbert_distill_dim"] = _sd
+        print(f"[train_scaled] SBERT distill: {args.sbert_model} (dim {_sd}), weight {args.sbert_distill_weight}")
     model_cfg = model_config(args.preset, pred_head_hidden=args.pred_head_hidden,
                              halt_mode=args.halt_mode,
                              halt_target=args.halt_target,
@@ -236,6 +254,8 @@ def main():
         ssl_contrastive_hard=args.pred_contrastive_hard,
         ssl_simcse_weight=args.simcse_weight,
         ssl_simcse_temp=args.simcse_temp,
+        sbert_distill_weight=args.sbert_distill_weight,
+        sbert_model=args.sbert_model,
         ssl_token_weight=args.pred_token_weight,
         reinit_pred_head=args.reinit_pred_head,
         grounded_loss_min_frequency=1.0,   # reconstruction stays the always-on anchor

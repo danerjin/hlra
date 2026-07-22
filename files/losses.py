@@ -224,6 +224,24 @@ def variance_regularization(z: torch.Tensor, target_std: float = 0.1, eps: float
     return torch.clamp(target_std - std, min=0.0).mean()
 
 
+def sbert_distill_loss(latent_proj: torch.Tensor, sbert_target: torch.Tensor) -> torch.Tensor:
+    """
+    Distill a pretrained sentence encoder (SBERT) into the chunk encoder: pull a learned
+    PROJECTION of our latent toward SBERT's embedding of the same chunk (cosine). This
+    imports SBERT's semantic geometry (which probe_predictability showed is ~2.4x more
+    sequentially predictable than our reconstruction-arbitrary cone) into a subspace of
+    the latent, while the full latent keeps doing reconstruction. `sbert_target` is a
+    detached, externally-computed embedding (no grad).
+
+    latent_proj, sbert_target: (N, sbert_dim). Returns 1 - mean cosine similarity.
+    """
+    if latent_proj.shape[0] < 1:
+        return torch.zeros((), device=latent_proj.device)
+    p = F.normalize(latent_proj, dim=-1)
+    t = F.normalize(sbert_target, dim=-1)
+    return (1.0 - (p * t).sum(-1)).mean()
+
+
 def simcse_loss(view1: torch.Tensor, view2: torch.Tensor,
                 temperature: float = 0.05) -> torch.Tensor:
     """

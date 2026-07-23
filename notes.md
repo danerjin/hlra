@@ -883,6 +883,10 @@ is the added losses — so those losses must be a **real, well-placed** differen
   `pred_head` is centroid-PROOF (a constant prediction decodes to generic tokens → high token NLL), so
   it must run *during* the whole collapse-prone window as a PREVENTATIVE, not arrive in D as a fix. A
   D+ gate is too late if the attractor forms in B/C.
+  **[SUPERSEDED 2026-07-23 — see the anisotropy section below. The centroid-proof claim was false as
+  wired: the gradient also reached the encoder and loop, which can lower `tok_nll` by making latents
+  easy to decode rather than predictions correct. `tok_nll` is now detached to the Talker only and is
+  NOT an anti-collapse term.]**
 - **Hard-negative InfoNCE from Stage B** (`--pred-contrastive-weight --pred-contrastive-hard`). The
   *most direct* anti-collapse pressure: a centroid predictor gives a uniform softmax = the worst
   InfoNCE loss. Hard negatives (same-document chunks) force the fine next-chunk distinction rather than
@@ -900,6 +904,93 @@ on → it is **not** a loss problem (architectural / scale) and we stop tuning l
 Tooling added this round: autoencoder round-trip in the chat interfaces (`chat.py` `:auto`/`:latent`,
 `web_chat.py` Codec mode) to separate codec failures from predictor failures; `--max-chunk-len`
 override on `data_prep`/`train_scaled` + `probe_granularity_sweep.sh` for the sweep.
+
+## Latent anisotropy is upstream of predictor collapse (2026-07-22/23)
+
+The anti-collapse regime above treats collapse as a **loss** problem. The measurements below
+locate it one level earlier, in the **geometry of the latent space itself**, and refute two of
+the claims made there. Everything here is measured on `small-w3` / `chunk_cache` unless noted.
+
+**1. The cone. `probe_latent_semantics` / `probe_predictability` measure random-pair cosine** — how
+aligned two *unrelated* chunks are. A healthy space is near 0; the reconstruction-only codec measured
+**0.495–0.515**, i.e. every latent crammed into a narrow cone. This is the mechanism under collapse:
+in a narrow cone the centroid is already close to every target, so a cosine predictor that ignores its
+input and emits the mean is *nearly optimal*. The narrower the cone, the better that cheat pays.
+`latent_std` cannot see this (it is a per-dimension variance floor, not an angular spread).
+
+**2. SBERT distillation opens the cone; it is the load-bearing anti-collapse lever.** Pointwise
+distillation (`--sbert-distill-weight`, `losses.sbert_distill_loss`) pulls a *projection* of the latent
+toward a frozen MiniLM embedding. Crucially the constraint sits on the **projection**, not the latent,
+so the latent stays free to be *more* isotropic than the teacher:
+
+| run | random cos | adjacent cos | lift | vs SBERT |
+|---|---|---|---|---|
+| `distill_test` (w=10, no floor, ~fresh encoder) | **0.1103** | 0.1898 | **+0.0795** | 1.46× |
+| `distill_full` (w=5, floor 0.8) | 0.2203 | 0.2832 | +0.0629 | 1.15× |
+| after rewind (w=10, no floor, 2k steps) | 0.1999 | 0.2694 | +0.0695 | 1.24× |
+| SBERT (MiniLM) itself | 0.2082 | 0.2615 | +0.0561 | — |
+
+`distill_test` is the only configuration that reached an open cone, and it is also the only run whose
+predictor escaped collapse (`pred_collapse` 0.9986 → **0.7967** within ~200 steps of Stage B) — with
+**no token-grounding and no contrastive term at all**. That co-occurrence is the central evidence that
+geometry, not the predictor-side losses, is what breaks collapse.
+
+**3. Over-imitation is real: distillation has an optimum, not a maximum.** Driving distill cosine to
+convergence converges our geometry *onto* MiniLM's and gives back the task-specific advantage:
+
+| distill cos to SBERT | lift | vs SBERT |
+|---|---|---|
+| 0.81 (partial) | +0.0713 | 1.30× |
+| 0.994 (converged) | +0.0619 | 1.15× |
+
+So the teacher must act as a **prior, not a target**. That is what `--sbert-distill-floor` is for
+(hinge `clamp(floor − cos, 0)`, dormant once cos ≥ floor).
+
+**4. The floor failed because of its VALUE, not its mechanism — and the failure is instructive.**
+A floor is dormant whenever cos ≥ floor. Setting `--sbert-distill-floor 0.8` while cos was already
+**0.98** made it inert from the first step: `distill` contributed ~0.016 against `nll` ~0.4 (~25×
+weaker), reconstruction won unopposed, and the cone re-closed **0.110 → 0.220** over ~7k steps
+(observed drifting: 0.2064 → 0.2108 → 0.2183 → 0.2203). A floor only acts if it is set *above* current
+cos. **Rule: pick the floor from a measured cos, and verify `distill > 0` after applying it.**
+
+**5. Token-grounding's gradient path was wrong (fixed, `b4d61d51`).** `tok_nll` decoded `pred_head`'s
+forecast through the Talker with gradient flowing into the Talker **and** the loop **and** the encoder.
+That breaks the centroid-proof property claimed above: the encoder/loop can lower `tok_nll` by making
+latents **low-information and easy to decode** instead of making predictions correct — the same leak as
+the "encoder degradation" risk. Observed directly: `tok_nll` rose monotonically (4.66 → 4.79 → 4.90)
+while the predictor spread out. Fix: detach the predicted latent before `score_tokens`, so the gradient
+reaches **only the Talker**. After the detach `tok_nll` reversed (4.90 → 4.78 → 4.69) and `val_loss`
+improved. **`tok_nll` is now a decoder-robustness term (the train/serve exposure fix) and NOT a
+collapse diagnostic** — a detached Talker will happily learn to decode a collapsed predictor's output.
+Collapse is read from `pred_collapse` / `hstate_collapse` and the probe's LIFT, full stop.
+
+**6. The cone cannot be reopened once the encoder hardens.** `distill_test` reached 0.110 from a
+*fresh* encoder. Retrofitting the same setting (w=10, no floor) onto a checkpoint with only **5k steps**
+of reconstruction behind it, for 2k steps, moved the cone just **0.2203 → 0.1999 (~19% of the way)**
+while lift recovered ~40%. The anisotropy is established early and is far cheaper to prevent than to
+undo. **Implication: distillation must be on from step 0, not added or restored later.**
+
+**7. The escape is learning-rate-gated.** `pred_collapse` is flat during Stage-B warmup and moves only
+as LR approaches its ~3e-04 peak — in both the escaping run and ours. Two earlier "it has stalled"
+readings were taken at 3.7e-05 during warmup and were meaningless. With `--lr-schedule per-stage` the
+warmup scales with stage length, so a long Stage B delays the escape window by ~750 steps. Judge
+collapse **only at peak LR**, and over a ≥4-reading window: single-point noise on `pred_collapse` is
+about ±0.02, so nothing under ~0.05 of movement is interpretable.
+
+**8. Where it stands (PENDING).** The rewound run (fresh loop into a half-open cone, 0.1999) sat at
+`pred_collapse` mean **0.906** over 250 steps at full peak LR — versus `distill_test`, which completed
+its entire descent to 0.797 within 150 steps of peak. `hstate_collapse` fell cleanly to ~0.69 in both
+this run and the abandoned one, i.e. **the loop differentiates and the head does not follow** —
+collapse is localized in `pred_head`, not the recurrence. Verdict window 8200–8500 not yet read. If it
+confirms the plateau, the indicated next run is `distill_test`'s recipe at full scale — pointwise
+distill at weight 10, no floor, **from step 0** — rather than any further loss tuning on this lineage.
+
+**Relational distillation is the wrong tool for this problem** (`--sbert-distill-mode relational`,
+`losses.relational_distill_loss`). It matches pairwise-similarity structure on the **raw latents** with
+no projection, so a perfect fit converges our random-pair cosine to the teacher's **0.208** — the very
+cone we are trying to escape. Only the pointwise form can land *below* the teacher's isotropy (0.110 vs
+0.208). Relational remains well-motivated for its stated purpose (freeing latent capacity from MiniLM's
+arbitrary basis) but only after the cone question is settled.
 
 ## Post-run experiments
 

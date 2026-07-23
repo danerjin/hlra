@@ -242,6 +242,40 @@ def sbert_distill_loss(latent_proj: torch.Tensor, sbert_target: torch.Tensor) ->
     return (1.0 - (p * t).sum(-1)).mean()
 
 
+def relational_distill_loss(latents: torch.Tensor, sbert_target: torch.Tensor) -> torch.Tensor:
+    """
+    RELATIONAL (similarity-structure) distillation -- the weaker, better-motivated form of
+    sbert_distill_loss. Instead of forcing our latent onto the teacher's exact coordinates
+    (pointwise), match only the PAIRWISE SIMILARITY STRUCTURE: for every pair of chunks
+    (i, j) in the batch, our cos(z_i, z_j) should equal the teacher's cos(s_i, s_j).
+
+    Why this is the right constraint: what carries semantics is which chunks are near
+    which -- not the teacher's particular basis. A different basis with the same relations
+    is equally semantic, so pointwise matching over-constrains, spending latent capacity
+    reproducing MiniLM's arbitrary coordinates (and its retrieval-tuned idiosyncrasies).
+    Relational transfers the geometry and lets the encoder pick its own basis, leaving
+    more of d_latent free for reconstruction's surface detail.
+
+    Cosines are scalars, so both Gram matrices are (N, N) regardless of embedding width --
+    NO projection is needed and the 960-vs-384 mismatch disappears entirely.
+
+    latents: (N, d_latent) our chunk latents. sbert_target: (N, d_sbert), detached.
+    NOTE the scale: this is an MSE over similarities (typically ~0.1), numerically much
+    smaller than pointwise's 1-cos (~0.5), so it needs a correspondingly LARGER weight.
+    """
+    n = latents.shape[0]
+    if n < 2:
+        return torch.zeros((), device=latents.device)
+    z = F.normalize(latents, dim=-1)
+    s = F.normalize(sbert_target, dim=-1)
+    ours = z @ z.t()                                          # (N, N)
+    theirs = s @ s.t()                                        # (N, N)
+    # Drop the diagonal: it is identically 1 in both and carries no signal (including it
+    # would only dilute the loss with a constant zero term).
+    off = ~torch.eye(n, dtype=torch.bool, device=latents.device)
+    return F.mse_loss(ours[off], theirs[off])
+
+
 def simcse_loss(view1: torch.Tensor, view2: torch.Tensor,
                 temperature: float = 0.05) -> torch.Tensor:
     """

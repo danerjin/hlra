@@ -102,6 +102,12 @@ def main():
                          "try 0.5-1.0. Logs distill (1-cos, -> 0 as it aligns).")
     ap.add_argument("--sbert-model", default="all-MiniLM-L6-v2",
                     help="sentence-transformers model for --sbert-distill-weight (default all-MiniLM-L6-v2, 384-d).")
+    ap.add_argument("--sbert-distill-mode", default="pointwise", choices=["pointwise", "relational"],
+                    help="pointwise: match the teacher's exact embedding (learned projection). relational: "
+                         "match only its PAIRWISE SIMILARITY structure -- dimension-free (no projection), a "
+                         "weaker constraint that leaves more latent capacity for reconstruction. Relational "
+                         "is an MSE over similarities (~0.1) vs pointwise's 1-cos (~0.5), so use a LARGER "
+                         "weight (start ~25 and tune by whether the loss actually moves).")
     ap.add_argument("--pred-contrastive-hard", action="store_true",
                     help="HARD-NEGATIVE InfoNCE: restrict each row's negatives to other chunks of the "
                          "SAME document, dropping the trivial cross-document negatives. The clean "
@@ -209,15 +215,21 @@ def main():
     if args.n_cycles:
         _mcl["h_updates_per_thought"] = args.n_cycles   # HRM-Text recurrent depth (fixed-depth sweep)
     if args.sbert_distill_weight > 0:
-        # Load SBERT once to learn its embedding dim, so model.sbert_proj matches it.
         try:
-            from sentence_transformers import SentenceTransformer
+            from sentence_transformers import SentenceTransformer      # noqa: F401
         except Exception as e:
             raise SystemExit(f"--sbert-distill-weight needs sentence-transformers ({e}). "
                              f"pip install sentence-transformers")
-        _sd = SentenceTransformer(args.sbert_model).get_sentence_embedding_dimension()
-        _mcl["sbert_distill_dim"] = _sd
-        print(f"[train_scaled] SBERT distill: {args.sbert_model} (dim {_sd}), weight {args.sbert_distill_weight}")
+        if args.sbert_distill_mode == "relational":
+            # Similarity matrices are dimension-free -> no projection needed at all.
+            print(f"[train_scaled] SBERT distill (RELATIONAL): {args.sbert_model}, "
+                  f"weight {args.sbert_distill_weight} (no projection)")
+        else:
+            # Load SBERT once to learn its embedding dim, so model.sbert_proj matches it.
+            _sd = SentenceTransformer(args.sbert_model).get_sentence_embedding_dimension()
+            _mcl["sbert_distill_dim"] = _sd
+            print(f"[train_scaled] SBERT distill (pointwise): {args.sbert_model} (dim {_sd}), "
+                  f"weight {args.sbert_distill_weight}")
     model_cfg = model_config(args.preset, pred_head_hidden=args.pred_head_hidden,
                              halt_mode=args.halt_mode,
                              halt_target=args.halt_target,
@@ -256,6 +268,7 @@ def main():
         ssl_simcse_temp=args.simcse_temp,
         sbert_distill_weight=args.sbert_distill_weight,
         sbert_model=args.sbert_model,
+        sbert_distill_mode=args.sbert_distill_mode,
         ssl_token_weight=args.pred_token_weight,
         reinit_pred_head=args.reinit_pred_head,
         grounded_loss_min_frequency=1.0,   # reconstruction stays the always-on anchor

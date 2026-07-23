@@ -430,6 +430,12 @@ class TrainConfig:
     # The trainer decodes chunks + runs SBERT on-the-fly. DEFAULT 0.0 == off.
     sbert_distill_weight: float = 0.0
     sbert_model: str = "all-MiniLM-L6-v2"
+    # "pointwise" = match the teacher's exact embedding (needs model.sbert_proj);
+    # "relational" = match only its pairwise similarity STRUCTURE (dimension-free, no
+    # projection, weaker constraint -> more latent capacity left for reconstruction).
+    # Relational is an MSE over similarities (~0.1) vs pointwise's 1-cos (~0.5), so it
+    # needs a proportionally LARGER weight.
+    sbert_distill_mode: str = "pointwise"
     # HARD-NEGATIVE InfoNCE: restrict each row's negatives to other chunks of the
     # SAME document (semantically adjacent, hard) and drop the trivial cross-document
     # negatives. The clean-experiment probe showed the all-negatives loss is won by

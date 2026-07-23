@@ -26,7 +26,7 @@ from dataclasses import asdict
 import torch
 
 from model import SELF
-from losses import sbert_distill_loss
+from losses import sbert_distill_loss, relational_distill_loss
 from gestalt_memory import GestaltMemoryBank
 from curriculum import Curriculum, Stage
 
@@ -212,11 +212,18 @@ class Trainer:
         # geometry (probe_predictability: ~2.4x more predictable than our cone). Decode +
         # SBERT run on the fly here; the model holds only the projection.
         dw = getattr(self.train_cfg, 'sbert_distill_weight', 0.0)
-        if dw > 0 and getattr(self.model, 'sbert_proj', None) is not None:
+        _mode = getattr(self.train_cfg, 'sbert_distill_mode', 'pointwise')
+        _relational = _mode == 'relational'
+        if dw > 0 and (_relational or getattr(self.model, 'sbert_proj', None) is not None):
             tgt = self._sbert_targets(ct)                      # (B*C, sbert_dim)
             valid = cm.reshape(-1).bool()
             flat_lat = chunk_vecs.reshape(-1, chunk_vecs.shape[-1])[valid]
-            distill = sbert_distill_loss(self.model.sbert_proj(flat_lat), tgt[valid])
+            if _relational:
+                # Match only the pairwise similarity structure -- dimension-free, so no
+                # projection is involved and the encoder keeps its own basis.
+                distill = relational_distill_loss(flat_lat, tgt[valid])
+            else:
+                distill = sbert_distill_loss(self.model.sbert_proj(flat_lat), tgt[valid])
             total = (dw * distill) if total is None else total + dw * distill
             if want_logs:
                 logs["distill"] = round(distill.item(), 4)

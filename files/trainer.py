@@ -223,7 +223,8 @@ class Trainer:
                 # projection is involved and the encoder keeps its own basis.
                 distill = relational_distill_loss(flat_lat, tgt[valid])
             else:
-                distill = sbert_distill_loss(self.model.sbert_proj(flat_lat), tgt[valid])
+                distill = sbert_distill_loss(self.model.sbert_proj(flat_lat), tgt[valid],
+                                             floor_cos=getattr(self.train_cfg, 'sbert_distill_floor', 0.0))
             total = (dw * distill) if total is None else total + dw * distill
             if want_logs:
                 logs["distill"] = round(distill.item(), 4)

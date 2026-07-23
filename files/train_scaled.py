@@ -102,6 +102,11 @@ def main():
                          "try 0.5-1.0. Logs distill (1-cos, -> 0 as it aligns).")
     ap.add_argument("--sbert-model", default="all-MiniLM-L6-v2",
                     help="sentence-transformers model for --sbert-distill-weight (default all-MiniLM-L6-v2, 384-d).")
+    ap.add_argument("--sbert-distill-floor", type=float, default=0.0,
+                    help="hinge target for pointwise distill: penalize only while cos < this, dormant "
+                         "above -- the teacher as a PRIOR, not a target. MEASURED: driving cos to 0.994 "
+                         "regressed the codec's predictability lift (+0.0713 -> +0.0619) by converging "
+                         "onto SBERT's own geometry; ~0.8 was the optimum. 0.0 = plain 1-cos target.")
     ap.add_argument("--sbert-distill-mode", default="pointwise", choices=["pointwise", "relational"],
                     help="pointwise: match the teacher's exact embedding (learned projection). relational: "
                          "match only its PAIRWISE SIMILARITY structure -- dimension-free (no projection), a "
@@ -269,6 +274,7 @@ def main():
         sbert_distill_weight=args.sbert_distill_weight,
         sbert_model=args.sbert_model,
         sbert_distill_mode=args.sbert_distill_mode,
+        sbert_distill_floor=args.sbert_distill_floor,
         ssl_token_weight=args.pred_token_weight,
         reinit_pred_head=args.reinit_pred_head,
         grounded_loss_min_frequency=1.0,   # reconstruction stays the always-on anchor

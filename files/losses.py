@@ -224,7 +224,8 @@ def variance_regularization(z: torch.Tensor, target_std: float = 0.1, eps: float
     return torch.clamp(target_std - std, min=0.0).mean()
 
 
-def sbert_distill_loss(latent_proj: torch.Tensor, sbert_target: torch.Tensor) -> torch.Tensor:
+def sbert_distill_loss(latent_proj: torch.Tensor, sbert_target: torch.Tensor,
+                       floor_cos: float = 0.0) -> torch.Tensor:
     """
     Distill a pretrained sentence encoder (SBERT) into the chunk encoder: pull a learned
     PROJECTION of our latent toward SBERT's embedding of the same chunk (cosine). This
@@ -234,12 +235,26 @@ def sbert_distill_loss(latent_proj: torch.Tensor, sbert_target: torch.Tensor) ->
     detached, externally-computed embedding (no grad).
 
     latent_proj, sbert_target: (N, sbert_dim). Returns 1 - mean cosine similarity.
+
+    MEASURED (2026-07-22): driving this to zero is HARMFUL. At cos 0.81 the codec's
+    sequential-predictability lift was +0.0713 (1.30x SBERT's); once it reached cos 0.994
+    the geometry converged onto SBERT's exactly (random-pair cos 0.177 -> 0.206 vs SBERT's
+    0.209) and the lift REGRESSED to +0.0619 (1.15x). Perfect imitation inherits the
+    teacher's retrieval-tuned limits and discards the task-specific structure our
+    reconstruction/prediction objectives had added. So the teacher should be a PRIOR, not
+    a target: set `floor_cos` (e.g. 0.8) to make this a hinge that is DORMANT once the
+    latent is close enough, letting the task objectives shape the rest -- exactly how
+    `variance_regularization` floors variance without dictating a scale.
+    floor_cos=0.0 (default) = the plain 1-cos target, unchanged.
     """
     if latent_proj.shape[0] < 1:
         return torch.zeros((), device=latent_proj.device)
     p = F.normalize(latent_proj, dim=-1)
     t = F.normalize(sbert_target, dim=-1)
-    return (1.0 - (p * t).sum(-1)).mean()
+    cos = (p * t).sum(-1)
+    if floor_cos > 0.0:
+        return torch.clamp(floor_cos - cos, min=0.0).mean()
+    return (1.0 - cos).mean()
 
 
 def relational_distill_loss(latents: torch.Tensor, sbert_target: torch.Tensor) -> torch.Tensor:

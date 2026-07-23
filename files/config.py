@@ -436,6 +436,11 @@ class TrainConfig:
     # Relational is an MSE over similarities (~0.1) vs pointwise's 1-cos (~0.5), so it
     # needs a proportionally LARGER weight.
     sbert_distill_mode: str = "pointwise"
+    # Hinge target: penalize the distill only while cos(latent_proj, teacher) < this, and
+    # go DORMANT above it -- the teacher as a PRIOR, not a target. 0.0 = plain 1-cos.
+    # Measured: driving cos to 0.994 regressed the codec's predictability lift from
+    # +0.0713 to +0.0619 by converging onto SBERT's own geometry; ~0.8 was the optimum.
+    sbert_distill_floor: float = 0.0
     # HARD-NEGATIVE InfoNCE: restrict each row's negatives to other chunks of the
     # SAME document (semantically adjacent, hard) and drop the trivial cross-document
     # negatives. The clean-experiment probe showed the all-negatives loss is won by

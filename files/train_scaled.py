@@ -220,16 +220,16 @@ def main():
         except Exception as e:
             raise SystemExit(f"--sbert-distill-weight needs sentence-transformers ({e}). "
                              f"pip install sentence-transformers")
-        if args.sbert_distill_mode == "relational":
-            # Similarity matrices are dimension-free -> no projection needed at all.
-            print(f"[train_scaled] SBERT distill (RELATIONAL): {args.sbert_model}, "
-                  f"weight {args.sbert_distill_weight} (no projection)")
-        else:
-            # Load SBERT once to learn its embedding dim, so model.sbert_proj matches it.
-            _sd = SentenceTransformer(args.sbert_model).get_sentence_embedding_dimension()
-            _mcl["sbert_distill_dim"] = _sd
-            print(f"[train_scaled] SBERT distill (pointwise): {args.sbert_model} (dim {_sd}), "
-                  f"weight {args.sbert_distill_weight}")
+        # The projection is created for BOTH modes even though relational never uses it:
+        # that keeps the state_dict identical across modes, so a run can SWITCH mode on
+        # --resume (e.g. pointwise through Stage A to bootstrap the geometry, then
+        # relational from Stage B to relax the over-constraint) without a key mismatch.
+        # The unused Linear costs ~0.4M params and receives no gradient in relational mode.
+        _sd = SentenceTransformer(args.sbert_model).get_sentence_embedding_dimension()
+        _mcl["sbert_distill_dim"] = _sd
+        print(f"[train_scaled] SBERT distill ({args.sbert_distill_mode}): {args.sbert_model} "
+              f"(dim {_sd}), weight {args.sbert_distill_weight}"
+              + ("  [projection unused in relational mode]" if args.sbert_distill_mode == "relational" else ""))
     model_cfg = model_config(args.preset, pred_head_hidden=args.pred_head_hidden,
                              halt_mode=args.halt_mode,
                              halt_target=args.halt_target,

@@ -415,6 +415,18 @@ class LatentThoughtModel(nn.Module):
         # it decodes to generic tokens, not THIS chunk's. The prediction is put on the
         # target's norm shell first (cosine trains direction only; the Talker consumes
         # unnormalized -- same rescale generation uses).
+        #
+        # GRADIENT PATH (2026-07-23): the predicted latent is DETACHED before the Talker
+        # (pred_scaled.detach() below), so this term's gradient reaches ONLY the Talker
+        # -- teaching it to decode the loop's imperfect predicted latents (the train/serve
+        # exposure fix), NOT the loop/encoder. Rationale: with grad flowing back into the
+        # encoder+loop, tok_nll is NOT centroid-proof -- they can lower it by making
+        # latents low-information / easy-to-decode (the "encoder degradation" cheat)
+        # instead of making predictions correct. Collapse is fought by the open cone
+        # (sbert distill) + InfoNCE on pred_head, which is what the distill_test run that
+        # actually escaped used (it had NO token grounding). So tok_nll's only defensible
+        # job is Talker robustness; the reconstruction anchor (forward_grounded) trains
+        # the Talker on REAL latents in parallel, keeping it honest on both.
         if token_weight > 0 and pred_cat is not None:
             tgt_cat = torch.cat(targets, 0)
             ntok_cat = torch.cat(next_tok, 0)
@@ -431,7 +443,9 @@ class LatentThoughtModel(nn.Module):
             # ref_norm must be a per-row column (N, 1) so it broadcasts over d_latent
             # (keepdim=True) -- same shape predict_next_latent passes to _rescale_to.
             pred_scaled = self._rescale_to(p_cat, tgt_cat.norm(dim=-1, keepdim=True))
-            nll_sum, n_tok = self.score_tokens(ntok_cat, pred_scaled)
+            # DETACH: gradient trains the Talker to decode this latent, not the loop/
+            # encoder to produce an easy-to-decode one (see the block comment above).
+            nll_sum, n_tok = self.score_tokens(ntok_cat, pred_scaled.detach())
             token_nll = nll_sum / n_tok.clamp_min(1.0)
         else:
             token_nll = torch.zeros((), device=device)

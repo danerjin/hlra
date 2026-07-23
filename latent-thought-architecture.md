@@ -118,6 +118,25 @@ collapsed representation — so it is the always-on **anti-collapse anchor** for
 the Talker it trains is a faithful codec of the latent space. This is what `val_loss` and
 `generate --score` measure.
 
+**Two costs of this term, both measured (2026-07-22/23), both load-bearing:**
+
+- **It anchors the encoder but does not spread it.** Reconstruction needs each latent to be
+  *decodable*, and a tight huddle of latents is perfectly decodable — nothing in the objective rewards
+  angular separation. So it drives the latent space **anisotropic** (measured random-pair cosine
+  0.495–0.515, where a healthy space is ~0), and that narrow cone is what makes the predictor's
+  centroid solution nearly optimal. Reconstruction is therefore an anti-collapse anchor for the
+  *encoder* and simultaneously the upstream *cause* of collapse in the *predictor*. It stands in
+  direct tension with the distillation term (§2.4), and it wins by default: `L_rec` is unbounded
+  (~0.4) while `L_dist` is bounded (≤1), so an under-weighted distill term is simply overrun.
+- **It makes the Talker a rigid exact-latent decoder.** `probe_latent_use` measures NLL under the
+  true latent vs. a shuffled one: **0.0042 vs 41.4**. The codec genuinely *uses* the latent (no
+  memorization) — but it decodes only near-exact ones. At generation the Talker is handed a
+  *predicted* latent, empirically ~0.5 cosine to the truth, which it has never practiced on. This is
+  the **train/serve exposure gap**, and it is why a good codec (`val_loss` 0.0067) still generated
+  mush. The token-grounded term (§2.4) exists for exactly this and is deliberately detached to the
+  Talker, so it buys decoder tolerance without letting the encoder pay for it by emitting
+  low-information latents.
+
 ### 2.2 Prediction — the HRM loop, sequential, with memory (the reasoning)
 
 For each chunk *t*, in order:
@@ -148,7 +167,10 @@ memory. Reconstruction anchors the encoder; prediction is where reasoning and me
 ### 2.4 Anti-collapse
 
 A shared encoder under a predictive self-distillation loss can collapse to a constant (predict a
-constant from a constant is a stable fixed point). Three defenses, all active:
+constant from a constant is a stable fixed point). **Collapse has two distinct seats, and the
+encoder-side defenses do not reach the second one.**
+
+**Encoder-side** (the latent space itself going constant):
 
 1. **The reconstruction anchor** runs every step and cannot be satisfied by a constant latent — the
    load-bearing defense.
@@ -156,8 +178,32 @@ constant from a constant is a stable fixed point). Three defenses, all active:
    in normal operation, active only near collapse. A floor, never a target.
 3. **A slow EMA target** (momentum 0.996) — harder to chase into a constant than a fast one.
 
-The reliable collapse *signal* is a **`val_loss` regression when prediction turns on (Stage B)**;
-`latent_std` is a secondary monitor whose healthy band is width-dependent (lower at larger width).
+**Predictor-side** (`pred_head` going constant while the latent space is fine). This is the failure
+that actually occurred: a finished run measured `pred_collapse` **0.98** with `hstate_collapse` 0.88 —
+the loop's states stayed diverse and the head crushed them into one vector. None of the three defenses
+above can see or prevent it. Two more, in order of measured importance:
+
+4. **Semantic distillation to open the cone** (`--sbert-distill-weight`, §2.1). A narrow cone is
+   *why* the centroid is attractive: if unrelated latents already sit at cosine 0.5, the mean is close
+   to every target and predicting it is nearly optimal. Distilling a frozen sentence encoder through a
+   **learned projection** (the constraint binds the projection, not the latent) opened the cone to
+   random-pair cosine **0.110** — below the teacher's own 0.208 — and the run that achieved this is the
+   only one whose predictor escaped (`pred_collapse` 0.9986 → 0.797), *with no predictor-side loss at
+   all*. Two caveats, both measured: driving distill cosine to convergence (0.994) **over-imitates**
+   and gives back the task-specific advantage, so the teacher must act as a prior, not a target; and
+   the cone cannot be reopened once the encoder hardens (~19% recovery after only 5k steps of
+   reconstruction), so **distillation must be on from step 0.**
+5. **Hard-negative InfoNCE** on the prediction — a constant forecast is maximally uninformative and
+   pays the worst possible ranking loss. Same-document negatives force the next-chunk distinction
+   rather than cross-document topic separation.
+
+**Signals.** `val_loss` and `latent_std` **cannot see predictor collapse** — a collapsed head and a
+good one score the same, because `forward_grounded` is encoder→Talker and never touches the loop. Read
+`pred_collapse` / `hstate_collapse` (logged every eval) and the probes' LIFT. `tok_nll` is *not* a
+collapse signal either: it is detached to the Talker, which will happily learn to decode a collapsed
+predictor's output. Two further cautions: the escape is **learning-rate-gated** (it moves only near
+peak LR, so a long stage's warmup delays it), and single-reading noise on `pred_collapse` is ~±0.02, so
+judge over a ≥4-reading window at peak LR.
 
 ---
 

@@ -918,6 +918,22 @@ in a narrow cone the centroid is already close to every target, so a cosine pred
 input and emits the mean is *nearly optimal*. The narrower the cone, the better that cheat pays.
 `latent_std` cannot see this (it is a per-dimension variance floor, not an angular spread).
 
+**1b. THE AUTOENCODER IS WHAT CLOSES THE CONE — the two objectives are in direct tension.**
+Reconstruction needs each latent to be *decodable*, and a tight huddle is perfectly decodable; nothing
+in `L_rec` rewards angular separation. So the anchor that prevents *encoder* collapse is the same force
+that drives the anisotropy causing *predictor* collapse. It also wins by default on scale: `nll` is
+unbounded (~0.4) while `distill` is bounded (1−cos ≤ 1), which is why weights of 1 and 3 were never
+competitive and weight **10** was required. Observed directly: with the distill hinge dormant, the cone
+re-closed 0.110 → 0.220 over ~7k steps with no other change.
+
+**1c. The codec is BRITTLE — an exact-latent decoder.** `probe_latent_use`: NLL under the true latent
+**0.0042**, under a shuffled latent **41.4**. Good news (the Talker genuinely uses the latent; it is
+not memorizing the token distribution), but it decodes only *near-exact* latents. At generation it
+receives a **predicted** latent at ~0.5 cosine to the truth, which it has never practiced on — the
+train/serve exposure gap, and the direct explanation for a near-lossless codec (`val_loss` 0.0067)
+producing mush. This is what the (now detached) token-grounding term is for, and why `--recon-weight`
+exists: reconstruction sharpness and decoder tolerance genuinely trade off.
+
 **2. SBERT distillation opens the cone; it is the load-bearing anti-collapse lever.** Pointwise
 distillation (`--sbert-distill-weight`, `losses.sbert_distill_loss`) pulls a *projection* of the latent
 toward a frozen MiniLM embedding. Crucially the constraint sits on the **projection**, not the latent,

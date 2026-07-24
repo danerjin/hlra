@@ -72,7 +72,7 @@ def collect(model, ema, batch, flags, device):
     tgt = model._encode_real_rows(flat, ema.encode).reshape(batch_n, n_chunks, -1)
 
     memory = GestaltMemoryBank(model.cfg.memory_capacity, model.cfg.d_latent)
-    preds, targets, hstates = [], [], []
+    preds, targets, hstates, modes = [], [], [], []
     for t in range(n_chunks):
         valid = cm[:, t]
         if not bool(valid.any()):
@@ -85,12 +85,25 @@ def collect(model, ema, batch, flags, device):
         if t + 1 < n_chunks:
             pair = valid & cm[:, t + 1]
             if bool(pair.any()):
-                preds.append(model.pred_head(h_state)[pair])
+                # MDN checkpoints (pred_head_mixture>0): the POINT pred_head is unused
+                # and untrained, so reading it would report noise. Use the mixture's
+                # top-weighted component as the comparable point prediction, and keep
+                # every component so the caller can also ask the distributional
+                # question ("does ANY mode cover the target?").
+                _mdn = getattr(model, "pred_head_mdn", None)
+                if _mdn is not None:
+                    _mu, _, _lg = _mdn(h_state)
+                    top = _lg.argmax(dim=-1)
+                    preds.append(_mu[torch.arange(_mu.shape[0], device=_mu.device), top][pair])
+                    modes.append(_mu[pair])
+                else:
+                    preds.append(model.pred_head(h_state)[pair])
                 targets.append(tgt[:, t + 1][pair])
                 hstates.append(h_state[pair])
     if not preds:
-        return None, None, None
-    return torch.cat(preds, 0), torch.cat(targets, 0), torch.cat(hstates, 0)
+        return None, None, None, None
+    return (torch.cat(preds, 0), torch.cat(targets, 0), torch.cat(hstates, 0),
+            torch.cat(modes, 0) if modes else None)
 
 
 def main(argv=None):
@@ -127,16 +140,19 @@ def main(argv=None):
     flags = StageFlags(use_hrm_loop=True, detach_memory=False, inner_loop_grad_window=5,
                        memory_grad_window=5, use_act=args.act, use_input_lanes=False)
 
-    P, T, H = [], [], []
+    P, T, H, M = [], [], [], []
     for i, batch in enumerate(loader):
         if i >= args.batches:
             break
-        p, t, h = collect(model, ema, batch, flags, device)
+        p, t, h, m = collect(model, ema, batch, flags, device)
         if p is not None:
             P.append(p); T.append(t); H.append(h)
+            if m is not None:
+                M.append(m)
     if not P:
         raise SystemExit("no valid (chunk_t, chunk_t+1) pairs found -- try more --batches")
     pred, target, hstate = torch.cat(P, 0), torch.cat(T, 0), torch.cat(H, 0)
+    all_modes = torch.cat(M, 0) if M else None      # (N, K, D) for MDN checkpoints
     n = pred.shape[0]
 
     perm = torch.randperm(n)
@@ -162,6 +178,35 @@ def main(argv=None):
     lift = matched.mean().item() - meanbase.mean().item()
     print(f"\n  GAP  matched - shuffled = {gap:+.4f}")
     print(f"  LIFT matched - meanbase = {lift:+.4f}")
+    # DISTRIBUTIONAL readout (MDN checkpoints only). A point head must commit to one
+    # vector, so it is beaten by the centroid whenever the target is multimodal. The
+    # mixture's claim is different: that SOME component lands on the true next latent
+    # even if the gating cannot say which. BEST-MODE answers exactly that, and
+    # BEST-LIFT vs the mean baseline is the number that decides whether the
+    # distributional predictor is worth building out (sampling, gating, generation).
+    if all_modes is not None:
+        mm = F.normalize(all_modes, dim=-1)                       # (N,K,D)
+        tt = F.normalize(target, dim=-1).unsqueeze(1)             # (N,1,D)
+        per_mode = (mm * tt).sum(-1)                              # (N,K)
+        best = per_mode.max(dim=-1).values                        # (N,)
+        # CONTROL (required, not optional): max-over-K is inflated by chance -- in an
+        # anisotropic cone every mode has cos~sqrt(r) with every target, so K random
+        # modes beat MEAN-BASE carrying no information at all. Score the SAME max-of-K
+        # statistic against a WRONG target; only the difference is evidence.
+        tt_shuf = F.normalize(target[torch.randperm(target.shape[0])], dim=-1).unsqueeze(1)
+        best_shuf = (mm * tt_shuf).sum(-1).max(dim=-1).values      # (N,)
+        spread = float(per_mode.std(dim=-1).mean())
+        print(f"\n  [MDN] {all_modes.shape[1]} components")
+        print(f"  BEST-MODE  max_k cos(mode_k, true)  : {best.mean().item():+.4f} "
+              f"(sd {best.std().item():.4f})")
+        print(f"  BEST-SHUF  max_k cos(mode_k, wrong) : {best_shuf.mean().item():+.4f}   "
+              f"<- the max-of-K chance floor")
+        print(f"  BEST-GAP   best - best_shuf         = {best.mean().item() - best_shuf.mean().item():+.4f}"
+              f"   <- THE number: mixture covers the TRUE next chunk")
+        print(f"  BEST-LIFT  best - meanbase          = {best.mean().item() - meanbase.mean().item():+.4f}"
+              f"   <- vs the centroid (read only alongside BEST-GAP)")
+        print(f"  MODE-SPREAD mean sd across components: {spread:.4f}   "
+              f"<- ~0 means the mixture collapsed to one mode")
     print()
     if predself.mean().item() > 0.98:
         print("  VERDICT: predictions are ~a CONSTANT vector -> mean-collapse. The SSL number is")

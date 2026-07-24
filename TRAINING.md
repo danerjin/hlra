@@ -17,14 +17,38 @@ The **no-brainer path** to a trained model. Copy-paste, top to bottom.
 
 ---
 
-## 0. The one number that decides success
+## 0. The numbers that decide success
 
-`val_loss` = the autoencoder reconstruction (encode a chunk → the Talker decodes it;
-no reasoning loop). It's the anti-collapse anchor. **It must NOT jump up when the
-predictor turns on at Stage B** — a rise there is latent collapse. `latent_std` (latent std)
-is a secondary, width-dependent monitor; judge it against its own Stage-A band, never
-an absolute threshold. Untrained `val_loss` ≈ 10.8; a healthy run drives it well
-below and keeps falling through the A→B boundary.
+**Two independent failures, and `val_loss` only sees one of them.** The first big A→E run
+reached a near-lossless codec (`val_loss` 0.0067) and still **generated mush**. Read both:
+
+**(a) `val_loss` — the codec.** The autoencoder reconstruction (encode a chunk → the Talker
+decodes it; no reasoning loop). **It must NOT jump up when the predictor turns on at Stage B**
+— a rise there is latent collapse. `latent_std` is a secondary, width-dependent monitor;
+judge it against its own Stage-A band, never an absolute threshold. Untrained `val_loss` ≈ 10.8.
+
+**(b) `pred_collapse` / `hstate_collapse` — the predictor.** `pred_head` can collapse to a
+near-constant forecast, which decodes to generic tokens (mush) while `val_loss` stays perfect —
+`forward_grounded` is encoder→Talker and never touches the loop, so **neither `val_loss` nor
+`latent_std` nor `ssl` can see this.** `pred_collapse` ≈ cos(pred, mean(pred)): ~1.0 = constant.
+A healthy run breaks below ~0.85 and keeps falling; ~0.98 sustained is the failure that produced
+mush. `hstate_collapse` localizes it — if it is low (~0.6) while `pred_collapse` is high, the loop
+is fine and the *head* is the problem.
+
+Three cautions learned the hard way:
+- **The escape is learning-rate-gated.** `pred_collapse` barely moves during a stage's LR warmup
+  and drops as LR approaches peak. With `--lr-schedule per-stage` the warmup scales with stage
+  length, so a long Stage B delays the window by ~750 steps. **Judge only at peak LR.**
+- **Single-reading noise is ~±0.02.** Nothing under ~0.05 of movement is interpretable; use a
+  ≥4-reading window.
+- **`tok_nll` is NOT a collapse signal.** It is detached to the Talker (it trains decoder
+  tolerance, not the predictor), so it falls happily even while the predictor is collapsed.
+
+**(c) The cone — `probe_predictability.py`.** The upstream cause. A reconstruction-only latent
+space is severely anisotropic (random-pair cosine ~0.50), which places the centroid close to every
+target and makes the constant forecast nearly optimal. Distillation (§3) holds it open; measured
+**0.11 open / 0.20+ closing**. Probe at the end of Stage A, before the loop starts — this is the
+precondition for everything in (b).
 
 ---
 
@@ -83,10 +107,35 @@ rm -rf "$PROJECT/runs/scaled_sanity"
 # real run (background, survives disconnect):
 nohup python train_scaled.py --preset small-w3 --cache chunk_cache --device cuda --amp --amp-dtype bf16 \
   --batch-size "$BATCH" --stage-steps "$STAGE_STEPS" --var-weight 3.0 --lr-schedule per-stage \
+  --sbert-distill-weight 10.0 --pred-head-hidden 1920 \
+  --pred-token-weight 1.0 --pred-contrastive-weight 0.3 \
   --num-workers 2 --log-every 50 --checkpoint-every 1000 --archive-every 5000 \
   --out runs/scaled > train.log 2>&1 &
 tail -f train.log
 ```
+
+### The four flags that are NOT optional (2026-07-23)
+
+Without them the run reproduces the mush — a perfect codec whose predictor is constant. All
+default to off for byte-identical A→E, so **a plain launch is the failing configuration.**
+
+| flag | why |
+|---|---|
+| `--sbert-distill-weight 10.0` | **The load-bearing one.** Distils a frozen sentence encoder through a *learned projection*, opening the latent cone (random-pair cos 0.50 → **0.11**, below the teacher's own 0.21). The only configuration whose predictor ever escaped collapse. Weight 10, not 1–3: `nll` is unbounded (~0.4) while `distill` is bounded (≤1), so a light weight is simply overrun by reconstruction. |
+| `--pred-head-hidden 1920` | `pred_head` was a single `Linear(d_latent,d_latent)` and the loop's informative states died in it (`pred_collapse` 0.98 vs `hstate_collapse` 0.88). 2× MLP; ~2.8M params on a 156M model, runs once per *chunk*. |
+| `--pred-contrastive-weight 0.3` | A constant forecast is maximally uninformative and pays the worst ranking loss. Add `--pred-contrastive-hard` for same-document negatives (forces the next-chunk distinction over topic separation). |
+| `--pred-token-weight 1.0` | Decoder tolerance, **not** anti-collapse. The Talker is a rigid exact-latent decoder (NLL 0.0042 true vs 41.4 shuffled) but is handed a ~0.5-cos *predicted* latent at generation. Gradient is detached to the Talker only. |
+
+**`--sbert-distill-weight` must be on from step 0.** Anisotropy is cheap to prevent and
+essentially impossible to cure: retrofitting weight-10 distill onto a codec with only 5k steps of
+reconstruction behind it recovered ~19% of the cone (0.22 → 0.20) over 2k steps, while the same
+setting from scratch reached 0.11. Two retrofit attempts failed; prevention worked first try.
+
+**Do not add `--sbert-distill-floor` reflexively.** The hinge is dormant whenever cos ≥ floor, and
+distillation is the *only* force opposing reconstruction — a dormant hinge let the cone re-close
+0.11 → 0.22. It also only acts if set *above* the current cos (a floor of 0.8 applied at cos 0.98
+does nothing at all). Over-imitation is real (cos 0.994 gives back lift: 0.0855 → 0.062), but read
+it off `probe_predictability`, not the loss.
 On ROCm/gfx1151 **`LATENT_MANUAL_LAYERNORM=1` is REQUIRED** (the stock LN-backward
 kernel writes NaN grads — `rocm_smoke` `[3]` FAILs without it).
 `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` (flash attention) is **optional** and

@@ -99,8 +99,13 @@ CPU, single-user.) Output coherence tracks the run's scale — smoke-scale is no
 python data_prep.py --dataset HuggingFaceFW/fineweb-edu --name sample-10BT --streaming \
     --preset small --max-tokens 1200000000
 # 2. Train from the cache (no tokenizer/SaT at train time; worker-friendly).
+#    The anti-collapse flags are NOT optional -- without them the predictor collapses and
+#    generation is mush, while val_loss stays perfect. See TRAINING.md §0 and §3.
 python train_scaled.py --preset small --cache chunk_cache --device cuda --amp \
-    --batch-size 32 --stage-steps <~1 epoch, see TRAINING.md>
+    --batch-size 32 --stage-steps <~1 epoch, see TRAINING.md> \
+    --var-weight 3.0 --lr-schedule per-stage \
+    --sbert-distill-weight 10.0 --pred-head-hidden <2 x d_latent> \
+    --pred-token-weight 1.0 --pred-contrastive-weight 0.3
 ```
 
 Size presets (`config.MODEL_PRESETS`): `smoke` (~43M) → `small` (512-d, ~152M) → `base`/`large`/`xl`.
@@ -176,11 +181,27 @@ Rewrites can only be validated as *helpful* on the trained checkpoint.
 ## Status and honest limits
 
 - **Verified at smoke and `small` (512-d) scale**, on offline synthetic and real gpt2 text: full A→E
-  runs healthy, `val_loss` falls through the Stage-B predictor boundary, no latent collapse. **No large
-  training run has been done.**
-- **Collapse monitoring:** the reliable signal is a `val_loss` rise when prediction turns on at Stage
-  B. `latent_std` is a secondary monitor and is **width-dependent** — do not abort on an absolute
-  threshold (see `TRAINING.md`).
+  runs healthy, `val_loss` falls through the Stage-B predictor boundary, no latent collapse.
+- **A large `small-w3` run reached a near-lossless codec (`val_loss` 0.0067) and generated mush.**
+  The failure was the **predictor**, not the codec: `pred_head` collapsed to a near-constant forecast
+  (`pred_collapse` 0.98) while the loop's own states stayed diverse (`hstate_collapse` 0.88).
+- **Collapse monitoring — two independent failures.** `val_loss` (plus `latent_std`, width-dependent)
+  watches the *encoder*. It is **blind to predictor collapse**: `forward_grounded` is encoder→Talker
+  and never touches the loop, so a collapsed predictor and a good one score identically. Read
+  `pred_collapse` / `hstate_collapse`, at **peak LR only** (the escape is learning-rate-gated) and over
+  a ≥4-reading window (single-reading noise ≈ ±0.02). `tok_nll` is *not* a collapse signal — it is
+  detached to the Talker. See `TRAINING.md` §0.
+- **The upstream cause is latent anisotropy.** A reconstruction-only space is a narrow cone
+  (random-pair cosine ~0.50), which puts the centroid close to every target and makes the constant
+  forecast nearly optimal. Reconstruction only requires each latent to be *decodable*, and a tight
+  huddle is decodable — so the encoder-side anti-collapse anchor is itself the cause of the
+  predictor-side failure. Distilling a frozen sentence encoder through a *learned projection* opens the
+  cone to **0.11** (below the teacher's own 0.21) and is, so far, the only thing whose predictor
+  escaped. **It must run from step 0** — retrofitting recovered ~19% of the cone; prevention worked
+  first try. See `latent-thought-architecture.md` §2.4 and `notes.md`.
+- **The Talker is a rigid exact-latent decoder** (NLL 0.0042 under the true latent, 41.4 under a
+  shuffled one) but receives a ~0.5-cos *predicted* latent at generation — the train/serve exposure
+  gap, and the direct reason a good codec still produced mush.
 - **ACT adaptive depth** trains the loop's executed depth but not the halting policy (the soft ponder
   cost gives no compute-vs-quality gradient; halting degenerates to minimum depth). A real ACT
   accumulator is future work.

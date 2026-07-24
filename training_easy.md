@@ -87,6 +87,8 @@ case " smoke small small-w3 base base-w3 large large-w3 xl xl-w3 " in
 esac
 # batch auto-sized to the model (64GB GTT); edit if you OOM or have headroom:
 case "$PRESET" in small*|smoke) BATCH=32;; base*) BATCH=16;; large*) BATCH=8;; xl*) BATCH=4;; esac
+# pred_head MLP hidden = 2 x d_latent (a plain Linear head mean-collapses; see TRAINING.md §3):
+PRED_HEAD_HIDDEN=$(python -c "import sys;sys.path.insert(0,'$HOME/hlra/files');from config import MODEL_PRESETS as M;p=M['$PRESET'];print(2*p['d_model']*p.get('latent_mult',1))")
 
 #==================== CONFIG — edit these ====================
 MAX_TOKENS=1200000000          # 1.2B soft target (0.5-1B is a fine first run)
@@ -116,7 +118,7 @@ echo "PREP started (PID $PREP_PID)"
 # 2) write the venv-aware auto-start watcher:
 cat > ~/run_pipeline.sh <<'WATCHER'
 #!/bin/bash
-PY="__PY__"; BATCH="__BATCH__"; PRESET="__PRESET__"
+PY="__PY__"; BATCH="__BATCH__"; PRESET="__PRESET__"; PRED_HEAD_HIDDEN="__PRED_HEAD_HIDDEN__"
 RUN_STAGE_F="__RUN_STAGE_F__"; HF_CHAT="__HF_CHAT__"; SPLIT="__SPLIT__"; STAGEF_STEPS="__STAGEF_STEPS__"; STAGEF_BATCH="__STAGEF_BATCH__"
 export LATENT_MANUAL_LAYERNORM=1
 export TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
@@ -135,6 +137,8 @@ STAGE_STEPS=$("$PY" -c "u=max(1,($EX//$BATCH)//6);print(f'{u},{u},{u},{u},{2*u},
 log "STATUS: prep done — $EX examples; launching A→E training BATCH=$BATCH STAGE_STEPS=$STAGE_STEPS"
 "$PY" train_scaled.py --preset "$PRESET" --cache chunk_cache --device cuda --amp --amp-dtype bf16 \
   --batch-size "$BATCH" --stage-steps "$STAGE_STEPS" --var-weight 3.0 --lr-schedule per-stage \
+  --sbert-distill-weight 10.0 --pred-head-hidden "$PRED_HEAD_HIDDEN" \
+  --pred-token-weight 1.0 --pred-contrastive-weight 0.3 \
   --num-workers 2 --log-every 50 --checkpoint-every 1000 --archive-every 5000 --out runs/scaled
 RC=$?
 log "STATUS: train_scaled.py exited (rc=$RC) -> runs/scaled/model.pt"
@@ -156,7 +160,7 @@ WATCHER
 
 # 3) bake the exact interpreter + config into the watcher, then queue it:
 PY="$(command -v python)"                       # the venv python we activated above
-sed -i "s|__PY__|$PY|; s|__BATCH__|$BATCH|; s|__PRESET__|$PRESET|; s|__RUN_STAGE_F__|$RUN_STAGE_F|; s|__HF_CHAT__|$HF_CHAT|; s|__SPLIT__|$SPLIT|; s|__STAGEF_STEPS__|$STAGEF_STEPS|; s|__STAGEF_BATCH__|$STAGEF_BATCH|" ~/run_pipeline.sh
+sed -i "s|__PY__|$PY|; s|__BATCH__|$BATCH|; s|__PRESET__|$PRESET|; s|__PRED_HEAD_HIDDEN__|$PRED_HEAD_HIDDEN|; s|__RUN_STAGE_F__|$RUN_STAGE_F|; s|__HF_CHAT__|$HF_CHAT|; s|__SPLIT__|$SPLIT|; s|__STAGEF_STEPS__|$STAGEF_STEPS|; s|__STAGEF_BATCH__|$STAGEF_BATCH|" ~/run_pipeline.sh
 chmod +x ~/run_pipeline.sh
 nohup ~/run_pipeline.sh "$PREP_PID" > ~/hlra/files/pipeline.log 2>&1 &
 sleep 2

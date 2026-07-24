@@ -362,6 +362,52 @@ def prediction_collapse_metric(pred: torch.Tensor) -> float:
     return float(F.cosine_similarity(pred, m, dim=-1).mean())
 
 
+def mdn_nll_loss(means, sig_param, logits, target, eps: float = 1e-4):
+    """
+    DISTRIBUTIONAL predictor loss (2026-07-24). Negative log-likelihood of the true
+    next latent `target` under a K-component isotropic-Gaussian mixture, in DIRECTION
+    space (both the component means and the target are L2-normalized, matching the
+    cosine geometry the rest of the model predicts into).
+
+    WHY this exists: the point cosine loss `k*(1-cos(pred, target))` is minimized, in an
+    anisotropic cone, by emitting the CENTROID -- the conditional MEAN of a multimodal
+    target sits between the modes, near the cone's center, and scores well on cosine
+    while carrying no information (the collapse this whole line of work fought). A mixture
+    NLL is centroid-PROOF by construction: parking all mass at one central mode pays high
+    NLL whenever the true next latents are spread across several modes, because it assigns
+    low density to every target that isn't at that mode. To lower the NLL the model MUST
+    place components on the actual modes -- i.e. predict a DISTRIBUTION, not the average.
+
+    means:     (N, K, D) component means (un-normalized; normalized to unit direction here)
+    sig_param: (N, K)    raw per-component log-variance (clamped; sigma^2 = exp(.))
+    logits:    (N, K)    raw mixture logits (-> log-softmax mixing weights)
+    target:    (N, D)    the true next latent (EMA-target space)
+
+    Isotropic (one scalar variance per component) rather than diagonal: in D~960 a
+    per-dim covariance is both parameter-heavy and numerically fragile, and for
+    direction prediction on the unit sphere a single concentration per mode is the
+    natural first parameterization (an approximation to a von Mises-Fisher mixture,
+    whose exact normalizer needs high-order Bessel functions that are unstable at this
+    D). The additive constant -0.5*D*log(2*pi) is dropped: it shifts every term inside
+    the log-sum-exp equally, so it changes neither the gradient nor any comparison
+    against a marginal baseline.
+    """
+    N, K, D = means.shape
+    tgt = F.normalize(target, dim=-1).unsqueeze(1)            # (N,1,D)
+    mu = F.normalize(means, dim=-1)                          # (N,K,D) unit-direction modes
+    log_pi = F.log_softmax(logits, dim=-1)                    # (N,K)
+    log_var = torch.clamp(sig_param, min=-8.0, max=4.0)      # log sigma^2, bounded for stability
+    inv_var = torch.exp(-log_var)                            # 1/sigma^2  (N,K)
+    diff2 = ((tgt - mu) ** 2).sum(-1)                        # ||tgt - mu||^2  (N,K)
+    log_gauss = -0.5 * (D * log_var + diff2 * inv_var)       # isotropic log-density (const dropped)
+    log_prob = torch.logsumexp(log_pi + log_gauss, dim=-1)   # (N,)
+    # Report/optimize the PER-DIMENSION NLL (divide by D): a monotonic rescale, so the
+    # optimum is identical, but the magnitude is O(1) instead of O(D) -- gentler
+    # gradients and a value comparable in scale to the cosine term it replaces, so
+    # --ssl-weight behaves the same across both.
+    return (-log_prob).mean() / D
+
+
 def prediction_contrastive_loss(pred: torch.Tensor, target: torch.Tensor,
                                 temperature: float = 0.07,
                                 group_ids: torch.Tensor = None) -> torch.Tensor:

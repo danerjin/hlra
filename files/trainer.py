@@ -535,10 +535,10 @@ class Trainer:
         # into a new MLP head (pred_head_hidden > 0), whose keys/shapes differ.
         _state = ckpt["model_state"]
         if getattr(self.train_cfg, "reinit_pred_head", False):
-            dropped = [k for k in _state if k.startswith("pred_head.")]
-            _state = {k: v for k, v in _state.items() if not k.startswith("pred_head.")}
+            dropped = [k for k in _state if k.startswith("pred_head")]
+            _state = {k: v for k, v in _state.items() if not k.startswith("pred_head")}
             missing, unexpected = self.model.load_state_dict(_state, strict=False)
-            missing = [k for k in missing if not k.startswith("pred_head.")]
+            missing = [k for k in missing if not k.startswith("pred_head")]
             if missing or unexpected:
                 raise RuntimeError(f"--reinit-pred-head: unexpected key drift beyond pred_head "
                                    f"(missing={missing}, unexpected={unexpected})")

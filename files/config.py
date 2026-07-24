@@ -138,6 +138,19 @@ class ModelConfig:
     # resumed into it without --reinit-pred-head (which is the intended rescue: keep
     # the good encoder/loop/Talker, discard the collapsed head).
     pred_head_hidden: int = 0
+    # ---- DISTRIBUTIONAL predictor (2026-07-24) ---------------------------
+    # pred_head_mixture = K > 0 builds an ADDITIONAL Mixture-Density head (model.
+    # pred_head_mdn) that predicts a K-component Gaussian mixture over the next latent
+    # instead of a single point, trained by mdn_nll_loss. Rationale: the point cosine
+    # loss is minimized by the CENTROID (the mean of a multimodal target), which is the
+    # collapse we could not defeat with any anti-collapse term; a mixture NLL is
+    # centroid-proof by construction (parking mass at the mean pays high NLL when the
+    # targets are multimodal). Only consulted by forward_self_supervised, and only when
+    # K>0; 0 = OFF, no module built, A-E state_dict byte-identical. The point pred_head
+    # still exists (generation / Stage-F / ACT paths use it); wiring those to sample the
+    # mixture is future work -- this is scoped to the SSL escape test. Uses
+    # pred_head_hidden as the MLP trunk width when set.
+    pred_head_mixture: int = 0
     # SBERT-distill projection: >0 creates model.sbert_proj (Linear d_latent -> this dim)
     # used only by the distill loss (organizes a latent subspace to a pretrained sentence
     # encoder's geometry). 0 = no projection created (byte-identical state_dict).

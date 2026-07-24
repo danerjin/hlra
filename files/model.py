@@ -54,7 +54,8 @@ from losses import (scaled_cosine_loss, grounded_nll_loss, ponder_cost_loss,
                     variance_regularization, prediction_variance_loss,
                     prediction_contrastive_loss, simcse_loss,
                     prediction_collapse_metric, anti_sycophancy_loss,
-                    supervised_halt_loss, turn_end_loss, turn_end_accuracy)
+                    supervised_halt_loss, turn_end_loss, turn_end_accuracy,
+                    mdn_nll_loss)
 
 USER, SELF, SYSTEM = 0, 1, 2  # role-tag ids, matching config.role_tags order
 # RETRIEVED (3) is the latent-RAG provenance tag (§Q3). It is only usable when
@@ -92,6 +93,45 @@ class StageFlags:
     memory_grad_window: int = 5
     use_act: bool = False              # Stage D+
     use_input_lanes: bool = False       # Stage F: role-tagged two-lane separation
+
+
+class MDNHead(nn.Module):
+    """
+    Mixture-Density predictor head (2026-07-24). Maps a finished thought h_t to the
+    parameters of a K-component isotropic-Gaussian mixture over the next latent's
+    DIRECTION, trained by losses.mdn_nll_loss. The distributional answer to mean-
+    collapse: a mixture cannot lower its NLL by predicting the centroid when the true
+    next latents are multimodal (see mdn_nll_loss for the argument).
+
+    Output per row:  means (K, D) . sig_param (K) . logits (K).
+    An optional GELU MLP trunk (hidden>0) gives the head capacity to route different
+    thoughts to different modes, mirroring pred_head_hidden for the point head.
+    """
+    def __init__(self, d_latent: int, k: int, hidden: int = 0):
+        super().__init__()
+        self.k, self.d = k, d_latent
+        feat = hidden if hidden and hidden > 0 else d_latent
+        self.trunk = (nn.Sequential(nn.Linear(d_latent, hidden), nn.GELU())
+                      if hidden and hidden > 0 else nn.Identity())
+        self.mean = nn.Linear(feat, k * d_latent)
+        self.sig = nn.Linear(feat, k)
+        self.logit = nn.Linear(feat, k)
+
+    def forward(self, h):
+        f = self.trunk(h)
+        means = self.mean(f).view(-1, self.k, self.d)     # (N,K,D)
+        sig_param = self.sig(f)                            # (N,K) raw log-variance
+        logits = self.logit(f)                            # (N,K) raw mixing logits
+        return means, sig_param, logits
+
+    def representative(self, h):
+        """A single point per row for the collapse metric / diagnostics: the mean of
+        the top-weighted component. Diverse across contexts iff the mixture routes
+        different thoughts to different modes -- so prediction_collapse_metric on this
+        reads mode-collapse exactly as it reads point-collapse for the linear head."""
+        means, _, logits = self.forward(h)
+        top = logits.argmax(dim=-1)                        # (N,)
+        return means[torch.arange(means.shape[0], device=means.device), top]  # (N,D)
 
 
 class LatentThoughtModel(nn.Module):
@@ -194,6 +234,12 @@ class LatentThoughtModel(nn.Module):
             nn.Sequential(nn.Linear(cfg.d_latent, _phh), nn.GELU(), nn.Linear(_phh, cfg.d_latent))
             if _phh and _phh > 0 else nn.Linear(cfg.d_latent, cfg.d_latent)
         )
+        # DISTRIBUTIONAL predictor (opt-in, default off => byte-identical): an ADDITIONAL
+        # mixture-density head consulted only by forward_self_supervised when K>0. Built
+        # here so its params live under the "pred_head" prefix family (freeze / reinit /
+        # init-from all match "pred_head", covering both this and the point head).
+        _pmk = getattr(cfg, "pred_head_mixture", 0)
+        self.pred_head_mdn = MDNHead(cfg.d_latent, _pmk, hidden=_phh) if _pmk and _pmk > 0 else None
 
         # --- Gestalt-readout projection (§4 / Q2, Stage-F/RAG only) ---------
         # Homogenizes what gets written to memory: self-thoughts AND external
@@ -389,17 +435,34 @@ class LatentThoughtModel(nn.Module):
                         next_tok.append(chunk_tensor[:, t + 1][pair])   # (n_active, L) tokens of t+1
 
         pred_cat = torch.cat(preds, 0) if preds else None
-        cos = (scaled_cosine_loss(pred_cat, torch.cat(targets, 0), k=self.cfg.cosine_loss_k)
-               if preds else torch.zeros((), device=device))
+        # DISTRIBUTIONAL branch (pred_head_mixture>0): the prediction-loss slot `cos`
+        # becomes the mixture NLL, which is centroid-proof (see mdn_nll_loss). It uses
+        # the SAME cos_weight the caller passes for the cosine term. The point-based
+        # terms (cosine, pred-variance, InfoNCE, token-grounding) are SKIPPED -- the NLL
+        # subsumes the escape objective and none of them have a meaningful single-point
+        # `pred` here. pred_cat is set to the top-component representative (detached) so
+        # the collapse metric reads MODE diversity exactly as it reads point diversity.
+        mdn_on = (self.pred_head_mdn is not None) and bool(hs_all)
+        if mdn_on:
+            _hs = torch.cat(hs_all, 0)
+            _tg = torch.cat(targets, 0)
+            _mu, _sig, _lg = self.pred_head_mdn(_hs)
+            cos = mdn_nll_loss(_mu, _sig, _lg, _tg)
+            self.last_mdn_nll = float(cos.detach())
+            pred_cat = _mu[torch.arange(_mu.shape[0], device=device), _lg.argmax(-1)].detach()
+        else:
+            self.last_mdn_nll = 0.0
+            cos = (scaled_cosine_loss(pred_cat, torch.cat(targets, 0), k=self.cfg.cosine_loss_k)
+                   if preds else torch.zeros((), device=device))
         # Anti-collapse on the PREDICTIONS themselves (the encoder-side twin is
         # `var` below). Dormant at the default weight 0.0 -> byte-identical.
         pvw = pred_var_weight
         pred_var = (prediction_variance_loss(pred_cat)
-                    if (pvw > 0 and pred_cat is not None) else torch.zeros((), device=device))
+                    if (pvw > 0 and pred_cat is not None and not mdn_on) else torch.zeros((), device=device))
         group_cat = torch.cat(groups, 0) if (contrastive_hard and groups) else None
         contrast = (prediction_contrastive_loss(pred_cat, torch.cat(targets, 0),
                                                 contrastive_temp, group_ids=group_cat)
-                    if (contrastive_weight > 0 and pred_cat is not None) else torch.zeros((), device=device))
+                    if (contrastive_weight > 0 and pred_cat is not None and not mdn_on) else torch.zeros((), device=device))
         # Diagnose WHERE a collapse lives: pred_collapse is pred_head's OUTPUT, but if
         # the loop's h_state is itself constant the information is already gone upstream
         # and no predictor-side term can recover it (that distinction decides whether a
@@ -427,7 +490,7 @@ class LatentThoughtModel(nn.Module):
         # actually escaped used (it had NO token grounding). So tok_nll's only defensible
         # job is Talker robustness; the reconstruction anchor (forward_grounded) trains
         # the Talker on REAL latents in parallel, keeping it honest on both.
-        if token_weight > 0 and pred_cat is not None:
+        if token_weight > 0 and pred_cat is not None and not mdn_on:
             tgt_cat = torch.cat(targets, 0)
             ntok_cat = torch.cat(next_tok, 0)
             p_cat = pred_cat

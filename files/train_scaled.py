@@ -142,6 +142,15 @@ def main():
                          "0 (default) = the plain Linear, byte-identical to existing checkpoints. "
                          "CHANGES THE STATE_DICT -- to load an old checkpoint into it, add "
                          "--reinit-pred-head.")
+    ap.add_argument("--pred-head-mixture", type=int, default=0,
+                    help="DISTRIBUTIONAL predictor: K>0 builds a mixture-density head that predicts a "
+                         "K-Gaussian mixture over the next latent (mdn_nll_loss) instead of a point. "
+                         "Centroid-proof by construction -- the direct answer to mean-collapse when a "
+                         "point head can't escape (see notes 2026-07-24). Consulted only by "
+                         "forward_self_supervised; the MDN NLL uses --ssl-weight as its weight and "
+                         "REPLACES the cosine/InfoNCE/token terms. 0 = OFF (byte-identical). Try 8. "
+                         "New state_dict -> pair with --reinit-pred-head on --init-from. Uses "
+                         "--pred-head-hidden as the MLP trunk width.")
     ap.add_argument("--init-from", default=None,
                     help="initialize MODEL WEIGHTS from this checkpoint, then train from step 0 with "
                          "a fresh optimizer and curriculum. This is NOT --resume: use it to continue "
@@ -236,6 +245,7 @@ def main():
               f"(dim {_sd}), weight {args.sbert_distill_weight}"
               + ("  [projection unused in relational mode]" if args.sbert_distill_mode == "relational" else ""))
     model_cfg = model_config(args.preset, pred_head_hidden=args.pred_head_hidden,
+                             pred_head_mixture=args.pred_head_mixture,
                              halt_mode=args.halt_mode,
                              halt_target=args.halt_target,
                              norm=args.norm, **_mcl)        # defaults == unchanged
@@ -328,7 +338,7 @@ def main():
         sd = torch.load(src, map_location=device, weights_only=False)["model_state"]
         dropped = 0
         drop_prefixes = tuple(
-            pfx for pfx, on in [("pred_head.", args.reinit_pred_head), ("hrm_loop.", args.reinit_loop)] if on)
+            pfx for pfx, on in [("pred_head", args.reinit_pred_head), ("hrm_loop.", args.reinit_loop)] if on)
         if drop_prefixes:
             dropped = len([k for k in sd if k.startswith(drop_prefixes)])
             sd = {k: v for k, v in sd.items() if not k.startswith(drop_prefixes)}
@@ -357,7 +367,7 @@ def main():
     if args.freeze_except_pred_head:
         frozen = trainable = 0
         for n, prm in model.named_parameters():
-            if n.startswith("pred_head."):
+            if n.startswith("pred_head"):   # matches pred_head AND pred_head_mdn
                 trainable += prm.numel()
             else:
                 prm.requires_grad_(False); frozen += prm.numel()

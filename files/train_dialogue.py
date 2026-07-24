@@ -736,6 +736,18 @@ def main():
                        + (f" end={float(dlg['end']):.4f} end_acc={float(dlg['end_acc']):.3f}"
                           f" end_pos={int(dlg['end_pos'])}/{int(dlg['end_n'])}"
                           if end_on else ""))
+                # COLLAPSE (2026-07-23): the A-E failure was a constant pred_head with a
+                # perfect codec -- invisible to every loss. `cos` scores a collapsed
+                # predictor and a good one identically; only `gen` resists it. Stage F
+                # runs the same cosine term with NO distillation holding the cone open,
+                # so it is exposed to the same failure and could not previously see it.
+                # pred_collapse ~1.0 = constant forecast; if hstate_collapse is much
+                # lower, the thoughts are fine and the HEAD is the problem.
+                # getattr-with-default (the trainer.py convention): these are set inside
+                # forward_dialogue, so a log on a step that did not call it must not raise.
+                msg += (f" pred_collapse={getattr(model, 'last_pred_collapse', 0.0):.4f}"
+                        f" hstate_collapse={getattr(model, 'last_hstate_collapse', 0.0):.4f}"
+                        f" latent_std={getattr(model, 'last_latent_std', 0.0):.4f}")
                 # Watch trust(USER) fall relative to trust(SELF) as anti-sycophancy trains.
                 reader = model.hrm_loop.memory_reader
                 trust = reader.trust_by_role(len(cfg.role_tags), device)

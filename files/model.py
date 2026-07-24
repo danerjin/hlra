@@ -929,6 +929,9 @@ class LatentThoughtModel(nn.Module):
         n_loops = 1
 
         preds, targets = [], []
+        # Collapse instrumentation (see below): the thoughts feeding pred_head, kept
+        # so hstate_collapse can localize a collapse to the head vs the recurrence.
+        hs_all = []
         gen_sum = torch.zeros((), device=device)
         gen_tok = torch.zeros((), device=device)
         # Turn-end: labels come from resp_mask alone; collected per t and reduced
@@ -957,6 +960,7 @@ class LatentThoughtModel(nn.Module):
                 grad_window=stage.inner_loop_grad_window, use_act=stage.use_act,
                 input_lane_mask=input_lane_mask, active_mask=active)
             l_state = h
+            hs_all.append(h[active])
             total_ponder = total_ponder + ponder
             n_loops += 1
             # Self-thought written through the same gestalt-readout as context, so
@@ -991,8 +995,23 @@ class LatentThoughtModel(nn.Module):
                                   k=self.cfg.cosine_loss_k)
                if preds else torch.zeros((), device=device))
         gen = gen_sum / gen_tok.clamp_min(1.0)
+        # COLLAPSE INSTRUMENTATION (2026-07-23). Stage F carries the SAME mean-seeking
+        # cosine term as A-E and NONE of the geometry defense (no sbert distill here --
+        # this driver is standalone), so the cone can re-close over a fine-tune and
+        # pred_head can go constant. Nothing in the Stage-F log could see that: `cos`
+        # scores a collapsed predictor and a good one alike, and `gen` is the only term
+        # a constant forecast cannot satisfy. Diagnostic only -- floats off detached
+        # tensors, no gradient, no effect on training.
+        self.last_pred_collapse = (prediction_collapse_metric(torch.cat(preds, 0).detach())
+                                   if preds else 0.0)
+        self.last_hstate_collapse = (prediction_collapse_metric(torch.cat(hs_all, 0).detach())
+                                     if hs_all else 0.0)
         flat_valid = resp_mask.reshape(B * M)
-        var = (variance_regularization(z.reshape(B * M, -1)[flat_valid])
+        _zf = z.reshape(B * M, -1)[flat_valid]
+        # Encoder-side monitor, same quantity the A-E trainer logs as `latent_std`:
+        # watches the assistant latents for drift/shrinkage during the fine-tune.
+        self.last_latent_std = float(_zf.detach().std()) if _zf.shape[0] > 1 else 0.0
+        var = (variance_regularization(_zf)
                if var_weight > 0 else torch.zeros((), device=device))
         # `var_weight` only GATES whether the (cheap) variance floor is computed;
         # all four terms are returned RAW and the driver applies StageFConfig
